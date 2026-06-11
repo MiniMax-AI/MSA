@@ -1,34 +1,15 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
 """Tests for runtime CUDA architecture flag selection."""
 
-import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from minimax_msa import arch
-
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def _load_fmha_sm100_jit_module() -> ModuleType:
-    """Load fmha_sm100.jit without importing the heavy package root."""
-
-    spec = importlib.util.spec_from_file_location(
-        "_fmha_sm100_jit_for_test", _REPO_ROOT / "python/fmha_sm100/jit.py"
-    )
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def test_default_arch_flags_when_no_cuda_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -62,36 +43,35 @@ def test_explicit_sm121_arch_selects_single_target(monkeypatch: pytest.MonkeyPat
 
 
 
-def test_sm100_fmha_jit_rejects_sm121_arch_before_nvcc(
+def test_sm12x_topk_loader_targets_sm121(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """SM100-only dense FMHA JIT refuses SM121 before invoking nvcc."""
+    """The SM12x sparse_topk loader compiles the shared kernel for SM121.
+
+    fmha_sm100 is untouched (its csrc still targets SM100/SM103); the SM12x
+    arch routing lives entirely in fmha_sm12x._topk.
+    """
 
     monkeypatch.setenv("MSA_CUDA_ARCH", "sm_121")
     monkeypatch.delenv("FMHA_SM100_CUDA_ARCH", raising=False)
     monkeypatch.delenv("MSA_NVCC_GENCODES", raising=False)
     monkeypatch.delenv("FMHA_SM100_NVCC_GENCODES", raising=False)
-    jit = _load_fmha_sm100_jit_module()
-    monkeypatch.setattr(jit, "_get_tvm_ffi_include", lambda: str(tmp_path))
 
-    with pytest.raises(arch.UnsupportedCudaArchError, match="fmha_sm100.*SM100/SM103"):
-        jit._get_nvcc_flags(tmp_path, fmha=True)
+    from fmha_sm12x import _topk
 
-
-def test_non_fmha_helpers_allow_sm121_arch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Standalone helper kernels such as sparse_topk can target SM121."""
-
-    monkeypatch.setenv("MSA_CUDA_ARCH", "sm_121")
-    monkeypatch.delenv("FMHA_SM100_CUDA_ARCH", raising=False)
-    monkeypatch.delenv("MSA_NVCC_GENCODES", raising=False)
-    monkeypatch.delenv("FMHA_SM100_NVCC_GENCODES", raising=False)
-    jit = _load_fmha_sm100_jit_module()
-    monkeypatch.setattr(jit, "_get_tvm_ffi_include", lambda: str(tmp_path))
-
-    flags = jit._get_nvcc_flags(tmp_path, fmha=False)
+    flags = _topk._nvcc_flags(tmp_path, tmp_path, tmp_path)
     assert "-gencode=arch=compute_121,code=sm_121" in flags
+    assert "-gencode=arch=compute_100a,code=sm_100a" not in flags
+
+
+def test_fmha_sm100_jit_is_arch_agnostic_source() -> None:
+    """fmha_sm100 carries no SM12x/arch-routing coupling (zero-diff PR goal)."""
+
+    jit_src = (
+        Path(__file__).resolve().parents[1] / "python/fmha_sm100/jit.py"
+    ).read_text()
+    assert "minimax_msa" not in jit_src
+    assert "-gencode=arch=compute_100a,code=sm_100a" in jit_src
 
 
 def test_sm12x_csrc_guard_accepts_sm121(monkeypatch: pytest.MonkeyPatch) -> None:

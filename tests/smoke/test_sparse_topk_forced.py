@@ -12,7 +12,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 import torch
-from fmha_sm100 import sparse_topk_select
+
+# sparse_topk_select is the same kernel in both packages; use the one built for
+# the running arch (fmha_sm100 targets SM100/SM103, fmha_sm12x targets SM120/121).
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12:
+    from fmha_sm12x import sparse_topk_select
+else:
+    from fmha_sm100 import sparse_topk_select
 
 
 def test_forced_blocks(
@@ -79,7 +85,7 @@ def test_forced_zero_is_noop(
         force_begin_blocks=0, force_end_blocks=0,
     )
     assert torch.equal(result_noop, result_zero), (
-        f"[FAIL] force_begin=0, force_end=0 differs from default"
+        "[FAIL] force_begin=0, force_end=0 differs from default"
     )
     print("  [PASS] force_begin=0, force_end=0 == no-force (bitwise identical)")
 
@@ -178,8 +184,8 @@ def test_forced_large_k(
 if __name__ == "__main__":
     dev = torch.device("cuda")
     p = torch.cuda.get_device_properties(dev)
-    if not (p.major == 10 and p.minor in (0, 3)):
-        print("SKIP: SM100/SM103 GPU not available")
+    if (p.major, p.minor) not in ((10, 0), (10, 3), (12, 0), (12, 1)):
+        print("SKIP: Blackwell SM100/SM103/SM12x GPU not available")
         sys.exit(0)
 
     print("=== Testing forced block selection ===")
