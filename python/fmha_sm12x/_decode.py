@@ -1,4 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
 """SM12x paged decode reference implementation."""
@@ -43,6 +42,11 @@ def sparse_decode_atten_func(
 
     if q.ndim != 3 or k.ndim != 4 or v.ndim != 4:
         raise ValueError("decode expects q [B*S,Hq,D] and paged k/v [P,Hkv,page,D]")
+    # FP8 E4M3 K/V cache (and FP8 Q) is staged to BF16, matching the SM100
+    # decode path; the reference then runs in BF16.
+    q = q.to(torch.bfloat16) if q.dtype == torch.float8_e4m3fn else q
+    k = k.to(torch.bfloat16) if k.dtype == torch.float8_e4m3fn else k
+    v = v.to(torch.bfloat16) if v.dtype == torch.float8_e4m3fn else v
     if page_table.dtype != torch.int32 or seqused_k.dtype != torch.int32:
         raise TypeError("page_table and seqused_k must be int32")
     if page_table.device != q.device or seqused_k.device != q.device:

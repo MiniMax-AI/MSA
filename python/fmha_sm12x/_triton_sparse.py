@@ -1,4 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
 """Triton block-sparse attention for SM12x dense-KV prefill/decode.

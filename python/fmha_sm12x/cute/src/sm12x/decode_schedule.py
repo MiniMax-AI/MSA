@@ -1,4 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
 """Split-KV schedule for paged fp8 decode attention.

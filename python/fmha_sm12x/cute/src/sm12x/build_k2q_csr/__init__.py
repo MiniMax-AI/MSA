@@ -1,4 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
 """JIT-loaded CUDA C++ extension for the SM12x q2k -> k2q CSR builder."""

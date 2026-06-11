@@ -1,16 +1,6 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
-"""SM120/SM121 package facade for MiniMax Sparse Attention.
-
-The upstream MiniMax kernels in ``fmha_sm100`` rely on SM100-only tcgen05/TMEM
-MMA and copy operations. SM12x support therefore cannot safely alias the SM100
-implementation; it needs separate kernels, following the same split used by the
-SGLang fork for SM100 versus SM12x code.
-
-This package currently exposes only architecture/build helpers. Kernel names are
-reserved and fail loudly if accessed before a real SM12x implementation exists.
-"""
+"""SM120/SM121 package facade for MiniMax Sparse Attention."""
 
 from __future__ import annotations
 
@@ -18,45 +8,73 @@ from minimax_msa.arch import (
     CudaArch,
     cpp_extension_arch_flag,
     cuda_arch_cache_suffix,
-    nvcc_arch_define_flags,
     nvcc_gencode_flags,
     selected_cuda_arch,
 )
 
-_KERNEL_EXPORTS = frozenset(
+_API_EXPORTS = frozenset(
     {
-        "fmha_sm100",
-        "fmha_sm100_plan",
+        "Sm12xPlan",
         "fmha_sm12x",
         "fmha_sm12x_plan",
         "sparse_topk_select",
+    }
+)
+_SPARSE_EXPORTS = frozenset(
+    {
+        "Nvfp4QuantizedTensor",
+        "SparseDecodePagedAttentionWrapper",
+        "SparseK2qCsrBuilderSm12x",
+        "build_k2q_csr",
+        "dequantize_nvfp4_128x4_to_bf16",
+        "fp4_indexer_block_scores",
+        "nvfp4_global_scale_from_amax",
+        "nvfp4_scale_128x4_offset",
+        "quantize_bf16_to_nvfp4_128x4",
+        "quantize_kv_bf16_to_nvfp4_128x4",
         "sparse_atten_func",
         "sparse_atten_nvfp4_kv_func",
         "sparse_decode_atten_func",
-        "SparseDecodePagedAttentionWrapper",
-        "fp4_indexer_block_scores",
-        "build_k2q_csr",
-        "SparseK2qCsrBuilderSm100",
+        "swizzle_nvfp4_scale_to_128x4",
     }
 )
 
 __all__ = [
     "CudaArch",
+    "Nvfp4QuantizedTensor",
+    "Sm12xPlan",
+    "SparseDecodePagedAttentionWrapper",
+    "SparseK2qCsrBuilderSm12x",
+    "build_k2q_csr",
     "cpp_extension_arch_flag",
     "cuda_arch_cache_suffix",
-    "nvcc_arch_define_flags",
+    "dequantize_nvfp4_128x4_to_bf16",
+    "fmha_sm12x",
+    "fmha_sm12x_plan",
+    "fp4_indexer_block_scores",
     "nvcc_gencode_flags",
+    "nvfp4_global_scale_from_amax",
+    "nvfp4_scale_128x4_offset",
+    "quantize_bf16_to_nvfp4_128x4",
+    "quantize_kv_bf16_to_nvfp4_128x4",
     "selected_cuda_arch",
+    "sparse_atten_func",
+    "sparse_atten_nvfp4_kv_func",
+    "sparse_decode_atten_func",
+    "sparse_topk_select",
+    "swizzle_nvfp4_scale_to_128x4",
 ]
 
 
 def __getattr__(name: str):
-    if name in _KERNEL_EXPORTS:
-        raise AttributeError(
-            f"{name!r} is not available from {__name__!r}: the existing "
-            "MiniMax kernels are SM100-only tcgen05/TMEM kernels. Add a "
-            "separate SM12x implementation instead of aliasing fmha_sm100."
-        )
+    if name in _API_EXPORTS:
+        from . import api as _api
+
+        return getattr(_api, name)
+    if name in _SPARSE_EXPORTS:
+        from . import sparse as _sparse
+
+        return getattr(_sparse, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

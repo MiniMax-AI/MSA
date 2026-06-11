@@ -1,4 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
 """SM120/SM121 reference API for MiniMax Sparse Attention."""
@@ -9,7 +8,7 @@ from typing import Optional, Union
 
 import torch
 
-from fmha_sm100.jit import get_sparse_topk_module
+from ._topk import get_sparse_topk_module
 
 from ._reference import Sm12xPlan, make_plan, run_plan
 

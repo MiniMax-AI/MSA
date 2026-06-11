@@ -1,4 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
 """SM12x sparse-attention public surface."""
@@ -240,6 +239,36 @@ def _q2k_from_csr(k2q_row_ptr: torch.Tensor, k2q_q_indices: torch.Tensor, cu_seq
     return q2k
 
 
+_FP8_E4M3 = torch.float8_e4m3fn
+
+
+def _stage_attention_dtypes(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Accept SM100's forward dtype combinations, staging FP8 to BF16.
+
+    Like the SM100 path, q/k/v may all share a dtype (BF16/FP16/FP8 E4M3) or be
+    a BF16 query with an FP8 E4M3 K/V cache.  FP8 operands are dequantized to
+    BF16 (the SM100 FP8 path stages QK/PV in BF16), so the downstream Triton /
+    Torch reference runs in BF16 and matches the dequantized-BF16 reference.
+    """
+
+    same = q.dtype == k.dtype == v.dtype
+    fp8_kv_bf16_q = (
+        q.dtype == torch.bfloat16 and k.dtype == _FP8_E4M3 and v.dtype == _FP8_E4M3
+    )
+    if not same and not fp8_kv_bf16_q:
+        raise TypeError(
+            "q, k, v must share a dtype, except a bf16 query with fp8_e4m3 K/V; "
+            f"got q={q.dtype}, k={k.dtype}, v={v.dtype}"
+        )
+
+    def _deq(t: torch.Tensor) -> torch.Tensor:
+        return t.to(torch.bfloat16) if t.dtype == _FP8_E4M3 else t
+
+    return _deq(q), _deq(k), _deq(v)
+
+
 def sparse_atten_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k2q_row_ptr: torch.Tensor, k2q_q_indices: torch.Tensor, topK: int, *, cu_seqlens_q: torch.Tensor, cu_seqlens_k: torch.Tensor, max_seqlen_q: int, max_seqlen_k: int, blk_kv: int = 128, causal: bool = False, softmax_scale: float | None = None, lse_temperature_scale: float = 1.0, return_temperature_lse: bool = False, partial_dtype: torch.dtype = torch.bfloat16, return_softmax_lse: bool = False, page_table: torch.Tensor | None = None, seqused_k: torch.Tensor | None = None, schedule: object | None = None, usable_SM_count: int = -1, qk_dtype: torch.dtype | None = None, pv_dtype: torch.dtype | None = None, **_kwargs):
     """Block-sparse varlen attention for SM12x.
 
@@ -260,6 +289,7 @@ def sparse_atten_func(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k2q_row
         )
     if bool(return_temperature_lse) and not bool(return_softmax_lse):
         raise ValueError("return_temperature_lse=True requires return_softmax_lse=True")
+    q, k, v = _stage_attention_dtypes(q, k, v)
     q2k = _q2k_from_csr(k2q_row_ptr, k2q_q_indices, cu_seqlens_q, cu_seqlens_k, int(topK), int(blk_kv))
     kv_heads = int(k.shape[1]) if k.ndim == 4 else int(k.shape[-2])
     block_indexes = q2k.permute(1, 0, 2).contiguous()
