@@ -34,10 +34,15 @@ dependencies = [
 #     which adds that directory to sys.path and re-exports the public sparse API.
 [tool.setuptools]
 package-dir = { "" = "python" }
-# The cute/ sparse sources are loaded via sys.path.insert at runtime by
-# fmha_sm100/sparse.py (not imported as a submodule), so they are shipped as
-# package data.
-packages = ["fmha_sm100"]
+
+# Auto-discover the packages. fmha_sm12x's cute/src loaders are real importable
+# subpackages, so the glob pulls them all in without listing each one.
+# fmha_sm100 stays a single package on purpose: its cute/ + cutlass/ trees are
+# loaded via sys.path at runtime and ship as package data (below), so they must
+# NOT be discovered as importable packages.
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["fmha_sm100", "fmha_sm12x*", "minimax_msa"]
 
 [tool.setuptools.package-data]
 fmha_sm100 = [
@@ -53,4 +58,12 @@ fmha_sm100 = [
     "csrc/**/*",
     "cutlass/include/**/*",
     "cutlass/tools/util/include/**/*",
+]
+
+fmha_sm12x = [
+    "cute/**/*.py",
+    "cute/**/*.cu",
+    "cute/**/*.cuh",
+    "cute/**/*.h",
+    "cute/**/*.hpp",
 ]

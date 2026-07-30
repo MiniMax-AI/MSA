@@ -2,12 +2,14 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-≥3.10-blue.svg)](pyproject.toml)
-[![GPU](https://img.shields.io/badge/NVIDIA-SM100-76b900.svg)](#requirements)
+[![GPU](https://img.shields.io/badge/NVIDIA-SM100%20%2F%20SM103-76b900.svg)](#requirements)
 [![Stack: CuTe-DSL + Cuda](https://img.shields.io/badge/stack-CuTe--DSL%20%2B%20Cuda-purple.svg)](#stacks)
 
-**MSA** (`fmha_sm100`) ships dense FlashAttention and sparse top-k attention
-kernels for **NVIDIA SM100**. Two JIT-compiled stacks
-share one Python package:
+**MSA** (`fmha_sm100`, plus the companion `fmha_sm12x` namespace) ships
+dense FlashAttention and sparse top-k attention kernels for **NVIDIA SM100 /
+SM103**. Those kernels use SM100-only tcgen05/TMEM instructions, so SM120 /
+SM121 (GB10) is served by the separate `fmha_sm12x` package rather than
+aliasing the SM100 path:
 
 ![MSA architecture](docs/architecture.png)
 
@@ -25,7 +27,7 @@ share one Python package:
 
 ## Requirements
 
-- **GPU**: NVIDIA SM100.
+- **GPU**: NVIDIA SM100 / SM103 for the `fmha_sm100` kernels; SM120 / SM121 (GB10) is served by the `fmha_sm12x` package (portable CUDA helpers + a Triton block-sparse prefill kernel, with Torch reference fallbacks).
 - **Toolchain**: CUDA Toolkit with `nvcc` on `PATH` (or `CUDA_HOME` / `CUDA_PATH` set).
 - **Python**: ≥ 3.10.
 - **OS**: Linux x86_64 (aarch64 untested; JIT builds may need small Makefile edits on WSL).
@@ -33,8 +35,8 @@ share one Python package:
 Quick sanity check before installing:
 
 ```bash
-nvcc --version                # expect ≥ 12.x
-nvidia-smi --query-gpu=compute_cap --format=csv | grep "10.0"  # confirm SM100
+nvcc --version                # expect ≥ 12.x for SM100, CUDA 13.x for SM120/SM121
+nvidia-smi --query-gpu=compute_cap --format=csv | grep -E "10\.(0|3)|12\.(0|1)"
 python -c "import sys; print(sys.version_info[:2])"              # ≥ (3, 10)
 ```
 
@@ -71,6 +73,26 @@ pip install -e .        # editable install for development
 This pulls in the CuTe-DSL stack via `nvidia-cutlass-dsl` and `quack-kernels`;
 the csrc kernels are JIT-compiled at first import from sources shipped inside
 the package.
+
+By default, csrc JIT builds preserve the original SM100/SM103 targets. The
+`fmha_sm12x` package is a parallel SM120/SM121 namespace: it ships real
+portable CUDA helpers (the k2q CSR builder, paged-decode split-KV scheduler,
+and top-k selector), a semi-optimized Triton kernel for block-sparse prefill
+attention (BF16/FP16, plus FP8 E4M3 and NVFP4 K/V staged to BF16), and
+correctness-first Torch references for the rest (dense attention, FP4 block
+scoring, paged decode). The
+Triton path is optional — Triton ships transitively with `torch` on Linux, is
+imported lazily, and falls back to the Torch reference when unavailable, so it
+is not a declared dependency. Do not compile the existing `fmha_sm100` kernels
+for GB10 / SM121; they rely on SM100-only tcgen05/TMEM operations. For SM12x
+development, set the target before importing compiled SM12x kernel modules so
+caches are partitioned by architecture:
+
+```bash
+export MSA_CUDA_ARCH=sm_121
+# For custom multi-target builds, override the full nvcc gencode list:
+# export MSA_NVCC_GENCODES='-gencode=arch=compute_120,code=sm_120 -gencode=arch=compute_121,code=sm_121'
+```
 
 ## Verify
 
@@ -176,11 +198,12 @@ python/fmha_sm100/                  Python package
   api.py                            fmha_sm100 / fmha_sm100_plan / sparse_topk_select
   jit.py                            Runtime JIT (nvcc + ninja) for the csrc stack
   sparse.py                         Lazy shim that loads the cute/ stack
-  sparse_fmha_adapter.py            Bridge: fmha_sm100 API → sparse_atten_func
+  sparse_fmha_adapter.py            Bridge: fmha_sm100 API -> sparse_atten_func
   csrc/                             CUDA kernels + Jinja templates (JIT-compiled)
     include/                        Vendored FlashInfer / CUTLASS-derived / TRT-LLM headers
   cutlass/                          NVIDIA CUTLASS git submodule (include/ + tools/util/include/)
   cute/                             CuTe-DSL sparse attention (loaded via sys.path)
+fmha_sm12x/                         SM120/SM121 attention/indexer/decode namespace (Triton + Torch)
 tests/                              Correctness tests
   smoke/  integration/  regression/
 scripts/                            Warmup + cache-management helpers
@@ -199,6 +222,21 @@ benchmarks/                         bench_sparse_attention_ops.py
 - **Bridge** — `sparse_fmha_plan` / `sparse_fmha` adapt the dense-API call
   site to the sparse backend for prefill paths; useful when you already
   drive the dense kernel and want a one-line swap to sparse.
+
+### SM12x status
+
+The SM100 tcgen05/TMEM kernels stay isolated; `fmha_sm12x` exposes independent
+SM120/SM121-safe routes that mirror the `fmha_sm100` public surface. The
+portable helpers are real optimized CUDA kernels: the q2k→k2q CSR builder, the
+paged-decode split-KV scheduler, and the `sparse_topk_select` indexer. Block-
+sparse prefill attention — including the FP8 E4M3 and NVFP4 K/V variants, which
+are staged/dequantized to BF16 — runs on a semi-optimized Triton kernel for
+dense KV, used by default when Triton is importable and falling back to the
+Torch reference otherwise. Dense FMHA, the FP4 indexer block scores, and paged
+decode (BF16, or FP8 staged to BF16) remain correctness-first Torch
+references. These routes cover the full API and are validated on GB10;
+matching SM100's fused-kernel throughput would still need dedicated SM12x
+CUTLASS/CuTe kernels.
 
 ## Third-party licenses
 
