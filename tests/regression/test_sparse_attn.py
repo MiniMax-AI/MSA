@@ -14,6 +14,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from fmha_sm100.sparse_fmha_adapter import sparse_fmha as fmha_sm100, sparse_fmha_plan as fmha_sm100_plan
+from fmha_sm100.api import (
+    fmha_sm100 as dispatch_fmha_sm100,
+    fmha_sm100_plan as dispatch_fmha_sm100_plan,
+)
 
 failed_cases = []
 
@@ -78,26 +82,65 @@ def sparse_ref(q_flat, k_pages, v_pages, qo_lens, kv_page_indptr,
 def run_sparse_flashinfer(q, k_pages, v_pages, qo_lens_list, original_kv_lens_list,
                           qo_offsets_list, kv_indices, pages_per_batch, kv_block_indexes,
                           kv_block_num, num_qo_heads, page_size, head_dim, device,
-                          num_kv_splits=-1, dtype=torch.bfloat16):
-    """Run FlashInfer sparse attention."""
+                          num_kv_splits=-1, dtype=torch.bfloat16,
+                          public_page_table_mode=None):
+    """Run sparse attention through the adapter or public dispatcher."""
     num_kv_heads = k_pages.shape[1]
     batch_size = len(qo_lens_list)
     qo_segment_lens = torch.tensor(qo_lens_list, dtype=torch.int32)
     kv_segment_lens = torch.tensor(original_kv_lens_list, dtype=torch.int32)
     qo_offset_tensor = torch.tensor(qo_offsets_list, dtype=torch.int32)
-    plan_info = fmha_sm100_plan(qo_segment_lens, kv_segment_lens,
+    plan_fn = (
+        dispatch_fmha_sm100_plan
+        if public_page_table_mode is not None
+        else fmha_sm100_plan
+    )
+    plan_info = plan_fn(qo_segment_lens, kv_segment_lens,
         num_qo_heads, qo_offset=qo_offset_tensor,
         page_size=page_size,
         num_kv_splits=num_kv_splits, kv_block_num=kv_block_num,
         num_kv_heads=num_kv_heads,
     )
     torch.cuda.synchronize()
-    out, _ = fmha_sm100(
+    page_table = None
+    if public_page_table_mode is not None:
+        page_table = torch.zeros(
+            batch_size, max(pages_per_batch), dtype=torch.int32, device=device
+        )
+        offset = 0
+        for batch_idx, num_pages in enumerate(pages_per_batch):
+            page_table[batch_idx, :num_pages] = kv_indices[offset:offset + num_pages]
+            offset += num_pages
+
+        has_mixed, split, _, _, _ = plan_info
+        if public_page_table_mode == "precedence":
+            assert has_mixed, "expected public mixed dispatch"
+            prefill_page_table = page_table[split:]
+            assert prefill_page_table.data_ptr() % 16 != 0
+
+            kv_page_split = sum(pages_per_batch[:split])
+            prefill_kv_indices = kv_indices[kv_page_split:]
+            rolled_kv_indices = prefill_kv_indices.roll(1)
+            assert not torch.equal(rolled_kv_indices, prefill_kv_indices)
+            kv_indices = kv_indices.clone()
+            kv_indices[kv_page_split:] = rolled_kv_indices
+        else:
+            assert not has_mixed, "expected non-mixed sparse dispatch"
+            kv_indices = None
+
+    run_fn = (
+        dispatch_fmha_sm100
+        if public_page_table_mode is not None
+        else fmha_sm100
+    )
+
+    out, _ = run_fn(
         q, k_pages, v_pages,
         plan_info=plan_info, sm_scale=1.0 / math.sqrt(head_dim), 
         kv_indices=kv_indices,
         kv_block_indexes=kv_block_indexes,
         check_input_valid=True,
+        page_table=page_table,
     )
     torch.cuda.synchronize()
     return out
@@ -107,7 +150,8 @@ def _run_sparse_varlen(name, seed, batch_size, num_kv_heads, num_qo_heads,
                        page_size=128, head_dim=128, shuffle_pages=False,
                        qo_lens=None, original_kv_lens=None, qo_offsets=None,
                        sparse_block_counts=None, max_sparse_blocks=16,
-                       num_kv_splits=-1, dtype=torch.bfloat16):
+                       num_kv_splits=-1, dtype=torch.bfloat16,
+                       public_page_table_mode=None):
     """Generic sparse attention test with full control over parameters."""
     torch.manual_seed(seed)
     random.seed(seed)
@@ -211,6 +255,7 @@ def _run_sparse_varlen(name, seed, batch_size, num_kv_heads, num_qo_heads,
         kv_indices, pages_per_batch, kv_block_indexes, kv_block_num,
         num_qo_heads, page_size, head_dim, dev,
         num_kv_splits=num_kv_splits, dtype=dtype,
+        public_page_table_mode=public_page_table_mode,
     )
 
     threshold = 0.9999 if dtype == torch.bfloat16 else 0.999
@@ -376,6 +421,27 @@ if __name__ == "__main__":
     print("\n=== 16. Large batch + small seq ===")
     for dt in dtypes:
         all_pass &= _run_sparse_varlen(f"large_batch {dt}", 42, 8, 4, 4, qo_lens=[1]*8, original_kv_lens=[512]*8, dtype=dt)
+
+    print("\n=== 17. Direct page table ===")
+    for dt in dtypes:
+        all_pass &= _run_sparse_varlen(
+            f"public_mixed_unaligned_page_table {dt}", 42, 3, 1, 16,
+            qo_lens=[8, 17, 33],
+            original_kv_lens=[1024, 2176, 4224],
+            shuffle_pages=True,
+            max_sparse_blocks=32,
+            dtype=dt,
+            public_page_table_mode="precedence",
+        )
+
+    all_pass &= _run_sparse_varlen(
+        "public_sparse_page_table_only", 43, 1, 1, 16,
+        qo_lens=[64],
+        original_kv_lens=[4096],
+        shuffle_pages=True,
+        max_sparse_blocks=32,
+        public_page_table_mode="only",
+    )
 
     print()
     total = len(failed_cases)
