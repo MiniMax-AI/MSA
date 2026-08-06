@@ -765,13 +765,14 @@ def _fmha_sm100(
     output_maxscore: bool = True,
     output_o: bool = True,
     check_input_valid: bool = False,
+    page_table: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
 
     if plan_info["MM-SA-Nv"]:
         return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score, 
                 sm_scale=sm_scale, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale, o_scale=o_scale,
                 kv_indices=kv_indices, output_maxscore=output_maxscore, output_o=output_o, q_offset_override=q_offset_override,
-                kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid)
+                kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid, page_table=page_table)
 
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
@@ -1035,6 +1036,7 @@ def fmha_sm100(
     q_offset_override: Optional[Union[int, torch.Tensor]] = None,
     out: Optional[torch.Tensor] = None,
     max_score: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
     **kwargs
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Run dense, paged, or sparse SM100 FMHA using a precomputed plan.
@@ -1054,9 +1056,15 @@ def fmha_sm100(
         Return value from ``fmha_sm100_plan`` for the same lengths, head layout,
         page size, and sparse/output mode.
     kv_indices : torch.Tensor, optional
-        Paged-KV physical page table, flattened across the batch.  Required when
-        ``k`` and ``v`` use paged layout.  Shape is ``[sum_pages]`` and dtype is
+        Paged-KV physical page table, flattened across the batch.  Required for
+        generic paged paths.  Shape is ``[sum_pages]`` and dtype is
         int32.
+    page_table : torch.Tensor, optional
+        Prebuilt two-dimensional physical page table with shape
+        ``[batch_size, max_pages_per_sequence]`` and dtype ``torch.int32``.
+        It must be on the same device as paged K/V. Sparse prefill uses it
+        directly instead of rebuilding it from ``kv_indices``; generic
+        sub-plans still require ``kv_indices``.
     kv_block_indexes : torch.Tensor, optional
         Sparse KV block indices from ``sparse_topk_select``.  Shape
         ``[total_qo_len, num_kv_heads or num_qo_heads, kv_block_num]``, dtype
@@ -1085,28 +1093,38 @@ def fmha_sm100(
         outputs are concatenated back into the original batch order.
     """
     has_mixed_prefill, split, batch_size, decode, prefill = plan_info
+    if page_table is not None:
+        subplans = (decode, prefill) if has_mixed_prefill else (decode,)
+        if not any(plan["MM-SA-Nv"] for plan in subplans):
+            raise ValueError("page_table is only supported by sparse prefill")
+
     if not has_mixed_prefill:
-        return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices,kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)
+        return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices, page_table=page_table, kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)
     else:
 
         decode_pack = decode.get("pack_factor", 1)
         decode_nnz = decode["qo_segment_offsets"][-1].item() // decode_pack
-        is_paged = kv_indices is not None
+        is_paged = kv_indices is not None or page_table is not None
         nnz_qo = q.shape[0]
         num_qo_heads = q.shape[1]
 
         q_decode = q[:decode_nnz]
         q_prefill = q[decode_nnz:]
+        decode_page_table = page_table[:split] if page_table is not None and decode["MM-SA-Nv"] else None
+        prefill_page_table = page_table[split:] if page_table is not None and prefill["MM-SA-Nv"] else None
 
         if is_paged:
             k_decode, v_decode = k, v
             k_prefill, v_prefill = k, v
-            if "kv_page_indptr" in decode:
-                kv_page_split = decode["kv_page_indptr"][-1].item()
-            else:
-                kv_page_split = decode["total_rows"]
-            decode_kv_indices = kv_indices[:kv_page_split]
-            prefill_kv_indices = kv_indices[kv_page_split:]
+            decode_kv_indices = None
+            prefill_kv_indices = None
+            if kv_indices is not None:
+                if "kv_page_indptr" in decode:
+                    kv_page_split = decode["kv_page_indptr"][-1].item()
+                else:
+                    kv_page_split = decode["total_rows"]
+                decode_kv_indices = kv_indices[:kv_page_split]
+                prefill_kv_indices = kv_indices[kv_page_split:]
         else:
             if "kv_segment_offsets" in decode:
                 decode_kv_nnz = decode["kv_segment_offsets"][-1].item()
@@ -1133,13 +1151,13 @@ def fmha_sm100(
         decode_out, decode_ms = _fmha_sm100(
             q_decode, k_decode, v_decode, decode,
             out=None, max_score=None,
-            kv_indices=decode_kv_indices, kv_block_indexes=decode_block_idx,
+            kv_indices=decode_kv_indices, page_table=decode_page_table, kv_block_indexes=decode_block_idx,
             q_offset_override=decode_qo_offset,
             **kwargs)
         prefill_out, prefill_ms = _fmha_sm100(
             q_prefill, k_prefill, v_prefill, prefill,
             out=None, max_score=None,
-            kv_indices=prefill_kv_indices, kv_block_indexes=prefill_block_idx,
+            kv_indices=prefill_kv_indices, page_table=prefill_page_table, kv_block_indexes=prefill_block_idx,
             q_offset_override=prefill_qo_offset,
             **kwargs)
 

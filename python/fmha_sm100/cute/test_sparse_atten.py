@@ -2900,6 +2900,7 @@ def _build_sparse_nvfp4_kv_benchmark_context(
     paged: bool = False,
     page_size: int = BLK_KV,
     seqused_trim: int = 0,
+    page_table_storage_offset: int = 0,
 ) -> dict[str, object]:
     torch.random.manual_seed(seed)
     if paged:
@@ -2958,6 +2959,17 @@ def _build_sparse_nvfp4_kv_benchmark_context(
     cu_seqlens_q = inputs["cu_seqlens_q"]
     cu_seqlens_k = inputs["cu_seqlens_k"]
     page_table = inputs["page_table"] if paged else None
+    if page_table is not None and page_table_storage_offset:
+        page_table_storage = torch.empty(
+            page_table.numel() + page_table_storage_offset,
+            dtype=page_table.dtype,
+            device=page_table.device,
+        )
+        page_table_view = page_table_storage[page_table_storage_offset:].view_as(
+            page_table
+        )
+        page_table_view.copy_(page_table)
+        page_table = page_table_view
     seqused_k = inputs["seqused_k"] if paged else None
     max_seqlen_q = int(inputs["max_seqlen_q"])
     max_seqlen_k = int(inputs["max_seqlen_k"])
@@ -3059,7 +3071,57 @@ def _build_sparse_nvfp4_kv_benchmark_context(
         "backend_fns": backend_fns,
         "run_csr": run_csr,
         "paged": paged,
+        "page_table": page_table,
     }
+
+
+def test_page_table_validation_rejects_insufficient_capacity():
+    page_table = torch.zeros((2, 1), dtype=torch.int32)
+    with pytest.raises(ValueError):
+        sparse_interface._validate_page_table(
+            page_table,
+            device=page_table.device,
+            batch=2,
+            page_size=128,
+            max_seqlen_k=256,
+        )
+
+
+def test_sparse_atten_nvfp4_kv_unaligned_page_table() -> None:
+    context = _build_sparse_nvfp4_kv_benchmark_context(
+        case_name="nvfp4_unaligned_page_table",
+        q2k_pattern="sink",
+        batch=1,
+        seqlen_q=64,
+        seqlen_k=4096,
+        head_kv=1,
+        qhead_per_kv=16,
+        dim=128,
+        topk=32,
+        blk_kv=128,
+        causal=True,
+        seed=42,
+        paged=True,
+        page_size=128,
+        page_table_storage_offset=1,
+    )
+    page_table = context["page_table"]
+    assert page_table.data_ptr() % 16 == page_table.element_size()
+
+    outputs = {
+        backend: run_forward()
+        for backend, run_forward in context["backend_fns"]
+    }
+    torch.cuda.synchronize()
+    reference = outputs["bf16_prefill"]
+    actual = outputs["nvfp4_kv_prefill"]
+    for actual_tensor, reference_tensor in zip(actual, reference):
+        torch.testing.assert_close(
+            actual_tensor.float(),
+            reference_tensor.float(),
+            atol=2e-2,
+            rtol=2e-2,
+        )
 
 
 def _run_sparse_benchmark_warmup(ctx: dict[str, object], *, warmup: int, sync_nvtx: bool) -> None:

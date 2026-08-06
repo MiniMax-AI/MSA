@@ -52,6 +52,8 @@ _SUPPORTED_SPARSE_TOPK = (4, 8, 16, 32)
 _SUPPORTED_FWD_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_FWD_MMA_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_DECODE_QHEAD_PER_KV = 16
+# Row slices may start at any int32 boundary.
+_PAGE_TABLE_ASSUMED_ALIGN_BYTES = 4
 
 
 def _normalize_partial_dtype(partial_dtype: torch.dtype) -> torch.dtype:
@@ -154,6 +156,31 @@ def _validate_cu_seqlens(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _validate_page_table(
+    page_table: torch.Tensor,
+    *,
+    device: torch.device,
+    batch: int,
+    page_size: int,
+    max_seqlen_k: int,
+) -> None:
+    if page_table.device != device:
+        raise ValueError("page_table must be on the same device as q")
+    if page_table.dtype != torch.int32:
+        raise TypeError("page_table must be torch.int32")
+    if page_table.ndim != 2 or page_table.shape[0] != batch:
+        raise ValueError("page_table must have shape [B, max_num_pages_per_seq]")
+    if page_table.stride(-1) != 1:
+        raise ValueError("page_table must be contiguous in the last dimension")
+
+    required_pages = (int(max_seqlen_k) + page_size - 1) // page_size
+    if page_table.shape[1] < required_pages:
+        raise ValueError(
+            f"page_table has {page_table.shape[1]} columns, "
+            f"but max_seqlen_k={max_seqlen_k} requires {required_pages}"
+        )
+
+
 def _csr_row_capacity(k2q_row_ptr: torch.Tensor) -> int:
     return int(k2q_row_ptr.shape[1] - 1)
 
@@ -170,6 +197,7 @@ def _validate_csr_varlen_inputs(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     seqused_k: Optional[torch.Tensor],
+    max_seqlen_k: int,
 ) -> tuple[int, int]:
     if q.ndim != 3:
         raise ValueError("CSR sparse forward requires q to have shape [total_q, Hq, D]")
@@ -257,14 +285,6 @@ def _validate_csr_varlen_inputs(
         if k.shape != (total_k, head_kv, q.shape[-1]) or v.shape != (total_k, head_kv, q.shape[-1]):
             raise ValueError("Sparse Attention k and v must match [total_k, Hkv, D]")
     else:
-        if page_table.device != q.device:
-            raise ValueError("page_table must be on the same device as q")
-        if page_table.dtype != torch.int32:
-            raise TypeError("page_table must be torch.int32")
-        if page_table.ndim != 2 or page_table.shape[0] != batch:
-            raise ValueError("page_table must have shape [B, max_num_pages_per_seq]")
-        if page_table.stride(-1) != 1:
-            raise ValueError("page_table must be contiguous in the last dimension")
         if k.ndim != 4 or v.ndim != 4:
             raise ValueError(
                 "Sparse Page Attention requires k and v to have shape "
@@ -292,6 +312,13 @@ def _validate_csr_varlen_inputs(
                 raise ValueError("seqused_k must have shape [B]")
             if not seqused_k.is_contiguous():
                 raise ValueError("seqused_k must be contiguous")
+        _validate_page_table(
+            page_table,
+            device=q.device,
+            batch=batch,
+            page_size=page_size,
+            max_seqlen_k=max_seqlen_k,
+        )
     if topK not in _SUPPORTED_SPARSE_TOPK:
         raise ValueError(
             f"CSR sparse forward supports topK in {_SUPPORTED_SPARSE_TOPK}, got {topK}"
@@ -315,6 +342,7 @@ def _validate_csr_varlen_nvfp4_kv_inputs(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     seqused_k: Optional[torch.Tensor],
+    max_seqlen_k: int,
 ) -> tuple[int, int]:
     if q.ndim != 3:
         raise ValueError("KVFP4 CSR sparse forward requires q to have shape [total_q, Hq, D]")
@@ -389,14 +417,6 @@ def _validate_csr_varlen_nvfp4_kv_inputs(
             )
         head_kv = int(k.shape[1])
         required_scale_rows = int(k.shape[0]) * head_kv * page_size
-        if page_table.device != q.device:
-            raise ValueError("page_table must be on the same device as q")
-        if page_table.dtype != torch.int32:
-            raise TypeError("page_table must be torch.int32")
-        if page_table.ndim != 2:
-            raise ValueError("page_table must have shape [B, max_num_pages_per_seq]")
-        if page_table.stride(-1) != 1:
-            raise ValueError("page_table must be contiguous in the last dimension")
         if seqused_k is not None:
             if seqused_k.device != q.device:
                 raise ValueError("seqused_k must be on the same device as q")
@@ -425,10 +445,16 @@ def _validate_csr_varlen_nvfp4_kv_inputs(
     if cu_seqlens_k.shape != cu_seqlens_q.shape:
         raise ValueError("cu_seqlens_k must have shape [B + 1] matching cu_seqlens_q")
     batch = int(cu_seqlens_q.shape[0] - 1)
-    if page_table is not None and page_table.shape[0] != batch:
-        raise ValueError("page_table must have shape [B, max_num_pages_per_seq]")
     if seqused_k is not None and seqused_k.shape != (batch,):
         raise ValueError("seqused_k must have shape [B]")
+    if page_table is not None:
+        _validate_page_table(
+            page_table,
+            device=q.device,
+            batch=batch,
+            page_size=page_size,
+            max_seqlen_k=max_seqlen_k,
+        )
     head_q = int(q.shape[1])
     if head_q % head_kv != 0:
         raise ValueError("q.shape[1] must be divisible by Hkv")
@@ -732,6 +758,7 @@ def sparse_atten_func(
         cu_seqlens_q,
         cu_seqlens_k,
         seqused_k,
+        max_seqlen_k,
     )
     max_seqlen_q = int(max_seqlen_q)
     max_seqlen_k = int(max_seqlen_k)
@@ -890,6 +917,7 @@ def sparse_atten_nvfp4_kv_func(
         cu_seqlens_q,
         cu_seqlens_k,
         seqused_k,
+        max_seqlen_k,
     )
     total_q, head_q, dim = q.shape
     max_num_kv_blocks = _csr_row_capacity(k2q_row_ptr)
@@ -1724,6 +1752,7 @@ def _call_sparse_forward_sm100_csr_varlen(
         partial_dtype,
         bool(causal),
         bool(paged_kv),
+        _PAGE_TABLE_ASSUMED_ALIGN_BYTES if paged_kv else None,
         bool(use_prepare_scheduler),
         page_size,
         bool(seqused_k is not None),
@@ -1764,7 +1793,7 @@ def _call_sparse_forward_sm100_csr_varlen(
                 else to_cute_tensor_kvouter(LSE_temperature_partial),
                 to_cute_tensor_kvouter(Q_flat),
                 None if Q_gather4_desc is None else to_cute_tensor_kvouter(Q_gather4_desc),
-                None if page_table is None else to_cute_tensor_kvouter(page_table),
+                None if page_table is None else to_cute_tensor_kvouter(page_table, assumed_align=_PAGE_TABLE_ASSUMED_ALIGN_BYTES),
                 None if seqused_k is None else to_cute_tensor_kvouter(seqused_k),
                 to_cute_tensor_kvouter(cu_seqlens_q),
                 to_cute_tensor_kvouter(cu_seqlens_k),
@@ -1916,6 +1945,7 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
         partial_dtype,
         bool(causal),
         bool(paged_kv),
+        _PAGE_TABLE_ASSUMED_ALIGN_BYTES if paged_kv else None,
         bool(use_prepare_scheduler),
         page_size,
         bool(seqused_k is not None),
@@ -1964,7 +1994,7 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
                 else to_cute_tensor_kvouter(LSE_temperature_partial),
                 to_cute_tensor_kvouter(Q_flat),
                 None if Q_gather4_desc is None else to_cute_tensor_kvouter(Q_gather4_desc),
-                None if page_table is None else to_cute_tensor_kvouter(page_table),
+                None if page_table is None else to_cute_tensor_kvouter(page_table, assumed_align=_PAGE_TABLE_ASSUMED_ALIGN_BYTES),
                 None if seqused_k is None else to_cute_tensor_kvouter(seqused_k),
                 to_cute_tensor_kvouter(cu_seqlens_q),
                 to_cute_tensor_kvouter(cu_seqlens_k),

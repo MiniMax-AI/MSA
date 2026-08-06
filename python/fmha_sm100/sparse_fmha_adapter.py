@@ -232,13 +232,8 @@ def _build_page_table(
     kv_lens = kv_segment_lens.tolist()
     pages_per_batch = [(int(kl) + page_size - 1) // page_size for kl in kv_lens]
     max_pages = max(pages_per_batch)
-    total = batch * max_pages
-    buf = torch.zeros(total + 4, dtype=torch.int32, device=kv_indices.device)
-    shift = ((-buf.data_ptr()) % 16) // 4
-    page_table = buf[shift : shift + total].view(batch, max_pages)
-    assert page_table.data_ptr() % 16 == 0, (
-        f"_build_page_table failed to align: buf=0x{buf.data_ptr():x} "
-        f"shift={shift} page_table=0x{page_table.data_ptr():x}"
+    page_table = torch.zeros(
+        (batch, max_pages), dtype=torch.int32, device=kv_indices.device
     )
     offset = 0
     for b in range(batch):
@@ -266,6 +261,7 @@ def sparse_fmha(
     kv_block_indexes: Optional[torch.Tensor] = None,
     q_offset_override = None,
     check_input_valid: bool = False,
+    page_table: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, None]:
     """Run sparse prefill through ``sparse_atten_func`` using an FMHA-style API.
 
@@ -290,7 +286,11 @@ def sparse_fmha(
         Accepted for FMHA API compatibility; only ``sm_scale`` is used by this
         backend.
     kv_indices : torch.Tensor, optional
-        Flattened physical page table with dtype int32.  Required for paged KV.
+        Flattened physical page table with dtype int32.  Required for paged KV
+        unless ``page_table`` is supplied.
+    page_table : torch.Tensor, optional
+        Prebuilt physical page table with shape ``[batch, max_pages]`` and dtype
+        int32.  When supplied, it is used directly and ``kv_indices`` is ignored.
     output_maxscore : bool, optional
         Accepted for compatibility; sparse prefill returns no max-score tensor.
     output_o : bool, optional
@@ -347,13 +347,10 @@ def sparse_fmha(
 
     is_paged = page_size > 0 and k.ndim == 4
 
-    page_table = None
-    if is_paged:
-
-        if kv_indices is not None:
-            page_table = _build_page_table(
-                kv_indices, kv_segment_lens, page_size, batch,
-            )
+    if is_paged and page_table is None and kv_indices is not None:
+        page_table = _build_page_table(
+            kv_indices, kv_segment_lens, page_size, batch,
+        )
 
     # build_k2q_csr(return_schedule=True) builds schedule using hardware SM count internally
     # (build_k2q_csr_native.cu), which ignores usable_SM_count. When SM-limited, skip its
