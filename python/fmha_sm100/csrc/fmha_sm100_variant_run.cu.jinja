@@ -84,6 +84,8 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
   params.k_stride_h = k.stride(1);
   params.v_stride_n = v.stride(0);
   params.v_stride_h = v.stride(1);
+  params.k_stride_t = is_paged ? static_cast<int>(k.stride(2)) : 0;
+  params.v_stride_t = is_paged ? static_cast<int>(v.stride(2)) : 0;
   params.batch_size = qo_segment_lens.size(0);
   params.total_qo_len = q.size(0);
   params.total_kv_len = is_paged ? 0 : k.size(0);

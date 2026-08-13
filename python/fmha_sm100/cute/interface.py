@@ -136,6 +136,53 @@ def _prepare_paged_kv_for_tma(k, v, blk_kv: int):
     return k, v
 
 
+def _apply_kv_layout(k, v, kv_layout: str, *, paged: bool):
+    """Normalize K/V to the canonical HND view.
+
+    ``kv_layout="HND"`` expects paged K/V as ``[num_pages, Hkv, page_size, D]``
+    and is a no-op.  ``kv_layout="NHD"`` expects ``[num_pages, page_size, Hkv,
+    D]`` and returns permuted views in the canonical HND shape.  The kernels
+    consume K/V through dynamic strides, so a standard (contiguous) NHD cache
+    is used zero-copy; inputs that violate the kernel alignment contract fall
+    back to a compacting copy in :func:`_kv_kernel_view`.
+    """
+    if kv_layout == "HND":
+        return k, v
+    if kv_layout != "NHD":
+        raise ValueError(f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}")
+    if not paged:
+        raise ValueError(
+            "kv_layout='NHD' requires paged K/V (pass page_table); dense flat "
+            "K/V [total_k, Hkv, D] is already token-major"
+        )
+    if k.ndim != 4 or v.ndim != 4:
+        raise ValueError(
+            "kv_layout='NHD' requires k/v with shape [num_pages, page_size, Hkv, D]"
+        )
+    return k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+
+
+_KV_ALIGN_BYTES = 16  # from_dlpack(assumed_align=16) + assume_tensor_aligned (128-bit)
+
+
+def _kv_kernel_view(t: torch.Tensor) -> torch.Tensor:
+    """Pass K/V through when it satisfies the kernel's TMA contract; else copy.
+
+    Contract: contiguous last dim, 16-byte-aligned base pointer, and every
+    non-last stride a 16-byte multiple.  Layout-permuted paged caches (HND
+    views of NHD storage) satisfy this and stay zero-copy; exotic strided or
+    offset views take the compacting copy that the previous unconditional
+    ``.contiguous()`` provided.
+    """
+    if t.stride(-1) != 1 or t.data_ptr() % _KV_ALIGN_BYTES:
+        return t.contiguous()
+    esize = t.element_size()
+    for size, stride in zip(t.shape[:-1], t.stride()[:-1]):
+        if size > 1 and (stride * esize) % _KV_ALIGN_BYTES:
+            return t.contiguous()
+    return t
+
+
 def _validate_cu_seqlens(
     cu_seqlens: torch.Tensor,
     *,
@@ -618,6 +665,7 @@ def sparse_atten_func(
     return_softmax_lse: bool = False,
     page_table: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    kv_layout: str = "HND",
     schedule: Optional[SparseAttentionSchedule] = None,
     usable_SM_count: int = -1,
     qk_dtype: Optional[torch.dtype] = None,
@@ -680,6 +728,13 @@ def sparse_atten_func(
     seqused_k : torch.Tensor, optional
         Shape ``[batch_size]``, dtype int32.  Effective KV length per request
         for paged causal attention.
+    kv_layout : str, optional
+        Paged K/V cache layout: ``"HND"`` (default) for
+        ``[num_pages, Hkv, blk_kv, D]`` or ``"NHD"`` for
+        ``[num_pages, blk_kv, Hkv, D]``.  A standard contiguous NHD cache is
+        consumed zero-copy via strided views; inputs violating the kernel
+        alignment contract fall back to a compacting copy.  Only valid
+        together with ``page_table``.
     schedule : SparseAttentionSchedule, optional
         Prebuilt sparse forward schedule.  If omitted, the schedule is built
         during the call.
@@ -715,6 +770,7 @@ def sparse_atten_func(
         raise ValueError("return_temperature_lse=True requires return_softmax_lse=True")
     partial_dtype = _normalize_partial_dtype(partial_dtype)
     qk_dtype, pv_dtype = _resolve_forward_mma_dtypes(q, k, v, qk_dtype, pv_dtype)
+    k, v = _apply_kv_layout(k, v, kv_layout, paged=page_table is not None)
 
     if cu_seqlens_q is None or cu_seqlens_k is None:
         raise ValueError(
@@ -738,8 +794,8 @@ def sparse_atten_func(
 
     return _sparse_atten_csr_varlen_forward(
         q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
+        _kv_kernel_view(k),
+        _kv_kernel_view(v),
         k2q_row_ptr.contiguous(),
         k2q_q_indices.contiguous(),
         int(topK),
@@ -1006,6 +1062,7 @@ def sparse_decode_atten_func(
     softmax_scale: Optional[float] = None,
     return_softmax_lse: bool = False,
     schedule: Optional[DecodeAttentionSchedule] = None,
+    kv_layout: str = "HND",
     O_partial: Optional[torch.Tensor] = None,
     LSE_partial: Optional[torch.Tensor] = None,
 ):
@@ -1046,6 +1103,11 @@ def sparse_decode_atten_func(
     O_partial, LSE_partial : torch.Tensor, optional
         Optional split-KV partial workspaces.  Normally owned by
         ``SparseDecodePagedAttentionWrapper``.
+    kv_layout : str, optional
+        Paged K/V cache layout: ``"HND"`` (default) for
+        ``[num_pages, Hkv, blk_kv, 128]`` or ``"NHD"`` for
+        ``[num_pages, blk_kv, Hkv, 128]`` (contiguous NHD caches are consumed
+        zero-copy).
 
     Returns
     -------
@@ -1055,6 +1117,7 @@ def sparse_decode_atten_func(
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
+    k, v = _apply_kv_layout(k, v, kv_layout, paged=True)
     batch, head_kv = _validate_sparse_decode_inputs(
         q,
         k,
@@ -1100,8 +1163,8 @@ def sparse_decode_atten_func(
     )
     _call_sparse_decode_forward_sm100_paged_fp8(
         q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
+        _kv_kernel_view(k),
+        _kv_kernel_view(v),
         None if q2k_indices is None else q2k_indices.contiguous(),
         page_table.contiguous(),
         seqused_k.contiguous(),
@@ -1343,6 +1406,7 @@ class SparseDecodePagedAttentionWrapper:
         return_softmax_lse: bool = False,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
+        kv_layout: str = "HND",
     ):
         """Launch decode using metadata cached by ``plan``.
 
@@ -1362,6 +1426,10 @@ class SparseDecodePagedAttentionWrapper:
             Preallocated BF16 output buffer with shape ``q.shape``.
         lse : torch.Tensor, optional
             Preallocated float32 LSE buffer with shape ``[total_q, Hq]``.
+        kv_layout : str, optional
+            Paged K/V cache layout: ``"HND"`` (default) or ``"NHD"`` for
+            ``[num_pages, blk_kv, Hkv, 128]`` caches (contiguous NHD caches
+            are consumed zero-copy).
 
         Returns
         -------
@@ -1381,8 +1449,11 @@ class SparseDecodePagedAttentionWrapper:
                 softmax_scale=softmax_scale, return_softmax_lse=return_softmax_lse,
                 schedule=self.decode_schedule,
                 O_partial=self.O_partial, LSE_partial=self.LSE_partial,
+                kv_layout=kv_layout,
             )
 
+        k, v = _apply_kv_layout(k, v, kv_layout, paged=True)
+        k, v = _kv_kernel_view(k), _kv_kernel_view(v)
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
         if out is None:

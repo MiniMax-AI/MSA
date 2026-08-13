@@ -34,6 +34,10 @@ struct FMHACutlassSM100Params {
   int k_stride_h;
   int v_stride_n;
   int v_stride_h;
+  // Within-page token stride for paged K/V (elements). 0 selects the
+  // HND-contiguous default head_dim; NHD caches pass Hkv * head_dim.
+  int k_stride_t = 0;
+  int v_stride_t = 0;
   int batch_size;
   int total_qo_len;
   int total_kv_len;

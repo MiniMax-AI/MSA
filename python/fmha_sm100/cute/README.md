@@ -163,11 +163,15 @@ objects raise an error instead of silently falling back.
 ### Sparse Page Attention
 
 - `q`: `[total_q, Hq, D]`
-- `k`, `v`: `[num_pages, page_size, Hkv, D]`
+- `k`, `v`: `[num_pages, Hkv, page_size, D]` (`kv_layout="HND"`, default) or
+  `[num_pages, page_size, Hkv, D]` (`kv_layout="NHD"`)
 - `page_table`: `[B, max_num_pages_per_seq]`
 - `seqused_k`: optional `[B]`, logical valid KV length per batch
 - `cu_seqlens_q`: `[B + 1]`
 - do not pass `cu_seqlens_k` together with `page_table`
+- `kv_layout`: `"HND"` (default) or `"NHD"`; a standard contiguous NHD cache is
+  consumed zero-copy through strided TMA — inputs violating the alignment
+  contract (last dim strided, unaligned base/strides) fall back to a copy
 
 Use `seqused_k` whenever logical KV length is smaller than the physical page
 capacity. This is the normal way to represent partially used tail pages.
@@ -587,6 +591,7 @@ The decode path is intentionally narrower than the dense sparse path:
 | `page_size` | `128` (must equal `blk_kv`) |
 | Causal | `True` |
 | Batch | `1 ≤ B ≤ 1024` |
+| KV cache layout | `[num_pages, Hkv, 128, 128]` HND (default); `run(..., kv_layout="NHD")` accepts `[num_pages, 128, Hkv, 128]` (contiguous NHD caches are zero-copy) |
 
 `seqused_k` may vary across batch (variable-length decode is the design
 target).  The schedule includes a load-balance heuristic that triggers

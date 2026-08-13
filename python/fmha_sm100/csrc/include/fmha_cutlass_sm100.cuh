@@ -131,7 +131,9 @@ struct FwdRunner {
                          int q_stride_h_original = 0,
                          int h_r_original = 0,
                          PackGQAUnpackParams pack_gqa = {},
-                         int num_ctas = 0) {
+                         int num_ctas = 0,
+                         int k_stride_t = 0,
+                         int v_stride_t = 0) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count = (num_ctas > 0)
@@ -169,8 +171,12 @@ struct FwdRunner {
       int k_stride_head = k_stride_h;
       int v_stride_page = v_stride_n;
       int v_stride_head = v_stride_h;
-      stride_K = make_stride(head_dim_qk, _1{}, k_stride_head, k_stride_page);
-      stride_V = make_stride(_1{}, head_dim_vo, v_stride_head, v_stride_page);
+      // Within-page token stride: head_dim for HND-contiguous caches; NHD
+      // caches ([page, token, head, dim]) pass num_kv_heads * head_dim.
+      int k_stride_token = k_stride_t > 0 ? k_stride_t : head_dim_qk;
+      int v_stride_token = v_stride_t > 0 ? v_stride_t : head_dim_vo;
+      stride_K = make_stride(k_stride_token, _1{}, k_stride_head, k_stride_page);
+      stride_V = make_stride(_1{}, v_stride_token, v_stride_head, v_stride_page);
       auto shape_K = make_shape(KVPageSize, head_dim_qk, num_kv_heads, total_page_num);
       auto shape_V = make_shape(head_dim_vo, KVPageSize, num_kv_heads, total_page_num);
 
@@ -441,7 +447,9 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          int q_stride_h_original = 0,
                          int h_r_original = 0,
                          PackGQAUnpackParams pack_gqa = {},
-                         int num_ctas = 0) {
+                         int num_ctas = 0,
+                         int k_stride_t = 0,
+                         int v_stride_t = 0) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
                    ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
       workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
@@ -456,7 +464,7 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
       maybe_max_score, max_k_tiles,
       kv_block_indexes, kv_block_num,
       pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
-      pack_gqa, num_ctas);
+      pack_gqa, num_ctas, k_stride_t, v_stride_t);
 }
 
 };  // namespace flashinfer

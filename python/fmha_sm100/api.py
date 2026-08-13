@@ -1035,6 +1035,7 @@ def fmha_sm100(
     q_offset_override: Optional[Union[int, torch.Tensor]] = None,
     out: Optional[torch.Tensor] = None,
     max_score: Optional[torch.Tensor] = None,
+    kv_layout: str = "HND",
     **kwargs
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Run dense, paged, or sparse SM100 FMHA using a precomputed plan.
@@ -1047,7 +1048,10 @@ def fmha_sm100(
         128.
     k : torch.Tensor
         Dense layout ``[total_kv_len, num_kv_heads, head_dim]`` or paged layout
-        ``[total_pages, num_kv_heads, page_size, head_dim]``.
+        ``[total_pages, num_kv_heads, page_size, head_dim]`` (``kv_layout="HND"``,
+        default).  Paged NHD caches ``[total_pages, page_size, num_kv_heads,
+        head_dim]`` are supported with ``kv_layout="NHD"`` (contiguous NHD
+        caches are consumed zero-copy; requires ``kv_indices``).
     v : torch.Tensor
         Same layout as ``k``.  The output head dimension follows ``v.shape[-1]``.
     plan_info : tuple
@@ -1072,6 +1076,9 @@ def fmha_sm100(
     max_score : torch.Tensor, optional
         Preallocated per-KV-tile score buffer with shape
         ``[num_qo_heads, max_k_tiles, total_qo_len]`` and dtype float32.
+    kv_layout : str, optional
+        Paged K/V cache layout, ``"HND"`` (default) or ``"NHD"``.  Only valid
+        for paged (4D) ``k``/``v``.
     **kwargs
         Runtime options forwarded to the kernel runner.  Common options are
         ``sm_scale``, ``q_scale``, ``k_scale``, ``v_scale``, ``o_scale``,
@@ -1084,6 +1091,16 @@ def fmha_sm100(
         output was disabled.  When both decode and prefill sub-plans are used,
         outputs are concatenated back into the original batch order.
     """
+    if kv_layout != "HND":
+        if kv_layout != "NHD":
+            raise ValueError(f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}")
+        if kv_indices is None or k.dim() != 4 or v.dim() != 4:
+            raise ValueError(
+                "kv_layout='NHD' requires paged k/v with shape "
+                "[total_pages, page_size, num_kv_heads, head_dim] and kv_indices"
+            )
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
     has_mixed_prefill, split, batch_size, decode, prefill = plan_info
     if not has_mixed_prefill:
         return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices,kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)
