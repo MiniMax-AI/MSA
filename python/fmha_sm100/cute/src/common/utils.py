@@ -208,32 +208,18 @@ def warp_reduce(
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
-        return Float32(
-            nvvm.fmax(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
+    # nvidia-cutlass-dsl 4.6.x binds nvvm.fmax(a, b, *, c=None, ...) for every CUDA
+    # flavor (cu12 and cu13); the result type is inferred, so the old explicit
+    # T.f32() leading argument is rejected. Always use the inferred-result call.
+    return Float32(
+        nvvm.fmax(
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+            loc=loc,
+            ip=ip,
         )
-    else:
-        # New API: infers result type automatically
-        return Float32(
-            nvvm.fmax(
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        )
+    )
 
 
 @cute.jit

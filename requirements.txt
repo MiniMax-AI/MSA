@@ -10,5 +10,5 @@ pybind11
 cuda-python
 
 # CuTe-DSL sparse attention backend
-nvidia-cutlass-dsl>=4.4.1
-quack-kernels>=0.2.10
+nvidia-cutlass-dsl==4.6.2
+quack-kernels==0.6.4
