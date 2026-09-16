@@ -1,0 +1,233 @@
+{
+  "case_count": 32,
+  "cases": [
+    {
+      "benchmark_case_id": 0,
+      "case_id": 516,
+      "rank": 0,
+      "representative_weight": 46,
+      "stratum": "shape_00"
+    },
+    {
+      "benchmark_case_id": 1,
+      "case_id": 12,
+      "rank": 1,
+      "representative_weight": 47,
+      "stratum": "shape_01"
+    },
+    {
+      "benchmark_case_id": 2,
+      "case_id": 739,
+      "rank": 2,
+      "representative_weight": 47,
+      "stratum": "shape_02"
+    },
+    {
+      "benchmark_case_id": 3,
+      "case_id": 929,
+      "rank": 3,
+      "representative_weight": 47,
+      "stratum": "shape_03"
+    },
+    {
+      "benchmark_case_id": 4,
+      "case_id": 16,
+      "rank": 4,
+      "representative_weight": 47,
+      "stratum": "shape_04"
+    },
+    {
+      "benchmark_case_id": 5,
+      "case_id": 181,
+      "rank": 5,
+      "representative_weight": 47,
+      "stratum": "shape_05"
+    },
+    {
+      "benchmark_case_id": 6,
+      "case_id": 317,
+      "rank": 6,
+      "representative_weight": 47,
+      "stratum": "shape_06"
+    },
+    {
+      "benchmark_case_id": 7,
+      "case_id": 500,
+      "rank": 7,
+      "representative_weight": 47,
+      "stratum": "shape_07"
+    },
+    {
+      "benchmark_case_id": 8,
+      "case_id": 431,
+      "rank": 8,
+      "representative_weight": 46,
+      "stratum": "shape_08"
+    },
+    {
+      "benchmark_case_id": 9,
+      "case_id": 1105,
+      "rank": 9,
+      "representative_weight": 47,
+      "stratum": "shape_09"
+    },
+    {
+      "benchmark_case_id": 10,
+      "case_id": 346,
+      "rank": 10,
+      "representative_weight": 47,
+      "stratum": "shape_10"
+    },
+    {
+      "benchmark_case_id": 11,
+      "case_id": 48,
+      "rank": 11,
+      "representative_weight": 47,
+      "stratum": "shape_11"
+    },
+    {
+      "benchmark_case_id": 12,
+      "case_id": 1080,
+      "rank": 12,
+      "representative_weight": 47,
+      "stratum": "shape_12"
+    },
+    {
+      "benchmark_case_id": 13,
+      "case_id": 18,
+      "rank": 13,
+      "representative_weight": 47,
+      "stratum": "shape_13"
+    },
+    {
+      "benchmark_case_id": 14,
+      "case_id": 521,
+      "rank": 14,
+      "representative_weight": 47,
+      "stratum": "shape_14"
+    },
+    {
+      "benchmark_case_id": 15,
+      "case_id": 820,
+      "rank": 15,
+      "representative_weight": 47,
+      "stratum": "shape_15"
+    },
+    {
+      "benchmark_case_id": 16,
+      "case_id": 1177,
+      "rank": 0,
+      "representative_weight": 46,
+      "stratum": "shape_16"
+    },
+    {
+      "benchmark_case_id": 17,
+      "case_id": 21,
+      "rank": 1,
+      "representative_weight": 47,
+      "stratum": "shape_17"
+    },
+    {
+      "benchmark_case_id": 18,
+      "case_id": 439,
+      "rank": 2,
+      "representative_weight": 47,
+      "stratum": "shape_18"
+    },
+    {
+      "benchmark_case_id": 19,
+      "case_id": 409,
+      "rank": 3,
+      "representative_weight": 47,
+      "stratum": "shape_19"
+    },
+    {
+      "benchmark_case_id": 20,
+      "case_id": 985,
+      "rank": 4,
+      "representative_weight": 47,
+      "stratum": "shape_20"
+    },
+    {
+      "benchmark_case_id": 21,
+      "case_id": 54,
+      "rank": 5,
+      "representative_weight": 47,
+      "stratum": "shape_21"
+    },
+    {
+      "benchmark_case_id": 22,
+      "case_id": 1251,
+      "rank": 6,
+      "representative_weight": 47,
+      "stratum": "shape_22"
+    },
+    {
+      "benchmark_case_id": 23,
+      "case_id": 681,
+      "rank": 7,
+      "representative_weight": 47,
+      "stratum": "shape_23"
+    },
+    {
+      "benchmark_case_id": 24,
+      "case_id": 760,
+      "rank": 8,
+      "representative_weight": 46,
+      "stratum": "shape_24"
+    },
+    {
+      "benchmark_case_id": 25,
+      "case_id": 11,
+      "rank": 9,
+      "representative_weight": 47,
+      "stratum": "shape_25"
+    },
+    {
+      "benchmark_case_id": 26,
+      "case_id": 46,
+      "rank": 10,
+      "representative_weight": 47,
+      "stratum": "shape_26"
+    },
+    {
+      "benchmark_case_id": 27,
+      "case_id": 37,
+      "rank": 11,
+      "representative_weight": 47,
+      "stratum": "shape_27"
+    },
+    {
+      "benchmark_case_id": 28,
+      "case_id": 37,
+      "rank": 12,
+      "representative_weight": 47,
+      "stratum": "shape_28"
+    },
+    {
+      "benchmark_case_id": 29,
+      "case_id": 37,
+      "rank": 13,
+      "representative_weight": 47,
+      "stratum": "shape_29"
+    },
+    {
+      "benchmark_case_id": 30,
+      "case_id": 37,
+      "rank": 14,
+      "representative_weight": 47,
+      "stratum": "shape_30"
+    },
+    {
+      "benchmark_case_id": 31,
+      "case_id": 37,
+      "rank": 15,
+      "representative_weight": 47,
+      "stratum": "shape_31"
+    }
+  ],
+  "manifest_sha256": "c83ce85e1ebf9b679cfe713de9cb8e2373684b2309d869e139e22eee6e2a4ac4",
+  "represented_cases": 1500,
+  "scenario": "192k_cp16",
+  "schema_version": 1
+}

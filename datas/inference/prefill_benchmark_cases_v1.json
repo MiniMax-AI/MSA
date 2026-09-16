@@ -1,0 +1,1853 @@
+{
+  "schema_version": 1,
+  "case_kind": "inference_prefill_benchmark_selection",
+  "manifest_files": [
+    "prefill_cases_v1/part-00000.jsonl",
+    "prefill_cases_v1/part-00001.jsonl",
+    "prefill_cases_v1/part-00002.jsonl"
+  ],
+  "manifest_sha256": "9f4337f47cd453b9f721cf988d77aab54afefd3e64b438f19862e1336d8f44d2",
+  "default_case_count": 128,
+  "selection": {
+    "representative": "one count-weighted medoid from each occupied batch/task/max-final-KV stratum",
+    "hot": "top 32 cases by merged count",
+    "batch_anchor": "the highest-count case for every observed batch size",
+    "stress": "round-robin extrema for zero useful FLOPs, LPT imbalance, tile waste, final KV, score workspace, TopK work, issued FLOPs, candidate tasks, valid tasks, and query skew",
+    "aggregate_rule": "production-weighted aggregates use only representative entries and representative_weight; hot/stress-only entries are diagnostic"
+  },
+  "representative_strata": {
+    "case_count": 66,
+    "represented_calls": 14805,
+    "batch_buckets": [
+      "1",
+      "2",
+      "3-4",
+      "5-8",
+      "9-18"
+    ],
+    "valid_q_tile_buckets": [
+      "1-3",
+      "4-20",
+      "21-63",
+      "64+"
+    ],
+    "max_final_kv_buckets": [
+      "<=32K",
+      "32K-64K",
+      "64K-128K",
+      ">128K"
+    ]
+  },
+  "cases": [
+    {
+      "case_id": "prefill_4469427d069d9467c4ec",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 171,
+      "max_final_kv": 55339,
+      "valid_q_tiles": 1,
+      "useful_flops": 2416443392,
+      "topk_candidate_entries": 73915,
+      "representative_weight": 1325,
+      "stratum": "b1/t1_3/k_32_64k"
+    },
+    {
+      "case_id": "prefill_f97f037f8487ee6aa442",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 338,
+      "max_final_kv": 74578,
+      "valid_q_tiles": 2,
+      "useful_flops": 6433406976,
+      "topk_candidate_entries": 196670,
+      "representative_weight": 1418,
+      "stratum": "b1/t1_3/k_64_128k"
+    },
+    {
+      "case_id": "prefill_86678b0105c69ec088c0",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 347,
+      "max_final_kv": 131547,
+      "valid_q_tiles": 2,
+      "useful_flops": 11664916480,
+      "topk_candidate_entries": 356332,
+      "representative_weight": 312,
+      "stratum": "b1/t1_3/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_092e27340df8621a02f0",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 182,
+      "max_final_kv": 17718,
+      "valid_q_tiles": 1,
+      "useful_flops": 818806784,
+      "topk_candidate_entries": 25170,
+      "representative_weight": 611,
+      "stratum": "b1/t1_3/k_le_32k"
+    },
+    {
+      "case_id": "prefill_d22a4b5be28082b9ab95",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 9844,
+      "max_final_kv": 48884,
+      "valid_q_tiles": 39,
+      "useful_flops": 110625947648,
+      "topk_candidate_entries": 3385880,
+      "representative_weight": 110,
+      "stratum": "b1/t21_63/k_32_64k"
+    },
+    {
+      "case_id": "prefill_54ec654e7ba25c09a6fa",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 10295,
+      "max_final_kv": 85815,
+      "valid_q_tiles": 41,
+      "useful_flops": 212432650240,
+      "topk_candidate_entries": 6493225,
+      "representative_weight": 103,
+      "stratum": "b1/t21_63/k_64_128k"
+    },
+    {
+      "case_id": "prefill_8959e3218982c0dbe5ab",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 8476,
+      "max_final_kv": 153884,
+      "valid_q_tiles": 34,
+      "useful_flops": 324571758592,
+      "topk_candidate_entries": 9913620,
+      "representative_weight": 14,
+      "stratum": "b1/t21_63/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_ab83cdb497fa333cf12e",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 8897,
+      "max_final_kv": 25537,
+      "valid_q_tiles": 35,
+      "useful_flops": 47886598144,
+      "topk_candidate_entries": 1470280,
+      "representative_weight": 47,
+      "stratum": "b1/t21_63/k_le_32k"
+    },
+    {
+      "case_id": "prefill_36d8d7ac7e52c5d67548",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 1404,
+      "max_final_kv": 46844,
+      "valid_q_tiles": 6,
+      "useful_flops": 16561602560,
+      "topk_candidate_entries": 506824,
+      "representative_weight": 492,
+      "stratum": "b1/t4_20/k_32_64k"
+    },
+    {
+      "case_id": "prefill_247ae467810aea26ebbf",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 1626,
+      "max_final_kv": 93146,
+      "valid_q_tiles": 7,
+      "useful_flops": 38407962624,
+      "topk_candidate_entries": 1173744,
+      "representative_weight": 565,
+      "stratum": "b1/t4_20/k_64_128k"
+    },
+    {
+      "case_id": "prefill_d8bdc0c82b7a4eae78f7",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 1649,
+      "max_final_kv": 135537,
+      "valid_q_tiles": 7,
+      "useful_flops": 56841273344,
+      "topk_candidate_entries": 1736307,
+      "representative_weight": 180,
+      "stratum": "b1/t4_20/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_7553c6c786d260ba4222",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 1623,
+      "max_final_kv": 18007,
+      "valid_q_tiles": 7,
+      "useful_flops": 7118389248,
+      "topk_candidate_entries": 218859,
+      "representative_weight": 388,
+      "stratum": "b1/t4_20/k_le_32k"
+    },
+    {
+      "case_id": "prefill_c17ccf7fbbb5d1ee5648",
+      "tags": [
+        "representative"
+      ],
+      "count": 3,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 47744,
+      "valid_q_tiles": 64,
+      "useful_flops": 165624676352,
+      "topk_candidate_entries": 5070848,
+      "representative_weight": 2477,
+      "stratum": "b1/t64_plus/k_32_64k"
+    },
+    {
+      "case_id": "prefill_167dfbd500b44961b5cb",
+      "tags": [
+        "representative"
+      ],
+      "count": 3,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 84480,
+      "valid_q_tiles": 64,
+      "useful_flops": 319706628096,
+      "topk_candidate_entries": 9773056,
+      "representative_weight": 1347,
+      "stratum": "b1/t64_plus/k_64_128k"
+    },
+    {
+      "case_id": "prefill_d29bd020e01f73ad62dc",
+      "tags": [
+        "representative"
+      ],
+      "count": 2,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 173824,
+      "valid_q_tiles": 64,
+      "useful_flops": 694442524672,
+      "topk_candidate_entries": 21209088,
+      "representative_weight": 35,
+      "stratum": "b1/t64_plus/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_34d5c963ddbc73bd8549",
+      "tags": [
+        "representative"
+      ],
+      "count": 6,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 27136,
+      "valid_q_tiles": 64,
+      "useful_flops": 79188459520,
+      "topk_candidate_entries": 2433024,
+      "representative_weight": 1010,
+      "stratum": "b1/t64_plus/k_le_32k"
+    },
+    {
+      "case_id": "prefill_632b631504ef33240a42",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 350,
+      "max_final_kv": 55282,
+      "valid_q_tiles": 2,
+      "useful_flops": 3399942144,
+      "topk_candidate_entries": 104108,
+      "representative_weight": 134,
+      "stratum": "b2/t1_3/k_32_64k"
+    },
+    {
+      "case_id": "prefill_a846fee6797e744e3a61",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 325,
+      "max_final_kv": 86544,
+      "valid_q_tiles": 2,
+      "useful_flops": 7078051840,
+      "topk_candidate_entries": 216330,
+      "representative_weight": 156,
+      "stratum": "b2/t1_3/k_64_128k"
+    },
+    {
+      "case_id": "prefill_8ef518965f93e0196db8",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 327,
+      "max_final_kv": 140055,
+      "valid_q_tiles": 2,
+      "useful_flops": 11073814528,
+      "topk_candidate_entries": 338273,
+      "representative_weight": 5,
+      "stratum": "b2/t1_3/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_9e55a33ef8b8965cd744",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 326,
+      "max_final_kv": 27277,
+      "valid_q_tiles": 2,
+      "useful_flops": 2194210816,
+      "topk_candidate_entries": 67288,
+      "representative_weight": 23,
+      "stratum": "b2/t1_3/k_le_32k"
+    },
+    {
+      "case_id": "prefill_4a9643bd5e663cbfc26d",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 10499,
+      "max_final_kv": 42113,
+      "valid_q_tiles": 42,
+      "useful_flops": 84981022720,
+      "topk_candidate_entries": 2603914,
+      "representative_weight": 60,
+      "stratum": "b2/t21_63/k_32_64k"
+    },
+    {
+      "case_id": "prefill_1c29748e251922114173",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 10912,
+      "max_final_kv": 101810,
+      "valid_q_tiles": 43,
+      "useful_flops": 183786799104,
+      "topk_candidate_entries": 5619640,
+      "representative_weight": 128,
+      "stratum": "b2/t21_63/k_64_128k"
+    },
+    {
+      "case_id": "prefill_cf15db4f4daea6fd2b43",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 8756,
+      "max_final_kv": 154704,
+      "valid_q_tiles": 35,
+      "useful_flops": 217068077056,
+      "topk_candidate_entries": 6633148,
+      "representative_weight": 12,
+      "stratum": "b2/t21_63/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_bc9a8c9d38a767d19219",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 6716,
+      "max_final_kv": 20084,
+      "valid_q_tiles": 27,
+      "useful_flops": 25719734272,
+      "topk_candidate_entries": 791620,
+      "representative_weight": 12,
+      "stratum": "b2/t21_63/k_le_32k"
+    },
+    {
+      "case_id": "prefill_83aeb655de9ae32e332d",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 1487,
+      "max_final_kv": 49957,
+      "valid_q_tiles": 7,
+      "useful_flops": 17993957376,
+      "topk_candidate_entries": 550619,
+      "representative_weight": 380,
+      "stratum": "b2/t4_20/k_32_64k"
+    },
+    {
+      "case_id": "prefill_1c56206835126754d10b",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 1486,
+      "max_final_kv": 86013,
+      "valid_q_tiles": 7,
+      "useful_flops": 30409490432,
+      "topk_candidate_entries": 929510,
+      "representative_weight": 361,
+      "stratum": "b2/t4_20/k_64_128k"
+    },
+    {
+      "case_id": "prefill_3b67e1e4c70349ed931d",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 1791,
+      "max_final_kv": 148937,
+      "valid_q_tiles": 8,
+      "useful_flops": 58957660160,
+      "topk_candidate_entries": 1801036,
+      "representative_weight": 41,
+      "stratum": "b2/t4_20/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_329f6b1afa56b926adc9",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 1708,
+      "max_final_kv": 28543,
+      "valid_q_tiles": 8,
+      "useful_flops": 9264955392,
+      "topk_candidate_entries": 284452,
+      "representative_weight": 113,
+      "stratum": "b2/t4_20/k_le_32k"
+    },
+    {
+      "case_id": "prefill_cf1acc6ec2e8340d138c",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 16268,
+      "max_final_kv": 53951,
+      "valid_q_tiles": 65,
+      "useful_flops": 144135290880,
+      "topk_candidate_entries": 4414928,
+      "representative_weight": 216,
+      "stratum": "b2/t64_plus/k_32_64k"
+    },
+    {
+      "case_id": "prefill_eb345f6ede4eae3bb3cb",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 16189,
+      "max_final_kv": 84983,
+      "valid_q_tiles": 64,
+      "useful_flops": 234049798144,
+      "topk_candidate_entries": 7158822,
+      "representative_weight": 292,
+      "stratum": "b2/t64_plus/k_64_128k"
+    },
+    {
+      "case_id": "prefill_9059df916c15e29d346c",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 16309,
+      "max_final_kv": 137728,
+      "valid_q_tiles": 64,
+      "useful_flops": 358403375104,
+      "topk_candidate_entries": 10953912,
+      "representative_weight": 6,
+      "stratum": "b2/t64_plus/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_b77627e59f45421a6d11",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 16318,
+      "max_final_kv": 26942,
+      "valid_q_tiles": 65,
+      "useful_flops": 75617927168,
+      "topk_candidate_entries": 2323994,
+      "representative_weight": 42,
+      "stratum": "b2/t64_plus/k_le_32k"
+    },
+    {
+      "case_id": "prefill_d6866ca6a9a8e6365f9e",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 398,
+      "max_final_kv": 58672,
+      "valid_q_tiles": 3,
+      "useful_flops": 5042405376,
+      "topk_candidate_entries": 154280,
+      "representative_weight": 5,
+      "stratum": "b3_4/t1_3/k_32_64k"
+    },
+    {
+      "case_id": "prefill_89518ea98d3d5cc801d0",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 406,
+      "max_final_kv": 88872,
+      "valid_q_tiles": 3,
+      "useful_flops": 7832272896,
+      "topk_candidate_entries": 239428,
+      "representative_weight": 9,
+      "stratum": "b3_4/t1_3/k_64_128k"
+    },
+    {
+      "case_id": "prefill_b8d425c3ea26ee1d3d1a",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 630,
+      "max_final_kv": 32723,
+      "valid_q_tiles": 3,
+      "useful_flops": 4597153792,
+      "topk_candidate_entries": 140924,
+      "representative_weight": 1,
+      "stratum": "b3_4/t1_3/k_le_32k"
+    },
+    {
+      "case_id": "prefill_6d560c83cfd7310129c4",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 8802,
+      "max_final_kv": 48226,
+      "valid_q_tiles": 36,
+      "useful_flops": 68407459840,
+      "topk_candidate_entries": 2096432,
+      "representative_weight": 101,
+      "stratum": "b3_4/t21_63/k_32_64k"
+    },
+    {
+      "case_id": "prefill_7e6aa8ec3387a0ecc03b",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 4,
+      "total_q": 9421,
+      "max_final_kv": 97157,
+      "valid_q_tiles": 39,
+      "useful_flops": 176016490496,
+      "topk_candidate_entries": 5381018,
+      "representative_weight": 198,
+      "stratum": "b3_4/t21_63/k_64_128k"
+    },
+    {
+      "case_id": "prefill_8b0ea8b703b310243b0e",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 9102,
+      "max_final_kv": 136510,
+      "valid_q_tiles": 38,
+      "useful_flops": 270505541632,
+      "topk_candidate_entries": 8264276,
+      "representative_weight": 19,
+      "stratum": "b3_4/t21_63/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_710beea1e90b1a2107c4",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 7991,
+      "max_final_kv": 24474,
+      "valid_q_tiles": 33,
+      "useful_flops": 31771688960,
+      "topk_candidate_entries": 977586,
+      "representative_weight": 36,
+      "stratum": "b3_4/t21_63/k_le_32k"
+    },
+    {
+      "case_id": "prefill_0aea0dd527cd4b9d0629",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 2285,
+      "max_final_kv": 43851,
+      "valid_q_tiles": 11,
+      "useful_flops": 19226165248,
+      "topk_candidate_entries": 589021,
+      "representative_weight": 353,
+      "stratum": "b3_4/t4_20/k_32_64k"
+    },
+    {
+      "case_id": "prefill_313bf85e62dec3a62862",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 2117,
+      "max_final_kv": 80539,
+      "valid_q_tiles": 10,
+      "useful_flops": 32679690240,
+      "topk_candidate_entries": 999422,
+      "representative_weight": 279,
+      "stratum": "b3_4/t4_20/k_64_128k"
+    },
+    {
+      "case_id": "prefill_3abc80aacf52627f7bf8",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 3380,
+      "max_final_kv": 148387,
+      "valid_q_tiles": 15,
+      "useful_flops": 113586962432,
+      "topk_candidate_entries": 3469779,
+      "representative_weight": 8,
+      "stratum": "b3_4/t4_20/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_baa254379bb3ac2ee6b7",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 2410,
+      "max_final_kv": 31465,
+      "valid_q_tiles": 11,
+      "useful_flops": 16047144960,
+      "topk_candidate_entries": 492130,
+      "representative_weight": 60,
+      "stratum": "b3_4/t4_20/k_le_32k"
+    },
+    {
+      "case_id": "prefill_c75ae8554c920d3d48fc",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 16363,
+      "max_final_kv": 60917,
+      "valid_q_tiles": 65,
+      "useful_flops": 94381965312,
+      "topk_candidate_entries": 2896672,
+      "representative_weight": 84,
+      "stratum": "b3_4/t64_plus/k_32_64k"
+    },
+    {
+      "case_id": "prefill_739b4b71fac30c7a0273",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 16328,
+      "max_final_kv": 85362,
+      "valid_q_tiles": 65,
+      "useful_flops": 138078650368,
+      "topk_candidate_entries": 4230154,
+      "representative_weight": 322,
+      "stratum": "b3_4/t64_plus/k_64_128k"
+    },
+    {
+      "case_id": "prefill_464b2175d1025fa50947",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 16268,
+      "max_final_kv": 132069,
+      "valid_q_tiles": 64,
+      "useful_flops": 147229081600,
+      "topk_candidate_entries": 4509343,
+      "representative_weight": 10,
+      "stratum": "b3_4/t64_plus/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_18761377b753524d5bb6",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 4,
+      "total_q": 16223,
+      "max_final_kv": 30208,
+      "valid_q_tiles": 65,
+      "useful_flops": 64855146496,
+      "topk_candidate_entries": 1995445,
+      "representative_weight": 3,
+      "stratum": "b3_4/t64_plus/k_le_32k"
+    },
+    {
+      "case_id": "prefill_ca3cf58ae0ea6463c340",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 8,
+      "total_q": 7464,
+      "max_final_kv": 39295,
+      "valid_q_tiles": 32,
+      "useful_flops": 46557855744,
+      "topk_candidate_entries": 1428297,
+      "representative_weight": 192,
+      "stratum": "b5_8/t21_63/k_32_64k"
+    },
+    {
+      "case_id": "prefill_55613ca5ba346143a7ff",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 7,
+      "total_q": 8100,
+      "max_final_kv": 109864,
+      "valid_q_tiles": 35,
+      "useful_flops": 152665686016,
+      "topk_candidate_entries": 4667087,
+      "representative_weight": 111,
+      "stratum": "b5_8/t21_63/k_64_128k"
+    },
+    {
+      "case_id": "prefill_6dfbe1ea63d464d4d3b0",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 6,
+      "total_q": 13088,
+      "max_final_kv": 135155,
+      "valid_q_tiles": 53,
+      "useful_flops": 386274230272,
+      "topk_candidate_entries": 11801242,
+      "representative_weight": 7,
+      "stratum": "b5_8/t21_63/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_659946ccd41f728ea401",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 7,
+      "total_q": 8371,
+      "max_final_kv": 28531,
+      "valid_q_tiles": 36,
+      "useful_flops": 35648798720,
+      "topk_candidate_entries": 1096286,
+      "representative_weight": 62,
+      "stratum": "b5_8/t21_63/k_le_32k"
+    },
+    {
+      "case_id": "prefill_e77ac4d03ef7a2ac8ffe",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 5,
+      "total_q": 2666,
+      "max_final_kv": 51665,
+      "valid_q_tiles": 13,
+      "useful_flops": 22444638208,
+      "topk_candidate_entries": 687622,
+      "representative_weight": 142,
+      "stratum": "b5_8/t4_20/k_32_64k"
+    },
+    {
+      "case_id": "prefill_1602922747e26c5bc005",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 5,
+      "total_q": 2897,
+      "max_final_kv": 85048,
+      "valid_q_tiles": 14,
+      "useful_flops": 42182475776,
+      "topk_candidate_entries": 1290204,
+      "representative_weight": 55,
+      "stratum": "b5_8/t4_20/k_64_128k"
+    },
+    {
+      "case_id": "prefill_9fc97583e41f14e7709c",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 5,
+      "total_q": 3164,
+      "max_final_kv": 135816,
+      "valid_q_tiles": 15,
+      "useful_flops": 83754418176,
+      "topk_candidate_entries": 2559146,
+      "representative_weight": 1,
+      "stratum": "b5_8/t4_20/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_ccccf3927960e35c84b5",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 5,
+      "total_q": 3052,
+      "max_final_kv": 31121,
+      "valid_q_tiles": 16,
+      "useful_flops": 16493674496,
+      "topk_candidate_entries": 506399,
+      "representative_weight": 20,
+      "stratum": "b5_8/t4_20/k_le_32k"
+    },
+    {
+      "case_id": "prefill_28c848ea979b58acba7e",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 5,
+      "total_q": 15787,
+      "max_final_kv": 51283,
+      "valid_q_tiles": 64,
+      "useful_flops": 133431656448,
+      "topk_candidate_entries": 4087798,
+      "representative_weight": 28,
+      "stratum": "b5_8/t64_plus/k_32_64k"
+    },
+    {
+      "case_id": "prefill_626cf367d7d64685a1ae",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 7,
+      "total_q": 15961,
+      "max_final_kv": 94153,
+      "valid_q_tiles": 66,
+      "useful_flops": 150713991168,
+      "topk_candidate_entries": 4615387,
+      "representative_weight": 122,
+      "stratum": "b5_8/t64_plus/k_64_128k"
+    },
+    {
+      "case_id": "prefill_2ed44ff2c5faa73c580a",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 5,
+      "total_q": 16010,
+      "max_final_kv": 141718,
+      "valid_q_tiles": 65,
+      "useful_flops": 101198430208,
+      "topk_candidate_entries": 3104341,
+      "representative_weight": 2,
+      "stratum": "b5_8/t64_plus/k_gt_128k"
+    },
+    {
+      "case_id": "prefill_43aff1f3e6e2eb904108",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 8,
+      "total_q": 15904,
+      "max_final_kv": 31232,
+      "valid_q_tiles": 66,
+      "useful_flops": 69649235968,
+      "topk_candidate_entries": 2141430,
+      "representative_weight": 6,
+      "stratum": "b5_8/t64_plus/k_le_32k"
+    },
+    {
+      "case_id": "prefill_d1bcfda694aeba4d78ea",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 10,
+      "total_q": 10226,
+      "max_final_kv": 45106,
+      "valid_q_tiles": 46,
+      "useful_flops": 80094167040,
+      "topk_candidate_entries": 2454506,
+      "representative_weight": 98,
+      "stratum": "b9_18/t21_63/k_32_64k"
+    },
+    {
+      "case_id": "prefill_f1de2984e28d9bb26547",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 10,
+      "total_q": 9115,
+      "max_final_kv": 73356,
+      "valid_q_tiles": 41,
+      "useful_flops": 140441681920,
+      "topk_candidate_entries": 4295055,
+      "representative_weight": 11,
+      "stratum": "b9_18/t21_63/k_64_128k"
+    },
+    {
+      "case_id": "prefill_18db56edf73bb3cfd8dd",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 10,
+      "total_q": 11058,
+      "max_final_kv": 31939,
+      "valid_q_tiles": 48,
+      "useful_flops": 52892368896,
+      "topk_candidate_entries": 1625205,
+      "representative_weight": 15,
+      "stratum": "b9_18/t21_63/k_le_32k"
+    },
+    {
+      "case_id": "prefill_8896c4678f5263494cfb",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 9,
+      "total_q": 3922,
+      "max_final_kv": 40435,
+      "valid_q_tiles": 19,
+      "useful_flops": 28644442112,
+      "topk_candidate_entries": 878081,
+      "representative_weight": 1,
+      "stratum": "b9_18/t4_20/k_32_64k"
+    },
+    {
+      "case_id": "prefill_95ce8383e28a26683a46",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 10,
+      "total_q": 15924,
+      "max_final_kv": 49696,
+      "valid_q_tiles": 67,
+      "useful_flops": 108812697600,
+      "topk_candidate_entries": 3336624,
+      "representative_weight": 20,
+      "stratum": "b9_18/t64_plus/k_32_64k"
+    },
+    {
+      "case_id": "prefill_c39ecf4f352379dc912c",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 11,
+      "total_q": 15732,
+      "max_final_kv": 73978,
+      "valid_q_tiles": 67,
+      "useful_flops": 221914529792,
+      "topk_candidate_entries": 6788026,
+      "representative_weight": 4,
+      "stratum": "b9_18/t64_plus/k_64_128k"
+    },
+    {
+      "case_id": "prefill_85c655e12d958652e3c8",
+      "tags": [
+        "representative"
+      ],
+      "count": 1,
+      "batch_size": 10,
+      "total_q": 15609,
+      "max_final_kv": 27776,
+      "valid_q_tiles": 67,
+      "useful_flops": 79853846528,
+      "topk_candidate_entries": 2452555,
+      "representative_weight": 5,
+      "stratum": "b9_18/t64_plus/k_le_32k"
+    },
+    {
+      "case_id": "prefill_7953b8e79a90685965e9",
+      "tags": [
+        "batch_anchor",
+        "hot",
+        "stress_query_skew"
+      ],
+      "count": 511,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 26368,
+      "valid_q_tiles": 64,
+      "useful_flops": 75967234048,
+      "topk_candidate_entries": 2334720
+    },
+    {
+      "case_id": "prefill_eefbbd8dfa0a2f8fe71b",
+      "tags": [
+        "hot",
+        "stress_query_skew"
+      ],
+      "count": 415,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 42752,
+      "valid_q_tiles": 64,
+      "useful_flops": 144686710784,
+      "topk_candidate_entries": 4431872
+    },
+    {
+      "case_id": "prefill_934338992d6b2743ade5",
+      "tags": [
+        "hot"
+      ],
+      "count": 295,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 59136,
+      "valid_q_tiles": 64,
+      "useful_flops": 213406187520,
+      "topk_candidate_entries": 6529024
+    },
+    {
+      "case_id": "prefill_5c729f270ae5caa65c73",
+      "tags": [
+        "hot"
+      ],
+      "count": 265,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 26496,
+      "valid_q_tiles": 64,
+      "useful_flops": 76504104960,
+      "topk_candidate_entries": 2351104
+    },
+    {
+      "case_id": "prefill_39efaabf4fe03c815c1e",
+      "tags": [
+        "hot"
+      ],
+      "count": 197,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 42880,
+      "valid_q_tiles": 64,
+      "useful_flops": 145223581696,
+      "topk_candidate_entries": 4448256
+    },
+    {
+      "case_id": "prefill_8bd3c2ca761c9e8ac8b7",
+      "tags": [
+        "hot"
+      ],
+      "count": 188,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 75520,
+      "valid_q_tiles": 64,
+      "useful_flops": 282125664256,
+      "topk_candidate_entries": 8626176
+    },
+    {
+      "case_id": "prefill_6a5688f1ea4c111ef7ff",
+      "tags": [
+        "hot"
+      ],
+      "count": 142,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 59264,
+      "valid_q_tiles": 64,
+      "useful_flops": 213943058432,
+      "topk_candidate_entries": 6545408
+    },
+    {
+      "case_id": "prefill_0b0e59728537e206ef55",
+      "tags": [
+        "hot"
+      ],
+      "count": 107,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 91904,
+      "valid_q_tiles": 64,
+      "useful_flops": 350845140992,
+      "topk_candidate_entries": 10723328
+    },
+    {
+      "case_id": "prefill_7bd48a41f12de7a30c49",
+      "tags": [
+        "hot"
+      ],
+      "count": 64,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 75648,
+      "valid_q_tiles": 64,
+      "useful_flops": 282662535168,
+      "topk_candidate_entries": 8642560
+    },
+    {
+      "case_id": "prefill_70c7ce5efee05f99d8b0",
+      "tags": [
+        "hot"
+      ],
+      "count": 63,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 108288,
+      "valid_q_tiles": 64,
+      "useful_flops": 419564617728,
+      "topk_candidate_entries": 12820480
+    },
+    {
+      "case_id": "prefill_30d5e7a472876cd9dfc4",
+      "tags": [
+        "hot"
+      ],
+      "count": 42,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 42496,
+      "valid_q_tiles": 64,
+      "useful_flops": 143612968960,
+      "topk_candidate_entries": 4399104
+    },
+    {
+      "case_id": "prefill_7bf22c13b8cd429ccec4",
+      "tags": [
+        "hot"
+      ],
+      "count": 33,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 58880,
+      "valid_q_tiles": 64,
+      "useful_flops": 212332445696,
+      "topk_candidate_entries": 6496256
+    },
+    {
+      "case_id": "prefill_bb91cdccb8f97a780df9",
+      "tags": [
+        "hot"
+      ],
+      "count": 33,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 92032,
+      "valid_q_tiles": 64,
+      "useful_flops": 351382011904,
+      "topk_candidate_entries": 10739712
+    },
+    {
+      "case_id": "prefill_9c0aa6e69d3086b14e5e",
+      "tags": [
+        "hot"
+      ],
+      "count": 30,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 42624,
+      "valid_q_tiles": 64,
+      "useful_flops": 144149839872,
+      "topk_candidate_entries": 4415488
+    },
+    {
+      "case_id": "prefill_03bf8afa1b4c2ee51e30",
+      "tags": [
+        "hot"
+      ],
+      "count": 25,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 42368,
+      "valid_q_tiles": 64,
+      "useful_flops": 143076098048,
+      "topk_candidate_entries": 4382720
+    },
+    {
+      "case_id": "prefill_7787a3475b5acebb7f9b",
+      "tags": [
+        "hot"
+      ],
+      "count": 23,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 42240,
+      "valid_q_tiles": 64,
+      "useful_flops": 142539227136,
+      "topk_candidate_entries": 4366336
+    },
+    {
+      "case_id": "prefill_904bab42efc30d8e6622",
+      "tags": [
+        "hot"
+      ],
+      "count": 21,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 124672,
+      "valid_q_tiles": 64,
+      "useful_flops": 488284094464,
+      "topk_candidate_entries": 14917632
+    },
+    {
+      "case_id": "prefill_bcf658634859e3d74723",
+      "tags": [
+        "hot"
+      ],
+      "count": 21,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 75264,
+      "valid_q_tiles": 64,
+      "useful_flops": 281051922432,
+      "topk_candidate_entries": 8593408
+    },
+    {
+      "case_id": "prefill_8ecc2f3f2006f86d4c89",
+      "tags": [
+        "hot"
+      ],
+      "count": 20,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 59008,
+      "valid_q_tiles": 64,
+      "useful_flops": 212869316608,
+      "topk_candidate_entries": 6512640
+    },
+    {
+      "case_id": "prefill_910e7b213a0912ece5cf",
+      "tags": [
+        "hot"
+      ],
+      "count": 19,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 41600,
+      "valid_q_tiles": 64,
+      "useful_flops": 139854872576,
+      "topk_candidate_entries": 4284416
+    },
+    {
+      "case_id": "prefill_37e644175fe8d5caf983",
+      "tags": [
+        "hot"
+      ],
+      "count": 18,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 58752,
+      "valid_q_tiles": 64,
+      "useful_flops": 211795574784,
+      "topk_candidate_entries": 6479872
+    },
+    {
+      "case_id": "prefill_7063879c128f8813cc27",
+      "tags": [
+        "hot"
+      ],
+      "count": 17,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 41472,
+      "valid_q_tiles": 64,
+      "useful_flops": 139318001664,
+      "topk_candidate_entries": 4268032
+    },
+    {
+      "case_id": "prefill_13cfa46f3d5d7e93b1ab",
+      "tags": [
+        "hot"
+      ],
+      "count": 16,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 57984,
+      "valid_q_tiles": 64,
+      "useful_flops": 208574349312,
+      "topk_candidate_entries": 6381568
+    },
+    {
+      "case_id": "prefill_2b6de3088e2a710cd147",
+      "tags": [
+        "hot"
+      ],
+      "count": 15,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 91648,
+      "valid_q_tiles": 64,
+      "useful_flops": 349771399168,
+      "topk_candidate_entries": 10690560
+    },
+    {
+      "case_id": "prefill_31c2cd24054feb5df52f",
+      "tags": [
+        "hot"
+      ],
+      "count": 15,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 75392,
+      "valid_q_tiles": 64,
+      "useful_flops": 281588793344,
+      "topk_candidate_entries": 8609792
+    },
+    {
+      "case_id": "prefill_05390a507dbc3b67edff",
+      "tags": [
+        "hot"
+      ],
+      "count": 14,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 75136,
+      "valid_q_tiles": 64,
+      "useful_flops": 280515051520,
+      "topk_candidate_entries": 8577024
+    },
+    {
+      "case_id": "prefill_05b7395dd14b7486455d",
+      "tags": [
+        "hot"
+      ],
+      "count": 14,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 58624,
+      "valid_q_tiles": 64,
+      "useful_flops": 211258703872,
+      "topk_candidate_entries": 6463488
+    },
+    {
+      "case_id": "prefill_1408031baf4a2aed934d",
+      "tags": [
+        "hot"
+      ],
+      "count": 14,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 42112,
+      "valid_q_tiles": 64,
+      "useful_flops": 142002356224,
+      "topk_candidate_entries": 4349952
+    },
+    {
+      "case_id": "prefill_3a07a4c16ef2b659f8fd",
+      "tags": [
+        "hot"
+      ],
+      "count": 14,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 75008,
+      "valid_q_tiles": 64,
+      "useful_flops": 279978180608,
+      "topk_candidate_entries": 8560640
+    },
+    {
+      "case_id": "prefill_c5ccc7000e276d135cb8",
+      "tags": [
+        "hot"
+      ],
+      "count": 14,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 108416,
+      "valid_q_tiles": 64,
+      "useful_flops": 420101488640,
+      "topk_candidate_entries": 12836864
+    },
+    {
+      "case_id": "prefill_1328d6d4f79f20e239eb",
+      "tags": [
+        "hot"
+      ],
+      "count": 13,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 36224,
+      "valid_q_tiles": 64,
+      "useful_flops": 117306294272,
+      "topk_candidate_entries": 3596288
+    },
+    {
+      "case_id": "prefill_1e827c5434f60822cdef",
+      "tags": [
+        "hot"
+      ],
+      "count": 13,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 52608,
+      "valid_q_tiles": 64,
+      "useful_flops": 186025771008,
+      "topk_candidate_entries": 5693440
+    },
+    {
+      "case_id": "prefill_00106f5b0e33b4e002f8",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 2,
+      "total_q": 16314,
+      "max_final_kv": 50874,
+      "valid_q_tiles": 64,
+      "useful_flops": 76667224064,
+      "topk_candidate_entries": 2356012
+    },
+    {
+      "case_id": "prefill_0020c25fae59bfa2285a",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 3,
+      "total_q": 863,
+      "max_final_kv": 42277,
+      "valid_q_tiles": 5,
+      "useful_flops": 8434614272,
+      "topk_candidate_entries": 258267
+    },
+    {
+      "case_id": "prefill_0006f3d56384ac89f14b",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 4,
+      "total_q": 2598,
+      "max_final_kv": 52027,
+      "valid_q_tiles": 12,
+      "useful_flops": 14704705536,
+      "topk_candidate_entries": 451350
+    },
+    {
+      "case_id": "prefill_0010023ffd95ecfb6337",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 5,
+      "total_q": 3093,
+      "max_final_kv": 54644,
+      "valid_q_tiles": 14,
+      "useful_flops": 20863254528,
+      "topk_candidate_entries": 639789
+    },
+    {
+      "case_id": "prefill_00390647c3b6228ff410",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 6,
+      "total_q": 15947,
+      "max_final_kv": 26977,
+      "valid_q_tiles": 65,
+      "useful_flops": 76904431616,
+      "topk_candidate_entries": 2362884
+    },
+    {
+      "case_id": "prefill_02d87372bb40baef079f",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 7,
+      "total_q": 5107,
+      "max_final_kv": 54714,
+      "valid_q_tiles": 23,
+      "useful_flops": 56619433984,
+      "topk_candidate_entries": 1732995
+    },
+    {
+      "case_id": "prefill_00f7b12d72ac32890f38",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 8,
+      "total_q": 5567,
+      "max_final_kv": 33406,
+      "valid_q_tiles": 26,
+      "useful_flops": 36920033280,
+      "topk_candidate_entries": 1132277
+    },
+    {
+      "case_id": "prefill_080b193a118a65ac045d",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 9,
+      "total_q": 13203,
+      "max_final_kv": 49433,
+      "valid_q_tiles": 56,
+      "useful_flops": 93297016832,
+      "topk_candidate_entries": 2860402
+    },
+    {
+      "case_id": "prefill_04a06583f13abca3b25d",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 10,
+      "total_q": 15758,
+      "max_final_kv": 36500,
+      "valid_q_tiles": 66,
+      "useful_flops": 91363344384,
+      "topk_candidate_entries": 2803946
+    },
+    {
+      "case_id": "prefill_3f79180b6d71d47c3e4c",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 11,
+      "total_q": 15928,
+      "max_final_kv": 47819,
+      "valid_q_tiles": 66,
+      "useful_flops": 124995796992,
+      "topk_candidate_entries": 3830497
+    },
+    {
+      "case_id": "prefill_06eb9c31d93ac20a3b89",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 12,
+      "total_q": 12269,
+      "max_final_kv": 55741,
+      "valid_q_tiles": 56,
+      "useful_flops": 93531570176,
+      "topk_candidate_entries": 2866626
+    },
+    {
+      "case_id": "prefill_21b3574884bf8d3e5526",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 13,
+      "total_q": 9535,
+      "max_final_kv": 33062,
+      "valid_q_tiles": 44,
+      "useful_flops": 51610910720,
+      "topk_candidate_entries": 1584575
+    },
+    {
+      "case_id": "prefill_0ddb16c10f1e1fc13853",
+      "tags": [
+        "batch_anchor",
+        "stress_valid_tasks"
+      ],
+      "count": 1,
+      "batch_size": 14,
+      "total_q": 15802,
+      "max_final_kv": 56961,
+      "valid_q_tiles": 68,
+      "useful_flops": 93427040256,
+      "topk_candidate_entries": 2866969
+    },
+    {
+      "case_id": "prefill_4e029f2b3c078a5a905f",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 15,
+      "total_q": 13810,
+      "max_final_kv": 39855,
+      "valid_q_tiles": 61,
+      "useful_flops": 78421721088,
+      "topk_candidate_entries": 2407051
+    },
+    {
+      "case_id": "prefill_e4e9a7e19c51fde47882",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 16,
+      "total_q": 13417,
+      "max_final_kv": 43222,
+      "valid_q_tiles": 59,
+      "useful_flops": 74989174784,
+      "topk_candidate_entries": 2301905
+    },
+    {
+      "case_id": "prefill_058cb9b8d5e3b45a2799",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 17,
+      "total_q": 11936,
+      "max_final_kv": 56203,
+      "valid_q_tiles": 57,
+      "useful_flops": 80787275776,
+      "topk_candidate_entries": 2477368
+    },
+    {
+      "case_id": "prefill_c5d85e8ca1cc43a25193",
+      "tags": [
+        "batch_anchor"
+      ],
+      "count": 1,
+      "batch_size": 18,
+      "total_q": 15330,
+      "max_final_kv": 51700,
+      "valid_q_tiles": 67,
+      "useful_flops": 86362783744,
+      "topk_candidate_entries": 2650913
+    },
+    {
+      "case_id": "prefill_71ca49d3833621538e26",
+      "tags": [
+        "stress_zero_useful_flops"
+      ],
+      "count": 11,
+      "batch_size": 1,
+      "total_q": 1,
+      "max_final_kv": 1,
+      "valid_q_tiles": 1,
+      "useful_flops": 0,
+      "topk_candidate_entries": 1
+    },
+    {
+      "case_id": "prefill_a6fba315f0b1de50bbb3",
+      "tags": [
+        "stress_candidate_tasks",
+        "stress_lpt_imbalance"
+      ],
+      "count": 1,
+      "batch_size": 8,
+      "total_q": 14552,
+      "max_final_kv": 121789,
+      "valid_q_tiles": 60,
+      "useful_flops": 421394087936,
+      "topk_candidate_entries": 12874479
+    },
+    {
+      "case_id": "prefill_3bae7083e0b65d7d2c2f",
+      "tags": [
+        "stress_tile_waste"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 7,
+      "max_final_kv": 20487,
+      "valid_q_tiles": 1,
+      "useful_flops": 36700160,
+      "topk_candidate_entries": 1127
+    },
+    {
+      "case_id": "prefill_26ab2fa007cb0d636c1c",
+      "tags": [
+        "stress_issued_flops",
+        "stress_max_final_kv",
+        "stress_score_workspace",
+        "stress_topk_candidates"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 16121,
+      "max_final_kv": 337401,
+      "valid_q_tiles": 63,
+      "useful_flops": 1358916321280,
+      "topk_candidate_entries": 41486956
+    },
+    {
+      "case_id": "prefill_15b78bc70a54afafb7b6",
+      "tags": [
+        "stress_candidate_tasks"
+      ],
+      "count": 1,
+      "batch_size": 8,
+      "total_q": 15820,
+      "max_final_kv": 88907,
+      "valid_q_tiles": 66,
+      "useful_flops": 100336140288,
+      "topk_candidate_entries": 3077836
+    },
+    {
+      "case_id": "prefill_3fb2d7cdfc4f9ffe6ef2",
+      "tags": [
+        "stress_valid_tasks"
+      ],
+      "count": 1,
+      "batch_size": 17,
+      "total_q": 15274,
+      "max_final_kv": 39183,
+      "valid_q_tiles": 69,
+      "useful_flops": 82847006720,
+      "topk_candidate_entries": 2543564
+    },
+    {
+      "case_id": "prefill_e879bfd0f6157ed2f9cc",
+      "tags": [
+        "stress_lpt_imbalance"
+      ],
+      "count": 1,
+      "batch_size": 8,
+      "total_q": 16100,
+      "max_final_kv": 79483,
+      "valid_q_tiles": 66,
+      "useful_flops": 273091297280,
+      "topk_candidate_entries": 8350185
+    },
+    {
+      "case_id": "prefill_1771c5fd9f866a13a3bc",
+      "tags": [
+        "stress_tile_waste"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 13,
+      "max_final_kv": 57997,
+      "valid_q_tiles": 1,
+      "useful_flops": 192970752,
+      "topk_candidate_entries": 5902
+    },
+    {
+      "case_id": "prefill_ed173f6b3cdc11c49f0c",
+      "tags": [
+        "stress_issued_flops",
+        "stress_max_final_kv",
+        "stress_score_workspace",
+        "stress_topk_candidates"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 321280,
+      "valid_q_tiles": 64,
+      "useful_flops": 1312917815296,
+      "topk_candidate_entries": 40083456
+    },
+    {
+      "case_id": "prefill_92fa07a1bf5d7445df14",
+      "tags": [
+        "stress_lpt_imbalance"
+      ],
+      "count": 1,
+      "batch_size": 8,
+      "total_q": 16080,
+      "max_final_kv": 118893,
+      "valid_q_tiles": 66,
+      "useful_flops": 379755495424,
+      "topk_candidate_entries": 11605298
+    },
+    {
+      "case_id": "prefill_41494d6ae94ebcee6d3c",
+      "tags": [
+        "stress_tile_waste"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 146,
+      "max_final_kv": 146,
+      "valid_q_tiles": 1,
+      "useful_flops": 589824,
+      "topk_candidate_entries": 164
+    },
+    {
+      "case_id": "prefill_fe4e08d44d7e24323add",
+      "tags": [
+        "stress_issued_flops",
+        "stress_max_final_kv",
+        "stress_score_workspace",
+        "stress_topk_candidates"
+      ],
+      "count": 1,
+      "batch_size": 1,
+      "total_q": 16384,
+      "max_final_kv": 304896,
+      "valid_q_tiles": 64,
+      "useful_flops": 1244198338560,
+      "topk_candidate_entries": 37986304
+    },
+    {
+      "case_id": "prefill_e2b525bb44ebdc2feded",
+      "tags": [
+        "stress_candidate_tasks"
+      ],
+      "count": 1,
+      "batch_size": 8,
+      "total_q": 15877,
+      "max_final_kv": 91330,
+      "valid_q_tiles": 66,
+      "useful_flops": 82354470912,
+      "topk_candidate_entries": 2529136
+    }
+  ]
+}

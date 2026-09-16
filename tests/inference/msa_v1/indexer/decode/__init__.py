@@ -1,0 +1,1 @@
+"""Decode indexer tests."""

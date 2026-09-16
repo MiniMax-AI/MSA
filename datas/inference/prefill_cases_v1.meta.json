@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "case_kind": "inference_prefill",
+  "manifest_files": [
+    "prefill_cases_v1/part-00000.jsonl",
+    "prefill_cases_v1/part-00001.jsonl",
+    "prefill_cases_v1/part-00002.jsonl"
+  ],
+  "manifest_sha256": "9f4337f47cd453b9f721cf988d77aab54afefd3e64b438f19862e1336d8f44d2",
+  "manifest_shards": [
+    {
+      "file": "prefill_cases_v1/part-00000.jsonl",
+      "sha256": "892d8389c172c48a8ea8ca017affe85bcc17c9e1e30514150f344dc5914f9214",
+      "case_count": 4096
+    },
+    {
+      "file": "prefill_cases_v1/part-00001.jsonl",
+      "sha256": "c6a2897e419a56949f3bbecd3dc6e2e33f9fbc3ad211e67ec197fa8b1daf2906",
+      "case_count": 4096
+    },
+    {
+      "file": "prefill_cases_v1/part-00002.jsonl",
+      "sha256": "3792b1b061050fdebf0b44350acc08e9a719b1c2c085b1d64a6687b122caf1d7",
+      "case_count": 2370
+    }
+  ],
+  "normalization": {
+    "batch_type": "prefill",
+    "dedup_key": [
+      "batch_size",
+      "query_lens",
+      "prefix_lens"
+    ],
+    "prefix_semantics": "cached prefix before this prefill chunk",
+    "final_kv_formula": "final_kv_lens[i] = prefix_lens[i] + query_lens[i]",
+    "count_formula": "sum counts from normalized duplicate records"
+  },
+  "summary": {
+    "raw_prefill_rows": 10937,
+    "unique_cases": 10562,
+    "duplicate_rows_merged": 375,
+    "weighted_calls": 14805
+  },
+  "kernel_contract": {
+    "head_q_local": 1,
+    "head_kv_local": 1,
+    "head_dim": 128,
+    "page_size": 128,
+    "q_dtype": "float8_e4m3fn",
+    "k_dtype": "float8_e4m3fn",
+    "accumulator_dtype": "float32",
+    "score_dtype": "float32",
+    "causal_alignment": "bottom_right"
+  }
+}

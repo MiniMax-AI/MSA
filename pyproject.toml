@@ -1,56 +1,100 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fmha_sm100"
-version = "0.1.1"
-description = "MSA — MiniMax Sparse Attention: dense FlashAttention + sparse top-k indexer (csrc JIT) and CuTe-DSL sparse attention for NVIDIA SM100"
-readme = "README.md"
+name = "minimax-msa"
+version = "0.1.0"
+description = "Training and inference kernels for MiniMax sparse attention"
 requires-python = ">=3.10"
-# SPDX-License-Identifier: MIT
-license = { text = "MIT" }
-authors = [{ name = "MiniMax" }]
 dependencies = [
+    "nvidia-cutlass-dsl[cu13]>=4.5.2",
     "torch",
+    "cuda-python>=13",
     "apache-tvm-ffi",
+    "numpy",
+    "packaging",
     "jinja2",
     "ninja",
-    "pybind11",
-    "cuda-python",
-    "nvidia-cutlass-dsl>=4.4.1",
-    "quack-kernels>=0.2.10",
+    "typing-extensions",
 ]
 
-[project.urls]
+[project.optional-dependencies]
+test = ["pytest", "nvidia-ml-py", "tomli; python_version < '3.11'"]
+flashinfer = ["flashinfer-python==0.6.17"]
 
-# The Python package lives under python/. Both kernel stacks ship as package
-# data and work from both editable and wheel installs:
-#   * Dense csrc/ kernels are JIT-compiled at runtime (python/fmha_sm100/jit.py).
-#     The CUDA sources, Jinja templates, and vendored CUTLASS headers live inside
-#     the package directory so that JIT can locate them via __file__.
-#   * The CuTe-DSL sparse stack (python/fmha_sm100/cute/) is exposed through the
-#     importable `fmha_sm100.sparse` module (and lazily from the package root),
-#     which adds that directory to sys.path and re-exports the public sparse API.
 [tool.setuptools]
-package-dir = { "" = "python" }
-# The cute/ sparse sources are loaded via sys.path.insert at runtime by
-# fmha_sm100/sparse.py (not imported as a submodule), so they are shipped as
-# package data.
-packages = ["fmha_sm100"]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["training", "."]
+include = ["msa_v1*", "datas*", "inference*"]
+namespaces = false
 
 [tool.setuptools.package-data]
-fmha_sm100 = [
-    "cute/**/*.py",
-    "cute/**/*.cu",
-    "cute/**/*.cuh",
-    "cute/**/*.h",
-    "cute/**/*.hpp",
-    "cute/**/*.md",
-    "cute/**/*.ini",
-    "cute/**/*.txt",
-    "cute/Makefile",
-    "csrc/**/*",
-    "cutlass/include/**/*",
-    "cutlass/tools/util/include/**/*",
+datas = [
+    "*.json",
+    "inference/*.json",
+    "inference/prefill_cases_v1/*.jsonl",
+    "inference/*.md",
+    "training/*.md",
+    "training/real/*.json",
+    "training/real/*.jsonl",
+    "training/synthetic/*.json",
+]
+"inference.msa_v1.attention.decode.q8kv4" = [
+    "csrc/api/*",
+    "csrc/src/*",
+    "csrc/templates/*",
+    "csrc/include/sm100/common/*",
+    "csrc/include/sm100/collective/*",
+    "csrc/include/sm100/device/*",
+    "csrc/include/sm100/kernel/*",
+]
+"inference.msa_v1.indexer.decode.tp4_q8kv4" = [
+    "csrc/api/*",
+    "csrc/src/*",
+    "csrc/templates/*",
+    "csrc/include/sm100/common/*",
+    "csrc/include/sm100/collective/*",
+    "csrc/include/sm100/device/*",
+    "csrc/include/sm100/kernel/*",
+]
+"inference.msa_v1.attention.prefill.q8kv4" = [
+    "csrc/api/*",
+    "csrc/templates/*",
+    "csrc/include/sm100/common/*",
+    "csrc/include/sm100/collective/*",
+    "csrc/include/sm100/device/*",
+    "csrc/include/sm100/kernel/*",
+]
+"inference.msa_v1.attention.prefill._common" = [
+    "vendor_manifest.json",
+]
+"inference.msa_v1.indexer._common.topk_select" = [
+    "csrc/api/*",
+    "csrc/kernel/*",
+    "csrc/kernel/m3/*",
+]
+"inference.dequant.nvfp4_to_fp8" = [
+    "csrc/api/*",
+    "csrc/src/*",
+    "csrc/include/sm100/common/*",
+    "csrc/include/sm100/collective/*",
+    "csrc/include/sm100/device/*",
+    "csrc/include/sm100/kernel/*",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["training", "."]
+testpaths = [
+    "tests/test_package_layout.py",
+    "tests/test_training_workloads.py",
+    "tests/training/msa_v1/cute",
+    "tests/inference",
+]
+markers = [
+    "gpu: requires an SM100 or SM103 CUDA GPU",
+    "acceptance: runs the real CP metadata kernel acceptance matrix",
+    "performance: runs same-machine performance gates",
 ]

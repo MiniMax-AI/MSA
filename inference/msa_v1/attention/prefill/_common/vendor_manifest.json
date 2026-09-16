@@ -1,0 +1,228 @@
+{
+  "source_root": "training/msa_v1",
+  "destination_root": "inference/msa_v1/attention/prefill/_common",
+  "namespace_rewrites": [
+    [
+      "from msa_v1._common.aot_cache",
+      "from inference.msa_v1.aot_cache"
+    ],
+    [
+      "from msa_v1._common",
+      "from inference.msa_v1.attention.prefill._common.dsl"
+    ],
+    [
+      "import msa_v1._common",
+      "import inference.msa_v1.attention.prefill._common.dsl"
+    ],
+    [
+      "from msa_v1.attention.prepare_k2q_csr",
+      "from inference.msa_v1.attention.prefill._common.prepare_k2q_csr"
+    ],
+    [
+      "from msa_v1.attention.prepare_scheduler",
+      "from inference.msa_v1.attention.prefill._common.prepare_scheduler"
+    ]
+  ],
+  "recorded_replacements": {
+    "_common/cute_dsl_utils.py": [
+      {
+        "source": "    t0 = time.time()\n    output = cute_compile_og(*args, **kwargs)\n    dt = time.time() - t0\n    logger.debug(\"[%s] compiled in %.1fs\", kernel_name, dt)\n    return output\n\n\n",
+        "destination": "    t0 = time.time()\n    output = cute_compile_og(*args, **kwargs)\n    dt = time.time() - t0\n    logger.info(\"[%s] Compiled in %.1fs\", kernel_name, dt)\n    return output\n\n\n",
+        "reason": "推理编译耗时统一使用 INFO logger。"
+      }
+    ],
+    "_common/utils.py": [
+      {
+        "source": "import hashlib\nimport inspect\nimport math\nfrom typing import Callable, Optional, Tuple, Type, overload\n\nimport cutlass\nimport cutlass.cute as cute\n",
+        "destination": "import hashlib\nimport inspect\nimport math\nfrom typing import Callable, Tuple, Type, overload\n\nimport cutlass\nimport cutlass.cute as cute\n",
+        "reason": "推理路径删除未使用的 warp_prefix_sum 及 Optional import。"
+      },
+      {
+        "source": "            asm_dialect=llvm.AsmDialect.AD_ATT,\n        )\n    )\n\n\n@cute.jit\ndef warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:\n    if const_expr(lane is None):\n        lane = cute.arch.lane_idx()\n    for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):\n        offset = 1 << i\n        # Very important that we set mask_and_clamp to 0\n        partial_sum = cute.arch.shuffle_sync_up(val, offset=offset, mask_and_clamp=0)\n        if lane >= offset:\n            val += partial_sum\n    return val\n\n\n@dsl_user_op\n",
+        "destination": "            asm_dialect=llvm.AsmDialect.AD_ATT,\n        )\n    )\n\n\n@dsl_user_op\n",
+        "reason": "推理路径删除未使用的 warp_prefix_sum 及 Optional import。"
+      }
+    ],
+    "attention/metadata.py": [
+      {
+        "source": "\nimport torch\n\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr import SparseK2qCsrBuilderSm100\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import SparseAttentionSchedule\n\n_HEAD_KV = 4\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_KV_BLOCK_SIZE = 128\n\n\n@dataclass(frozen=True)\nclass AttentionMetadata:\n    \"\"\"Per-layer metadata shared by the corresponding forward and backward.\"\"\"\n\n    topk_indices: torch.Tensor\n    cu_seqlens_q: torch.Tensor\n",
+        "destination": "\nimport torch\n\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr import (\n    SparseK2qCsrBuilderSm100,\n)\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SparseAttentionSchedule,\n)\n\n_TOPK = 16\n_KV_BLOCK_SIZE = 128\n\n\n@dataclass(frozen=True)\nclass AttentionMetadata:\n    \"\"\"Opaque metadata owned by one MSA v1 inference plan.\"\"\"\n\n    topk_indices: torch.Tensor\n    cu_seqlens_q: torch.Tensor\n",
+        "reason": "推理 metadata 由 plan 独占，并支持公开 prefill 的 KV head 数和 GQA 比例。"
+      },
+      {
+        "source": "    total_rows: int,\n    max_seqlen_q: int,\n    max_seqlen_k: int,\n    fragment_indices: torch.Tensor | None = None,\n    prepare_kl_schedule: bool = True,\n) -> AttentionMetadata:\n    \"\"\"Build layer-specific CSR and schedules from the current TopK indices.\n\n    ``total_rows`` is the exact sum of logical K-block rows across batches,\n    including fragments that share the same physical K storage.\n\n    The returned metadata belongs to this TopK result and may be shared by its\n    corresponding forward, attention backward, and KL backward. A new TopK\n    result requires a new call, including during CUDA Graph replay.\n    \"\"\"\n    if topk_indices.dtype != torch.int32:\n        raise TypeError(\"topk_indices must be torch.int32\")\n    if not topk_indices.is_cuda:\n        raise ValueError(\"topk_indices must be a CUDA tensor\")\n    if topk_indices.ndim != 3 or tuple(topk_indices.shape[::2]) != (_HEAD_KV, _TOPK):\n        raise ValueError(\"topk_indices must have shape [4, total_q, 16]\")\n    if not topk_indices.is_contiguous():\n        raise ValueError(\"topk_indices must be contiguous\")\n    _validate_cu_seqlens(cu_seqlens_q, name=\"cu_seqlens_q\", device=topk_indices.device)\n",
+        "destination": "    total_rows: int,\n    max_seqlen_q: int,\n    max_seqlen_k: int,\n    qhead_per_kv: int = 16,\n    fragment_indices: torch.Tensor | None = None,\n    prepare_kl_schedule: bool = True,\n) -> AttentionMetadata:\n    \"\"\"Build q2k->k2q CSR and schedules from the current plan inputs.\n\n    ``total_rows`` is the exact sum of logical K-block rows across batches,\n    including fragments that share the same physical K storage.\n\n    Schedule counts remain device-resident. The returned metadata belongs to\n    this plan and may be reused by its corresponding ``run()`` calls. New TopK\n    or length metadata requires a new plan.\n    \"\"\"\n    if topk_indices.dtype != torch.int32:\n        raise TypeError(\"topk_indices must be torch.int32\")\n    if not topk_indices.is_cuda:\n        raise ValueError(\"topk_indices must be a CUDA tensor\")\n    if (\n        topk_indices.ndim != 3\n        or topk_indices.shape[0] <= 0\n        or topk_indices.shape[2] != _TOPK\n    ):\n        raise ValueError(\"topk_indices must have shape [num_kv_heads, total_q, 16]\")\n    if not topk_indices.is_contiguous():\n        raise ValueError(\"topk_indices must be contiguous\")\n    _validate_cu_seqlens(cu_seqlens_q, name=\"cu_seqlens_q\", device=topk_indices.device)\n",
+        "reason": "推理 metadata 由 plan 独占，并支持公开 prefill 的 KV head 数和 GQA 比例。"
+      },
+      {
+        "source": "        max_seqlen_k=max_seqlen_k,\n        max_seqlen_q=max_seqlen_q,\n        total_rows=total_rows,\n        qhead_per_kv=_QHEAD_PER_KV,\n        fragment_indices=fragment_indices,\n        prepare_kl_schedule=bool(prepare_kl_schedule),\n    )\n",
+        "destination": "        max_seqlen_k=max_seqlen_k,\n        max_seqlen_q=max_seqlen_q,\n        total_rows=total_rows,\n        qhead_per_kv=int(qhead_per_kv),\n        fragment_indices=fragment_indices,\n        prepare_kl_schedule=bool(prepare_kl_schedule),\n    )\n",
+        "reason": "推理 metadata 由 plan 独占，并支持公开 prefill 的 KV head 数和 GQA 比例。"
+      }
+    ],
+    "attention/prepare_k2q_csr.py": [
+      {
+        "source": "import torch\n\nfrom inference.msa_v1.aot_cache import compile_or_load\nfrom inference.msa_v1.attention.prefill._common.dsl.compile_utils import compile_with_timing\nfrom inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import to_cute_tensor\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr_cutedsl import SparseK2qCsrPipelineSm100\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SPARSE_SCHEDULE_MODEL,\n    SparseAttentionSchedule,\n)\n\n_HEAD_KV = 4\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_BLOCK_K = 128\n",
+        "destination": "import torch\n\nfrom inference.msa_v1.aot_cache import compile_or_load\nfrom inference.msa_v1.attention.prefill._common.dsl.compile_utils import (\n    compile_with_timing,\n)\nfrom inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import to_cute_tensor\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr_cutedsl import (\n    SparseK2qCsrPipelineSm100,\n)\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SPARSE_SCHEDULE_MODEL,\n    SparseAttentionSchedule,\n)\n\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_BLOCK_K = 128\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "_KL_MACROS_PER_WORK = 16\n_KL_TARGET_Q_PER_CTA = _KL_Q_PER_MACRO * _KL_MACROS_PER_WORK\n_COMPILE_CACHE: dict[tuple, object] = {}\n_PIPELINE = SparseK2qCsrPipelineSm100()\n\n\ndef _ceil_div(value: int, divisor: int) -> int:\n",
+        "destination": "_KL_MACROS_PER_WORK = 16\n_KL_TARGET_Q_PER_CTA = _KL_Q_PER_MACRO * _KL_MACROS_PER_WORK\n_COMPILE_CACHE: dict[tuple, object] = {}\n\n\ndef _ceil_div(value: int, divisor: int) -> int:\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "    tensors: tuple[torch.Tensor | None, ...],\n    scalar_args: tuple[int, ...],\n    *,\n    reorder_schedule: bool,\n    prepare_kl_schedule: bool,\n) -> object:\n    device = tensors[0].device\n    has_fragment_indices = tensors[3] is not None\n    key = (\n        \"sparse_k2q_csr_physical_kl_sm100\",\n        torch.cuda.get_device_capability(device),\n        reorder_schedule,\n        prepare_kl_schedule,\n        has_fragment_indices,\n    )\n    if key not in _COMPILE_CACHE:\n        _COMPILE_CACHE[key] = compile_or_load(\n            key,\n            lambda: compile_with_timing(\n                _PIPELINE,\n                *(_as_cute_tensor(tensor) for tensor in tensors),\n                *(cutlass.Int32(value) for value in scalar_args),\n                reorder_schedule,\n",
+        "destination": "    tensors: tuple[torch.Tensor | None, ...],\n    scalar_args: tuple[int, ...],\n    *,\n    head_kv: int,\n    reorder_schedule: bool,\n    prepare_kl_schedule: bool,\n) -> object:\n    device = tensors[0].device\n    has_fragment_indices = tensors[3] is not None\n    base_key = (\n        \"sparse_k2q_csr_physical_kl_sm100\",\n        torch.cuda.get_device_capability(device),\n        reorder_schedule,\n        prepare_kl_schedule,\n        has_fragment_indices,\n    )\n    key = base_key if head_kv == 4 else (*base_key, f\"hkv{head_kv}\")\n    if key not in _COMPILE_CACHE:\n        _COMPILE_CACHE[key] = compile_or_load(\n            key,\n            lambda: compile_with_timing(\n                SparseK2qCsrPipelineSm100(head_kv=head_kv),\n                *(_as_cute_tensor(tensor) for tensor in tensors),\n                *(cutlass.Int32(value) for value in scalar_args),\n                reorder_schedule,\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "\n        batch = int(cu_seqlens_q.numel() - 1)\n        total_q = int(q2k_indices.shape[1])\n        max_kv_blocks = _ceil_div(max(max_seqlen_k, _BLOCK_K), _BLOCK_K)\n        padded_kv_blocks = (total_k + (batch + 1) * _BLOCK_K - 1) // _BLOCK_K\n        nnz_upper_bound = total_q * _TOPK\n",
+        "destination": "\n        batch = int(cu_seqlens_q.numel() - 1)\n        total_q = int(q2k_indices.shape[1])\n        head_kv = int(q2k_indices.shape[0])\n        max_kv_blocks = _ceil_div(max(max_seqlen_k, _BLOCK_K), _BLOCK_K)\n        padded_kv_blocks = (total_k + (batch + 1) * _BLOCK_K - 1) // _BLOCK_K\n        nnz_upper_bound = total_q * _TOPK\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "        target_q_per_cta = SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta(\n            total_q=total_q,\n            topk=_TOPK,\n            head_kv=_HEAD_KV,\n            qhead_per_kv=_QHEAD_PER_KV,\n            device=device,\n        )\n        work_capacity = SPARSE_SCHEDULE_MODEL.flat_schedule_capacity(\n            total_rows=total_rows,\n            total_q=total_q,\n            topk=_TOPK,\n            head_kv=_HEAD_KV,\n            target_q_per_cta=target_q_per_cta,\n        )\n        kl_work_capacity = SPARSE_SCHEDULE_MODEL.physical_kl_schedule_capacity(\n            total_q=total_q,\n            topk=_TOPK,\n            head_kv=_HEAD_KV,\n            padded_kv_blocks=padded_kv_blocks,\n            q_per_macro=_KL_Q_PER_MACRO,\n            macros_per_work=_KL_MACROS_PER_WORK,\n",
+        "destination": "        target_q_per_cta = SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta(\n            total_q=total_q,\n            topk=_TOPK,\n            head_kv=head_kv,\n            qhead_per_kv=qhead_per_kv,\n            device=device,\n        )\n        work_capacity = SPARSE_SCHEDULE_MODEL.flat_schedule_capacity(\n            total_rows=total_rows,\n            total_q=total_q,\n            topk=_TOPK,\n            head_kv=head_kv,\n            target_q_per_cta=target_q_per_cta,\n        )\n        kl_work_capacity = SPARSE_SCHEDULE_MODEL.physical_kl_schedule_capacity(\n            total_q=total_q,\n            topk=_TOPK,\n            head_kv=head_kv,\n            padded_kv_blocks=padded_kv_blocks,\n            q_per_macro=_KL_Q_PER_MACRO,\n            macros_per_work=_KL_MACROS_PER_WORK,\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "        # Dynamic workers process the largest rows first to minimize the final-wave tail.\n        reorder_schedule = True\n        row_ptr = torch.empty(\n            (_HEAD_KV, total_rows + 1),\n            dtype=torch.int32,\n            device=device,\n        )\n        q_idx = torch.empty(\n            (_HEAD_KV, nnz_upper_bound),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "destination": "        # Dynamic workers process the largest rows first to minimize the final-wave tail.\n        reorder_schedule = True\n        row_ptr = torch.empty(\n            (head_kv, total_rows + 1),\n            dtype=torch.int32,\n            device=device,\n        )\n        q_idx = torch.empty(\n            (head_kv, nnz_upper_bound),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "        )\n        work_count = torch.empty((1,), dtype=torch.int32, device=device)\n        dkv_owner_counts = torch.empty(\n            (_HEAD_KV, padded_kv_blocks),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "destination": "        )\n        work_count = torch.empty((1,), dtype=torch.int32, device=device)\n        dkv_owner_counts = torch.empty(\n            (head_kv, padded_kv_blocks),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "        )\n        kl_work_count = torch.empty((1,), dtype=torch.int32, device=device)\n        kl_physical_row_ptr = torch.empty(\n            (_HEAD_KV, padded_kv_blocks + 1),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "destination": "        )\n        kl_work_count = torch.empty((1,), dtype=torch.int32, device=device)\n        kl_physical_row_ptr = torch.empty(\n            (head_kv, padded_kv_blocks + 1),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "        kl_dki_split_count = torch.empty((1,), dtype=torch.int32, device=device)\n        qsplit_idx = torch.empty_like(q_idx)\n        split_counts = torch.empty(\n            (total_q, _HEAD_KV),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "destination": "        kl_dki_split_count = torch.empty((1,), dtype=torch.int32, device=device)\n        qsplit_idx = torch.empty_like(q_idx)\n        split_counts = torch.empty(\n            (total_q, head_kv),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "            device=device,\n        )\n        row_counts = torch.empty(\n            (_HEAD_KV, batch, max_kv_blocks),\n            dtype=torch.int32,\n            device=device,\n        )\n        tile_counts = torch.empty(\n            (\n                batch * partitions_per_batch * _WARPS,\n                _HEAD_KV,\n                max_kv_blocks,\n            ),\n            dtype=torch.int32,\n",
+        "destination": "            device=device,\n        )\n        row_counts = torch.empty(\n            (head_kv, batch, max_kv_blocks),\n            dtype=torch.int32,\n            device=device,\n        )\n        tile_counts = torch.empty(\n            (\n                batch * partitions_per_batch * _WARPS,\n                head_kv,\n                max_kv_blocks,\n            ),\n            dtype=torch.int32,\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "            torch.empty_like(scheduler_metadata) if reorder_schedule else None\n        )\n        kl_physical_row_counts = torch.empty(\n            (_HEAD_KV, padded_kv_blocks),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "destination": "            torch.empty_like(scheduler_metadata) if reorder_schedule else None\n        )\n        kl_physical_row_counts = torch.empty(\n            (head_kv, padded_kv_blocks),\n            dtype=torch.int32,\n            device=device,\n        )\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "        compiled = _get_compiled_pipeline(\n            tensors,\n            scalar_args,\n            reorder_schedule=reorder_schedule,\n            prepare_kl_schedule=prepare_kl_schedule,\n        )\n",
+        "destination": "        compiled = _get_compiled_pipeline(\n            tensors,\n            scalar_args,\n            head_kv=head_kv,\n            reorder_schedule=reorder_schedule,\n            prepare_kl_schedule=prepare_kl_schedule,\n        )\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "        blk_kv: int,\n        qhead_per_kv: int,\n    ) -> None:\n        if q2k_indices.ndim != 3 or tuple(q2k_indices.shape[::2]) != (\n            _HEAD_KV,\n            _TOPK,\n        ):\n            raise ValueError(\"q2k_indices must have shape [4, total_q, 16]\")\n        if q2k_indices.dtype != torch.int32 or not q2k_indices.is_contiguous():\n            raise ValueError(\"q2k_indices must be contiguous torch.int32\")\n        if not q2k_indices.is_cuda:\n",
+        "destination": "        blk_kv: int,\n        qhead_per_kv: int,\n    ) -> None:\n        if (\n            q2k_indices.ndim != 3\n            or q2k_indices.shape[0] <= 0\n            or q2k_indices.shape[2] != _TOPK\n        ):\n            raise ValueError(\"q2k_indices must have shape [num_kv_heads, total_q, 16]\")\n        if q2k_indices.dtype != torch.int32 or not q2k_indices.is_contiguous():\n            raise ValueError(\"q2k_indices must be contiguous torch.int32\")\n        if not q2k_indices.is_cuda:\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      },
+      {
+        "source": "                raise ValueError(\"fragment_indices must be contiguous with shape [B]\")\n        if int(blk_kv) != _BLOCK_K:\n            raise ValueError(\"only block_size=128 is supported\")\n        if int(qhead_per_kv) != _QHEAD_PER_KV:\n            raise ValueError(\"only qhead_per_kv=16 is supported\")\n\n    @staticmethod\n    def _partition_config(\n",
+        "destination": "                raise ValueError(\"fragment_indices must be contiguous with shape [B]\")\n        if int(blk_kv) != _BLOCK_K:\n            raise ValueError(\"only block_size=128 is supported\")\n        if int(qhead_per_kv) not in (1, 2, 4, 8, 16):\n            raise ValueError(\"qhead_per_kv must be one of 1, 2, 4, 8, or 16\")\n\n    @staticmethod\n    def _partition_config(\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
+      }
+    ],
+    "attention/prepare_k2q_csr_cutedsl.py": [
+      {
+        "source": "    KL_WRITER_RANK_SHIFT,\n)\n\n_HEAD_KV = 4\n_TOPK = 16\n_BLOCK_K = 128\n_KL_Q_PER_MACRO = 16\n",
+        "destination": "    KL_WRITER_RANK_SHIFT,\n)\n\n_TOPK = 16\n_BLOCK_K = 128\n_KL_Q_PER_MACRO = 16\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "\nclass SparseK2qCsrPipelineSm100:\n    \"\"\"Launch the fixed MSA v1 CSR and schedule preparation pipeline.\"\"\"\n\n    @cute.jit\n    def _rows_in_batch(\n",
+        "destination": "\nclass SparseK2qCsrPipelineSm100:\n    \"\"\"Launch the fixed MSA v1 CSR and schedule preparation pipeline.\"\"\"\n\n    def __init__(self, *, head_kv: int = 4) -> None:\n        if head_kv <= 0:\n            raise ValueError(\"head_kv must be positive\")\n        self.head_kv = int(head_kv)\n\n    @cute.jit\n    def _rows_in_batch(\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "        prepare_kl_schedule: cutlass.Constexpr[bool],\n        stream: cuda.CUstream = None,\n    ):\n        num_q_idx = Int32(_HEAD_KV * _TOPK) * total_q\n        num_row_counts = Int32(_HEAD_KV) * batch * max_kv_blocks\n        num_owner_counts = Int32(_HEAD_KV) * padded_kv_blocks\n        fill_copy_atom = cute.make_copy_atom(\n            nvgpu.CopyUniversalOp(),\n            Int32,\n",
+        "destination": "        prepare_kl_schedule: cutlass.Constexpr[bool],\n        stream: cuda.CUstream = None,\n    ):\n        num_q_idx = Int32(self.head_kv * _TOPK) * total_q\n        num_row_counts = Int32(self.head_kv) * batch * max_kv_blocks\n        num_owner_counts = Int32(self.head_kv) * padded_kv_blocks\n        fill_copy_atom = cute.make_copy_atom(\n            nvgpu.CopyUniversalOp(),\n            Int32,\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "            padded_kv_blocks,\n            prepare_kl_schedule,\n        ).launch(\n            grid=(_HEAD_KV, 1, 1),\n            block=(_PREFIX_THREADS, 1, 1),\n            smem=_PREFIX_THREADS * _INT32_BYTES,\n            stream=stream,\n",
+        "destination": "            padded_kv_blocks,\n            prepare_kl_schedule,\n        ).launch(\n            grid=(self.head_kv, 1, 1),\n            block=(_PREFIX_THREADS, 1, 1),\n            smem=_PREFIX_THREADS * _INT32_BYTES,\n            stream=stream,\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "                mKlPhysicalRowPtr,\n                padded_kv_blocks,\n            ).launch(\n                grid=(_HEAD_KV, 1, 1),\n                block=(_PREFIX_THREADS, 1, 1),\n                smem=_PREFIX_THREADS * _INT32_BYTES,\n                stream=stream,\n",
+        "destination": "                mKlPhysicalRowPtr,\n                padded_kv_blocks,\n            ).launch(\n                grid=(self.head_kv, 1, 1),\n                block=(_PREFIX_THREADS, 1, 1),\n                smem=_PREFIX_THREADS * _INT32_BYTES,\n                stream=stream,\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "            partitions_per_batch,\n        ).launch(\n            grid=(\n                _HEAD_KV\n                * batch\n                * cute.ceil_div(max_kv_blocks, _ROWS_PER_PREFIX_CTA),\n                1,\n",
+        "destination": "            partitions_per_batch,\n        ).launch(\n            grid=(\n                self.head_kv\n                * batch\n                * cute.ceil_div(max_kv_blocks, _ROWS_PER_PREFIX_CTA),\n                1,\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "            owner_idx += stride\n        if const_expr(prepare_kl_schedule):\n            kl_idx = block_idx * Int32(_KL_SCHEDULE_THREADS) + tidx\n            num_physical_counts = Int32(_HEAD_KV) * padded_kv_blocks\n            while kl_idx < num_physical_counts:\n                mKlPhysicalRowCounts[kl_idx] = Int32(0)\n                kl_idx += stride\n",
+        "destination": "            owner_idx += stride\n        if const_expr(prepare_kl_schedule):\n            kl_idx = block_idx * Int32(_KL_SCHEDULE_THREADS) + tidx\n            num_physical_counts = Int32(self.head_kv) * padded_kv_blocks\n            while kl_idx < num_physical_counts:\n                mKlPhysicalRowCounts[kl_idx] = Int32(0)\n                kl_idx += stride\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "            batch_idx,\n            mFragmentIndices,\n        )\n        for head_idx in cutlass.range_constexpr(_HEAD_KV):\n            packed_idx = lane_idx\n            while packed_idx < packed_per_warp:\n                sMyPacked[packed_idx] = Int32(0)\n",
+        "destination": "            batch_idx,\n            mFragmentIndices,\n        )\n        for head_idx in cutlass.range_constexpr(self.head_kv):\n            packed_idx = lane_idx\n            while packed_idx < packed_per_warp:\n                sMyPacked[packed_idx] = Int32(0)\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "                        scope=\"gpu\",\n                    )\n                row_idx += Int32(_THREADS)\n            if const_expr(head_idx + 1 < _HEAD_KV):\n                cute.arch.sync_threads()\n\n    @cute.kernel\n",
+        "destination": "                        scope=\"gpu\",\n                    )\n                row_idx += Int32(_THREADS)\n            if const_expr(head_idx + 1 < self.head_kv):\n                cute.arch.sync_threads()\n\n    @cute.kernel\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "        macros_per_work = kl_target_q_per_cta // q_per_macro\n        while physical_block < padded_kv_blocks:\n            total_macros = Int32(0)\n            for head_idx in cutlass.range_constexpr(_HEAD_KV):\n                row_count = (\n                    mPhysicalRowPtr[head_idx, physical_block + Int32(1)]\n                    - mPhysicalRowPtr[head_idx, physical_block]\n",
+        "destination": "        macros_per_work = kl_target_q_per_cta // q_per_macro\n        while physical_block < padded_kv_blocks:\n            total_macros = Int32(0)\n            for head_idx in cutlass.range_constexpr(self.head_kv):\n                row_count = (\n                    mPhysicalRowPtr[head_idx, physical_block + Int32(1)]\n                    - mPhysicalRowPtr[head_idx, physical_block]\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "        q_len = mCuSeqlensQ[batch_idx + Int32(1)] - mCuSeqlensQ[batch_idx]\n        k_len = mCuSeqlensK[batch_idx + Int32(1)] - physical_offset_k\n\n        for head_idx in cutlass.range_constexpr(_HEAD_KV):\n            packed_idx = lane_idx\n            while packed_idx < packed_per_warp:\n                sMyPacked[packed_idx] = Int32(0)\n",
+        "destination": "        q_len = mCuSeqlensQ[batch_idx + Int32(1)] - mCuSeqlensQ[batch_idx]\n        k_len = mCuSeqlensK[batch_idx + Int32(1)] - physical_offset_k\n\n        for head_idx in cutlass.range_constexpr(self.head_kv):\n            packed_idx = lane_idx\n            while packed_idx < packed_per_warp:\n                sMyPacked[packed_idx] = Int32(0)\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      },
+      {
+        "source": "                                )\n                    cute.arch.sync_warp()\n                q_base += Int32(2)\n            if const_expr(head_idx + 1 < _HEAD_KV):\n                cute.arch.sync_threads()\n\n\n",
+        "destination": "                                )\n                    cute.arch.sync_warp()\n                q_base += Int32(2)\n            if const_expr(head_idx + 1 < self.head_kv):\n                cute.arch.sync_threads()\n\n\n",
+        "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
+      }
+    ]
+  },
+  "organization_files": [
+    "__init__.py"
+  ],
+  "local_implementation_files": [
+    "atten_fwd_sm100.py",
+    "paged_interface.py"
+  ],
+  "files": [
+    {"source": "_common/__init__.py", "destination": "dsl/__init__.py"},
+    {"source": "_common/blackwell_helpers.py", "destination": "dsl/blackwell_helpers.py"},
+    {"source": "_common/compile_utils.py", "destination": "dsl/compile_utils.py"},
+    {"source": "_common/copy_utils.py", "destination": "dsl/copy_utils.py"},
+    {"source": "_common/cute_dsl_utils.py", "destination": "dsl/cute_dsl_utils.py"},
+    {"source": "_common/layout_utils.py", "destination": "dsl/layout_utils.py"},
+    {"source": "_common/mask.py", "destination": "dsl/mask.py"},
+    {"source": "_common/mma_sm100_desc.py", "destination": "dsl/mma_sm100_desc.py"},
+    {"source": "_common/named_barrier.py", "destination": "dsl/named_barrier.py"},
+    {"source": "_common/pack_gqa.py", "destination": "dsl/pack_gqa.py"},
+    {"source": "_common/paged_kv.py", "destination": "dsl/paged_kv.py"},
+    {"source": "_common/pipeline.py", "destination": "dsl/pipeline.py"},
+    {"source": "_common/seqlen_info.py", "destination": "dsl/seqlen_info.py"},
+    {"source": "_common/softmax.py", "destination": "dsl/softmax.py"},
+    {"source": "_common/tma_utils.py", "destination": "dsl/tma_utils.py"},
+    {"source": "_common/utils.py", "destination": "dsl/utils.py"},
+    {"source": "attention/fwd/combine.py", "destination": "combine.py"},
+    {"source": "attention/metadata.py", "destination": "metadata.py"},
+    {"source": "attention/prepare_k2q_csr.py", "destination": "prepare_k2q_csr.py"},
+    {"source": "attention/prepare_k2q_csr_cutedsl.py", "destination": "prepare_k2q_csr_cutedsl.py"},
+    {"source": "attention/prepare_scheduler.py", "destination": "prepare_scheduler.py"}
+  ]
+}

@@ -1,0 +1,1 @@
+"""Decode indexer benchmarks."""

@@ -1,257 +1,265 @@
-# MiniMax Sparse Attention (MSA)
+# MiniMax MSA
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-≥3.10-blue.svg)](pyproject.toml)
-[![GPU](https://img.shields.io/badge/NVIDIA-SM100-76b900.svg)](#requirements)
-[![Stack: CuTe-DSL + Cuda](https://img.shields.io/badge/stack-CuTe--DSL%20%2B%20Cuda-purple.svg)](#stacks)
+[English](README.en.md)
 
-**MSA** (`fmha_sm100`) ships dense FlashAttention and sparse top-k attention
-kernels for **NVIDIA SM100**. Two JIT-compiled stacks
-share one Python package:
+## 1. 概述
 
-![MSA architecture](docs/architecture.png)
+MiniMax Sparse Attention（MSA）通过 Indexer 为每个 query 选择 TopK blocks，
+再由 Sparse Attention 在选中的 blocks 上计算注意力。本分支提供 MSA v1 的
+训练和推理算子，面向 NVIDIA Blackwell GPU，覆盖 BF16、FP8 E4M3 和 NVFP4 数据路径。
+算法参考：[MiniMax Sparse Attention 论文](docs/MiniMaxSparseAttention.pdf)。
 
-> Algorithm reference: [MiniMax Sparse Attention paper](docs/MiniMaxSparseAttention.pdf).
+训练包为 `msa_v1`，推理包为 `inference.msa_v1`，量化格式转换由 `inference.dequant`
+提供。训练和推理使用各自的数据布局与公开接口；具体支持范围如下。
 
-| Stack | Path | What it gives you |
-|---|---|---|
-| **csrc JIT** | `python/fmha_sm100/csrc/` | Dense FMHA (`fmha_sm100`, `fmha_sm100_plan`) + `sparse_topk_select` indexer, compiled from Jinja templates by `jit.py` at runtime. |
-| **CuTe-DSL** | `python/fmha_sm100/cute/` | Full sparse attention (forward + paged FP8 decode, BF16 / FP8 / NVFP4 / FP4), compiled at runtime via `cute.compile`. |
-| **Bridge** | `python/fmha_sm100/sparse_fmha_adapter.py` | Adapts the `fmha_sm100` API to call `sparse_atten_func` for sparse prefill paths. |
+### 1.1 训练算子
 
-> **License: MIT.** Self-authored files carry `SPDX-License-Identifier: MIT`.
-> See [LICENSE](LICENSE) and [NOTICE](NOTICE). Bundled / derived third-party
-> code retains its own license — see [Third-party licenses](#third-party-licenses).
+| 算子 | 主要输入 | 输出 | 支持范围 |
+| --- | --- | --- | --- |
+| Sparse Attention | BF16 Q/K/V | BF16 O、FP32 LSE；BF16 dQ/dK/dV | Forward / Backward，支持变长序列 |
+| Sparse Attention：FP8 forward | FP8 E4M3 Q/K/V | BF16 O、FP32 LSE | 仅 Forward，不支持原生 FP8 Q/K/V 的 Backward |
+| Sparse Attention：概率 QAT | BF16 Q/K/V；`sparse_attn_p_mode="fp8"` | BF16 O、FP32 LSE；BF16 dQ/dK/dV | Forward / Backward；对注意力概率执行 FP8 量化感知训练 |
+| Indexer（含 TopK） | BF16 Q/K | INT32 TopK indices、FP32 selected LSE | 因果、变长序列的 block 选择 |
+| Tree Indexer（含 TopK） | BF16 Q/K、预先构建的 mask plan | INT32 TopK indices、FP32 selected LSE | Batch=1 的树状 / 自定义可见性选择 |
+| Sparse KL Backward | BF16 teacher Q/K 与 indexer Q/K、FP32 LSE | BF16 indexer dQ/dK | 通过稀疏 KL 目标计算 indexer 梯度 |
 
-## Requirements
+LSE 可按接口选项返回；上表不表示每次调用都返回 LSE。
+训练 Attention 的公开配置为 head dimension=128、64 个 Q heads、4 个 KV heads，
+block size=128、TopK=16。调用入口见[训练接口](#31-msa-v1-训练)。
 
-- **GPU**: NVIDIA SM100.
-- **Toolchain**: CUDA Toolkit with `nvcc` on `PATH` (or `CUDA_HOME` / `CUDA_PATH` set).
-- **Python**: ≥ 3.10.
-- **OS**: Linux x86_64 (aarch64 untested; JIT builds may need small Makefile edits on WSL).
+### 1.2 推理算子
 
-Quick sanity check before installing:
+| 算子 | 支持的输入格式 | 输出 | 用途与约束 |
+| --- | --- | --- | --- |
+| Prefill Attention | BF16 Q/K/V；Q8KV8；Q8KV4 | BF16 O，可选 FP32 LSE | Paged sparse causal attention，支持变长 chunk prefill |
+| Decode Attention | Q8KV8；Q8KV4 | BF16 O | Paged sparse decode / MTP；Q8KV8 需安装可选 FlashInfer 依赖 |
+| Prefill Indexer（含 TopK） | BF16 Q/K；FP8 E4M3 Q/K | INT32 logical page indices | BF16 支持 1 或 4 个本地 index heads；FP8 为 TP4 路径 |
+| Decode Indexer（含 TopK） | FP8 E4M3 Q/K；FP8 E4M3 Q + NVFP4 K | INT32 logical page indices | TP4 路径，8 个 query（1 个主 token + 7 个 draft token） |
+| NVFP4 → FP8 转换 | Packed E2M1 数据 + E4M3 scale | FP8 E4M3 数据 | Dense 转换或仅转换 TopK 选中的 paged K/V |
+
+各算子的 package 路径见[推理接口](#32-msa-v1-推理)，shape、scale、分页和
+CUDA Graph 契约见[推理算子文档](inference/msa_v1/README.md)及其链接的各算子 README。
+
+### 1.3 数据类型说明
+
+- **BF16**：`torch.bfloat16`。
+- **FP8 E4M3**：`torch.float8_e4m3fn`；本文的 Q8/K8/V8 表示浮点 FP8，不是 INT8。
+- **NVFP4**：打包的 E2M1 数据及其 E4M3 分组 scale，必须按对应接口提供两者。
+- **Q8KV8**：Q/K/V 均为 FP8 E4M3；**Q8KV4**：Q 为 FP8 E4M3，K/V 为 NVFP4。
+  Indexer 只读取 Q/K，不读取 V。
+- 上表列出的是公开输入输出格式。Tensor Core 累加使用 FP32；FP16 中间存储选项
+  不代表公开接口接受 FP16 Q/K/V。
+
+所有 varlen 接口都使用真实长度 metadata；TopK 的有效项保持离散无序语义，
+最后一个有效 block 为 local block。
+
+## 2. 系统要求与安装
+
+| GPU | Architecture | 状态 |
+| --- | --- | --- |
+| NVIDIA B200 | SM100 | 支持 |
+| NVIDIA GB300 | SM103 | 支持 |
+
+仓库的 Blackwell kernel 覆盖 B200/SM100 与 B300/SM103，包括 inference 和 training。
+运行时按设备架构选择兼容实现；各算子既有的 dtype、shape 和数据契约仍适用。
+
+本项目的 CuTe DSL 最低版本要求为：
+
+```text
+nvidia-cutlass-dsl[cu13]>=4.5.2
+```
+
+安装项目：
 
 ```bash
-nvcc --version                # expect ≥ 12.x
-nvidia-smi --query-gpu=compute_cap --format=csv | grep "10.0"  # confirm SM100
-python -c "import sys; print(sys.version_info[:2])"              # ≥ (3, 10)
+git submodule update --init --recursive
+python -m pip install -e ".[test]"
 ```
 
-## Using with the `kernels` library
-
-To quickly get started using MSA kernels, you can use the [`kernels` library](https://github.com/huggingface/kernels):
-
-```py
-# make sure `kernels` is installed: `pip install -U kernels`
-from kernels import get_kernel
-
-kernel_module = get_kernel("MiniMaxAI/msa", version=0)
-sparse_atten_func = kernel_module.sparse_atten_func
-
-sparse_atten_func(...)
-```
-
-Check out the kernel on the Hugging Face Hub [here](https://huggingface.co/kernels/kernels-staging/msa).
-
-## Install
+MSA v1 的兼容性验收覆盖最低版本和最新稳定版。升级 DSL 后需要重新构建 AOT 产物，
+不得跨 DSL 或 CUDA backend 版本复用编译缓存。本项目默认安装 cu13 backend，
+包括 CuTe DSL 4.5.2。可用以下命令安装并核验实际加载版本：
 
 ```bash
-# --recursive pulls the NVIDIA CUTLASS submodule (python/fmha_sm100/cutlass/),
-# whose headers are required for JIT/AOT compilation.
-git clone --recursive https://github.com/MiniMax-AI/MSA.git msa
-cd msa
-# If you cloned without --recursive:
-#   git submodule update --init --recursive
-pip install .           # standard install (works from a wheel too)
-# or
-pip install -e .        # editable install for development
+python -m pip install "nvidia-cutlass-dsl[cu13]>=4.5.2"
+python -c 'import cutlass; print(cutlass.__version__, cutlass.CUDA_VERSION)'
 ```
 
-This pulls in the CuTe-DSL stack via `nvidia-cutlass-dsl` and `quack-kernels`;
-the csrc kernels are JIT-compiled at first import from sources shipped inside
-the package.
-
-## Verify
-
-Run a small CUDA smoke test. **The first run JIT-compiles `sparse_topk_select`,
-which takes 30 s – a few minutes on a cold nvcc cache** — this is normal, not
-a hang. Subsequent runs hit the JIT cache and finish in seconds.
+固定使用 4.5.2 时，若核验仍显示 CUDA 12.9，需最后重新安装同版本 cu13 wheel：
 
 ```bash
-python tests/smoke/test_sparse_topk_forced.py
+python -m pip install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==4.5.2"
+python -c 'import cutlass; print(cutlass.__version__, cutlass.CUDA_VERSION)'
 ```
 
-## Usage
+Q8KV4 C++ 算子使用标准的 `CUDA_HOME`、`CUTLASS_ROOT` 和 `TORCH_EXTENSIONS_DIR`
+配置。运行时 JIT 始终根据输入 tensor 所在的 CUDA device 选择 `sm_100a` 或
+`sm_103a`；无 tensor 的 AOT/离线构建使用 `MM_SPARSE_TARGET_ARCH=100a|103a` 指定
+目标（默认 `103a`）。`TORCH_CUDA_ARCH_LIST` 只由内部编译流程设置，不作为运行时
+架构选择接口。Q8KV4 Decode Attention、Decode Indexer 和共享 dequant 支持 CUDA
+Toolkit 12.9 或更高版本；工具链支持 QMUL4 时使用该路径，否则自动使用精确
+fallback。Q8KV4 Prefill Attention 要求 CUDA Toolkit 13.4 或更高版本。
+
+Q8K8 sparse decode 通过可选的外部 FlashInfer TRTLLM-GEN backend 提供。本仓库不包含
+FlashInfer 源码或 cubin；使用 `python -m pip install -e '.[flashinfer]'` 安装
+`flashinfer-python==0.6.17`。Q8KV4 decode 使用原生 CUTLASS C++；两种 decode attention
+均支持 B200/B300 上的 GQA=8/16 和 BF16 输出，按实际 `Hq/Hkv` 选择实现，不接收 TP 数。
+Q8KV4 decode 另保留 SM107 的 GQA=16 支持，需要 CUDA Toolkit 13.5 或更新版本。
+
+## 3. 主要接口
+
+### 3.1 MSA v1 训练
 
 ```python
-import torch
-from fmha_sm100 import fmha_sm100, fmha_sm100_plan, sparse_topk_select
+from msa_v1 import attention, indexer, indexer_tree, kl
 
-# Page size and top-k for the sparse prefill path.
-page_size, topk = 128, 16
+topk_indices, indexer_lse = indexer.forward(...)
+metadata = attention.prepare(...)
+out, lse = attention.forward(..., metadata, return_softmax_lse=True)
+dq, dk, dv = attention.backward(..., out, lse, metadata)
+dqi, dki = kl.backward(..., indexer_lse, metadata)
+```
 
-# Dense proxy pass: compute per-block max score from a cheap Q slice.
-proxy_plan = fmha_sm100_plan(
-    qo_lens, kv_lens, proxy_q.shape[1],
-    num_kv_heads=1,
-    page_size=page_size,
-    output_maxscore=True,
-)
-_, max_score = fmha_sm100(
-    proxy_q, proxy_k_pages, proxy_v_pages, proxy_plan,
-    kv_indices=kv_indices,
-    output_o=False,
-    output_maxscore=True,
+每一层必须使用该层当前的 `topk_indices` 调用 `attention.prepare()`。返回的
+`AttentionMetadata` 只在对应的 Attention forward、Attention backward 和 KL backward
+之间复用；TopK 更新后必须重新执行 `prepare()`。若 TopK 会在 CUDA Graph replay 之间
+变化，Graph 必须捕获 `prepare()`，使其在每次 replay 时重新生成 metadata。
+
+MSA v1 Attention 的 E4M3 概率路径（含 `sparse_attn_p_mode="fp8"` QAT）采用
+`E4M3(P × 448)`，归一化和 backward 概率重建补偿该缩放。LSE 保持原始 logits
+的自然对数语义，QAT 的逻辑 softmax STE 定义不变。该约定不承诺训练与推理最终输出逐位一致。
+QAT/FP8 路径及 decode 使用硬件 exp2，普通 BF16 路径保留原有模拟设置；跨路径对齐缩放及补偿语义，
+不要求量化后的 P 逐位一致。
+
+| Module | 公开 API |
+| --- | --- |
+| `msa_v1.indexer` | `prepare_indexer_schedule`、`forward` |
+| `msa_v1.attention` | `prepare`、`forward`、`backward` |
+| `msa_v1.indexer_tree` | `compile_plan`、`forward` |
+| `msa_v1.kl` | `backward` |
+
+Tree Indexer 的用法见
+[`training/msa_v1/indexer_tree/tree_indexer_usage.md`](training/msa_v1/indexer_tree/tree_indexer_usage.md)。
+
+### 3.2 MSA v1 推理
+
+MSA v1 推理算子统一使用 `plan()` / `run()` 生命周期。`plan()` 接收请求级 metadata，
+`run()` 接收逐层数据。进入 CUDA Graph capture 前必须完成 `plan()` 和所需 warmup；
+capture 期间应使用预分配输出。
+
+| 算子 | Package | 输入格式 |
+| --- | --- | --- |
+| Decode Attention | `inference.msa_v1.attention.decode.q8kv4` | E4M3 Q + NVFP4 K/V |
+| Decode Attention | `inference.msa_v1.attention.decode.q8kv8` | E4M3 Q/K/V |
+| Prefill Attention | `inference.msa_v1.attention.prefill.bf16` | BF16 Q/K/V |
+| Prefill Attention | `inference.msa_v1.attention.prefill.q8kv4` | E4M3 Q + NVFP4 K/V |
+| Prefill Attention | `inference.msa_v1.attention.prefill.q8kv8` | E4M3 Q/K/V |
+| Decode Indexer | `inference.msa_v1.indexer.decode.tp4_q8kv4` | E4M3 Q + NVFP4 K |
+| Decode Indexer | `inference.msa_v1.indexer.decode.tp4_q8kv8` | E4M3 Q/K |
+| Prefill Indexer | `inference.msa_v1.indexer.prefill.bf16` | BF16 Q/K |
+| Prefill Indexer | `inference.msa_v1.indexer.prefill.tp4_q8kv8` | E4M3 Q/K |
+
+Q8KV4 Decode Attention 示例：
+
+```python
+from inference.msa_v1.attention.decode.q8kv4 import (
+    BatchDecodeWithPagedKVCacheWrapper,
 )
 
-# max_score -> sparse KV block indexes.
-kv_block_indexes = sparse_topk_select(
-    max_score.contiguous(), topk, num_valid_pages=num_pages,
+wrapper = BatchDecodeWithPagedKVCacheWrapper()
+wrapper.plan(
+    topk_indices,
+    page_table,
+    seq_lens,
+    q_len_per_req=q_len_per_req,
+    num_q_heads=64,
+    num_kv_heads=4,
 )
-
-# Sparse attention with the selected blocks.
-sparse_plan = fmha_sm100_plan(
-    qo_lens, kv_lens, q.shape[1],
-    num_kv_heads=k_pages.shape[1],
-    page_size=page_size,
-    kv_block_num=topk,
-)
-out, _ = fmha_sm100(
-    q, k_pages, v_pages, sparse_plan,
-    kv_indices=kv_indices,
-    kv_block_indexes=kv_block_indexes,
+out = wrapper.run(
+    q,
+    (packed_k_cache, packed_v_cache),
+    kv_cache_sf=(k_scale, v_scale),
 )
 ```
 
-For block-sparse prefill with CSR metadata, the FP4 indexer, NVFP4 K/V, and
-the paged FP8 decode wrapper, see the **CuTe-DSL deep dive**:
+各算子的 shape、dtype、TopK/page 契约和可选参数见对应目录的 README。
 
-- [`python/fmha_sm100/cute/README.md`](python/fmha_sm100/cute/README.md)
+## 4. 正确性测试
 
-## Test
+在仓库根目录运行。设置 `FMHA_SM100_ALLOW_JIT=1` 允许首次编译；首次编译不计入 kernel 执行耗时。
 
 ```bash
-# Fast smoke tests.
-python -m pytest tests/smoke -q
-
-# API and end-to-end integration tests.
-python -m pytest tests/integration -q
-python tests/integration/test_proxy_kv_e2e.py
-
-# Large regression suites.
-python tests/regression/test_correctness.py
-python tests/regression/test_sparse_attn.py
-
-# CuTe-DSL forward-only sparse attention.
-cd python/fmha_sm100/cute
-python -m pytest test_sparse_atten.py -q
+export FMHA_SM100_ALLOW_JIT=1
+python -m pytest tests/test_package_layout.py tests/test_training_workloads.py -q
+python -m pytest tests/training/msa_v1/cute -q -s --msa-v1-suite=smoke
+python -m pytest tests/training/msa_v1/cute -q -s --msa-v1-suite=full
+python -m pytest tests/inference -q -s --msa-inference-suite=smoke
+python -m pytest tests/inference -q -s --msa-inference-suite=full
 ```
 
-## Benchmark
+## 5. Benchmark
 
-`benchmarks/bench_sparse_attention_ops.py` covers dense prefill, paged
-prefill, sparse prefill, dense decode, paged decode, sparse decode, in
-`fp8` and `bf16` (`nvfp4` is sparse-prefill only).
+### 5.1 数据集与 workload
+
+| 场景 | 数据来源 | Benchmark 范围 |
+| --- | --- | --- |
+| 训练 | [训练 workload](datas/training/README.md) | 按训练 benchmark 的 `--case-suite` 选择 |
+| 推理 Prefill | [推理 workload](datas/inference/README.md)：10,562 个去敏唯一 shape | `--suite full` 固定运行 128 个 case；代表性权重合计 14,805 |
+| 推理 Decode / MTP | [固定 workload 配置](benchmarks/inference/msa_v1/decode/cases.py) | `--suite full` 运行 28 个 case：4 个 batch size × 7 个标称序列长度 |
+
+Prefill manifest 保存 query/prefix/KV 长度及调用权重，Attention 与 Indexer 共用这些
+shape；tensor 数据和非连续 physical page table 在运行时可复现生成。
+Decode 配置使用 batch=8/32/64/128，标称序列长度为
+1,000/4,000/5,000/10,000/50,000/100,000/200,000，每个请求包含 8 个 query
+（1 个主 token + 7 个 draft token）。以 1701 为基础 seed，在 batch 内生成围绕标称
+长度变化的真实 seqlen，并保持平均长度等于标称值；它是一套固定合成 workload。
+这些数据不包含 tensor payload 或原始业务数据。
+
+### 5.2 运行示例
+
+在仓库根目录运行，先按上节说明启用首次 JIT 编译。训练快速检查：
 
 ```bash
-python benchmarks/bench_sparse_attention_ops.py --help     # full flag list
+python benchmarks/training/msa_v1/benchmark.py --kernel indexer --case-suite smoke
 ```
 
-Common invocations (output is TSV):
+推理 Prefill Indexer：快速检查与完整 128-case benchmark：
 
-| Goal | Command |
-|---|---|
-| FP8 full sweep | `python benchmarks/bench_sparse_attention_ops.py --dtype fp8 --sections all --output_mode o -o /tmp/msa_fp8.tsv` |
-| BF16 full sweep | `python benchmarks/bench_sparse_attention_ops.py --dtype bf16 --sections all --output_mode o -o /tmp/msa_bf16.tsv` |
-| NVFP4 sparse prefill | `python benchmarks/bench_sparse_attention_ops.py --dtype nvfp4 --sections sparse_prefill --output_mode o -o /tmp/msa_nvfp4.tsv` |
-| Quick CI smoke | `python benchmarks/bench_sparse_attention_ops.py --dtype fp8 --sections prefill,decode,sparse_decode --seqs 8192,16384 --tp 1,4 --decode-k 8192,131072 --decode-b 32 --dry-run-ms 50 --repeat-ms 200 -o /tmp/msa_smoke.tsv` |
-| Output-mode checks (dense/paged) | `--output_mode maxscore` or `--output_mode full` |
-
-## Layout
-
-```
-python/fmha_sm100/                  Python package
-  __init__.py                       Public re-exports (lazy for the CuTe-DSL stack)
-  api.py                            fmha_sm100 / fmha_sm100_plan / sparse_topk_select
-  jit.py                            Runtime JIT (nvcc + ninja) for the csrc stack
-  sparse.py                         Lazy shim that loads the cute/ stack
-  sparse_fmha_adapter.py            Bridge: fmha_sm100 API → sparse_atten_func
-  csrc/                             CUDA kernels + Jinja templates (JIT-compiled)
-    include/                        Vendored FlashInfer / CUTLASS-derived / TRT-LLM headers
-  cutlass/                          NVIDIA CUTLASS git submodule (include/ + tools/util/include/)
-  cute/                             CuTe-DSL sparse attention (loaded via sys.path)
-tests/                              Correctness tests
-  smoke/  integration/  regression/
-scripts/                            Warmup + cache-management helpers
-benchmarks/                         bench_sparse_attention_ops.py
+```bash
+python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark \
+  --suite smoke --out agent/agent_benchmark/prefill_bf16_smoke.json
+python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark \
+  --suite full --out agent/agent_benchmark/prefill_bf16_full.json
 ```
 
-## Stacks
+推理 Decode Indexer：完整 28-case benchmark：
 
-- **csrc JIT** — dense FlashAttention, page KV, and `sparse_topk_select`
-  indexer. Compiled at runtime from `csrc/*.cu.jinja` plus
-  `csrc/include/`. Public entry: `fmha_sm100.plan → run`.
-- **CuTe-DSL** — block-sparse prefill, FP8 / NVFP4 / FP4 quantization, paged
-  FP8 decode (`SparseDecodePagedAttentionWrapper`), FP4 block-score indexer.
-  Public entry: `fmha_sm100.sparse_atten_func`,
-  `fmha_sm100.sparse_decode_atten_func`, `fmha_sm100.fp4_indexer_block_scores`.
-- **Bridge** — `sparse_fmha_plan` / `sparse_fmha` adapt the dense-API call
-  site to the sparse backend for prefill paths; useful when you already
-  drive the dense kernel and want a one-line swap to sparse.
-
-## Third-party licenses
-
-`fmha_sm100` bundles, derives from, or depends on the third-party components
-below. Each retains its original license; this section summarizes them.
-Authoritative text is shipped with each component.
-
-### Vendored / derived source (shipped in this repo)
-
-| Component | License | Where |
-|---|---|---|
-| **NVIDIA CUTLASS** | BSD-3-Clause | Git submodule at `python/fmha_sm100/cutlass/` (provides `include/` + `tools/util/include/`), plus BSD-3-tagged headers under `python/fmha_sm100/csrc/include/`. The SM100 MMA descriptor encodings in `python/fmha_sm100/cute/src/common/mma_sm100_desc.py` mirror CUTLASS hardware descriptors. Copyright (c) 2017–2025 NVIDIA CORPORATION & AFFILIATES. |
-| **FlashInfer** | Apache-2.0 | Headers and sources under `python/fmha_sm100/csrc/` and `python/fmha_sm100/csrc/include/` that carry a `Copyright (c) <year> by FlashInfer team` line (e.g. `allocator.h`, `exception.h`, `utils.cuh`, `cutlass_utils.cuh`, `fmha_cutlass_sm100.cuh`, `sparse_topk_select.cuh`, `plan.cuh`, `sm100_fmha_reduction.hpp`, `tvm_ffi_utils.h`). Project: <https://github.com/flashinfer-ai/flashinfer>. |
-| **NVIDIA TensorRT-LLM + NAVER Corp (CLOVA)** | Apache-2.0 | Portions of `python/fmha_sm100/csrc/include/sparse_topk_select.cuh` — `indexerTopK` histogram-step + insertion-sort derived from `tensorrt_llm/cpp/tensorrt_llm/kernels/indexerTopK.cu`. Copyright (c) 2019–2026 NVIDIA CORPORATION; Copyright (c) 2021 NAVER Corp. The per-file header in `sparse_topk_select.cuh` includes a function-level provenance map. |
-
-### Runtime dependencies (installed via pip)
-
-| Package | Upstream | License |
-|---|---|---|
-| `quack-kernels` | <https://github.com/Dao-AILab/quack> | Apache-2.0 |
-| `nvidia-cutlass-dsl` | NVIDIA CUTLASS Python DSL | NVIDIA / BSD-3-Clause (see package) |
-| `apache-tvm-ffi` | Apache TVM FFI | Apache-2.0 |
-| `cuda-python` | NVIDIA | NVIDIA / see package |
-| `torch` | <https://github.com/pytorch/pytorch> | BSD-3-Clause |
-| `jinja2` | <https://github.com/pallets/jinja> | BSD-3-Clause |
-| `ninja` | <https://github.com/ninja-build/ninja> | Apache-2.0 |
-| `pybind11` | <https://github.com/pybind/pybind11> | BSD-3-Clause |
-
-The exact license of each installed package is distributed with that package;
-consult its metadata (`pip show <pkg>`) for the authoritative text.
-
-## Citation
-
-If MSA helps your research, please cite it. (BibTeX entry coming once the
-companion paper / technical report has a stable identifier — placeholder.)
-The algorithmic reference is shipped at
-[`docs/MiniMaxSparseAttention.pdf`](docs/MiniMaxSparseAttention.pdf).
-
-```bibtex
-@software{msa2026,
-  title  = {MiniMax Sparse Attention (MSA): FlashAttention and block-sparse
-            attention kernels for NVIDIA SM100},
-  author = {{MiniMax}},
-  year   = {2026},
-  url    = {https://github.com/MiniMax-AI/MSA}
-}
+```bash
+python -m benchmarks.inference.msa_v1.indexer.decode.tp4_q8kv8.benchmark \
+  --suite full --graph-calls 120 --warmup 5 --replays 20 \
+  --out agent/agent_benchmark/decode_q8kv8_full.json
 ```
 
-## Contributing
+以上是 Indexer 的可执行示例；Attention benchmark 位于
+[`benchmarks/inference/msa_v1/attention/`](benchmarks/inference/msa_v1/attention/)，
+按 decode/prefill 与 dtype 选择对应入口。训练的完整用法见
+[训练 benchmark](benchmarks/training/msa_v1/README.md)。
 
-Issues and PRs welcome on the
-[issue tracker](https://github.com/MiniMax-AI/MSA/issues). For kernel or
-runtime-contract changes, open an issue first to align on the public
-surface — `fmha_sm100.api`, `fmha_sm100.sparse` and
-`cute.interface` are the stable entry points; everything else
-is internal and may change without notice.
+### 5.3 计时口径
+
+输入构造、编译、plan 和 warmup 不计入正式指标。推理计时覆盖 CUDA Graph 内公开
+`run()` 的完整 E2E 路径；Indexer 包含评分计算与 TopK。Prefill 通过不相交 tensor
+轮换建立超过 2 倍 L2 的复用距离；Decode 默认每张 Graph 调用 120 次，并轮换输入
+实现 cold-cache。默认 5 次 warmup、20 次 replay，报告每次调用的 median latency 和 CV。
+Prefill 的每张 Graph 调用次数由 tensor slots 决定，不固定为 120。
+
+`smoke` 用于快速检查；正式聚合比较应使用不带 case 筛选的 `full`。
+上述推理 Indexer 入口支持 `--baseline <baseline.json>`，用于比较相同 workload 的
+E2E 性能。日志和结果统一写入 Git 忽略的 `agent/` 目录。
+
+## 6. 第三方许可证
+
+本仓库使用 [MIT 许可证](LICENSE)。第三方来源与许可证声明见 [NOTICE](NOTICE)；
+原有源码头部的版权及许可证不变。CUTLASS 子模块位于 `third_party/cutlass`（BSD-3-Clause）。
+CuTe 训练和推理公共组件参考 FlashAttention，其 BSD-3-Clause 许可证全文收录于 [NOTICE](NOTICE)。
+FlashInfer 派生 C++ 文件保留原 Apache-2.0 声明；上游继承的其他来源署名保留在 NOTICE 中。Python 运行时依赖各自遵循其发行包许可证。

@@ -1,32 +1,22 @@
-# Python
 __pycache__/
 *.py[cod]
-*.egg-info/
-.eggs/
+.pytest_cache/
+.ruff_cache/
 build/
 dist/
-
-# Compiled / JIT artifacts
+*.egg-info/
+*.log
+*.ncu-rep
+*.nsys-rep
+*.sqlite
 *.so
 *.o
 *.cubin
 *.ptx
-
-# Caches
-.pytest_cache/
-.benchmarks/
-.cache/
-.ruff_cache/
-
-# Profiling
-*.ncu-rep
-*.nsys-rep
-log/
-profiles/
-
-# Editor / OS
-.vscode/
-.idea/
-*.swp
-.DS_Store
-tests/logs/
+**/design.md
+**/development.md
+**/results.md
+**/optimization.md
+/datas/inference/dspark_forward_dumps.dp*.jsonl
+/datas/192k_cp16/*.csv
+/agent/

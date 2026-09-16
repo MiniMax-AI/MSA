@@ -1,0 +1,12 @@
+#include "sm100/device/prefill_attention_launch.cuh"
+
+namespace minimax::msa_v1::attention::prefill::q8kv4 {
+
+static_assert(detail::kQHeadsPerKv == {{ q_heads_per_kv }});
+static_assert(detail::kHeadDim == {{ head_dim }});
+static_assert(detail::kPageSize == {{ page_size }});
+static_assert({{ topk }} == 16);
+static_assert(detail::kQStages == {{ q_stages }});
+static_assert(detail::kScoreStages == {{ score_stages }});
+
+}  // namespace minimax::msa_v1::attention::prefill::q8kv4
