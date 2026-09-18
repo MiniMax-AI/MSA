@@ -136,8 +136,27 @@ class _BatchPrefillWithPagedKVCacheWrapperBase:
     allow_strided_kv = False
     supported_gqa_group_sizes = tuple(sorted(_SUPPORTED_GQA_GROUP_SIZES))
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        enable_fp16_softmax: bool | None = None,
+        enable_2x_fp8: bool | None = None,
+    ) -> None:
+        """Create a wrapper with independently selectable Rubin fast paths.
+
+        ``None`` preserves automatic selection: both optimizations are active
+        for native FP8 Q/K/V on SM107 and inactive otherwise. Pass ``False``
+        to disable either optimization independently.
+        """
+        for name, value in (
+            ("enable_fp16_softmax", enable_fp16_softmax),
+            ("enable_2x_fp8", enable_2x_fp8),
+        ):
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{name} must be bool or None")
         self._plan_state: _PlanState | None = None
+        self.enable_fp16_softmax = enable_fp16_softmax
+        self.enable_2x_fp8 = enable_2x_fp8
 
     def plan(
         self,
@@ -304,6 +323,8 @@ class _BatchPrefillWithPagedKVCacheWrapperBase:
             state.lse_partial,
             softmax_scale=state.sm_scale,
             max_seqlen_q=state.metadata.max_seqlen_q,
+            enable_fp16_softmax=self.enable_fp16_softmax,
+            enable_2x_fp8=self.enable_2x_fp8,
         )
         combine(
             state.o_partial,

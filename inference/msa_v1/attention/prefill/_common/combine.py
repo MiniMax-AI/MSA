@@ -11,6 +11,7 @@ from typing import Optional, Type
 import cutlass
 from cutlass import Boolean, Float32, Int32, Int64, const_expr
 import cutlass.cute as cute
+from cutlass.cutlass_dsl import BaseDSL
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.nvgpu import cpasync
 import cuda.bindings.driver as cuda
@@ -61,6 +62,9 @@ class SparseAttentionForwardCombine:
         self.num_threads = num_threads
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        rubin_arch = getattr(arch.__class__, "sm_107", None)
+        self.is_rubin = rubin_arch is not None and arch.is_family_of(rubin_arch)
         self.use_pdl = use_pdl
         self.min_blocks_per_mp = min_blocks_per_mp
         self.raw_partial_stats = raw_partial_stats
@@ -1629,7 +1633,7 @@ class SparseAttentionForwardCombine:
                 # Get scales for this split
                 scale = cute.make_rmem_tensor(num_rows, Float32)
                 for m in cutlass.range(num_rows, unroll_full=True):
-                    scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem
+                    scale[m] = sLSE[s, tOcO[0, m, 0][0]]
 
                 if const_expr(self.use_tma_partial):
                     cute.autovec_copy(
@@ -2184,8 +2188,12 @@ def combine(
     has_output_scale = output_scale is not None
     min_blocks_per_mp = 3 if has_output_scale and use_pdl else 0
 
+    capability = torch.cuda.get_device_capability(o_out.device)
+    stages = 4 if capability == (10, 7) else 2
     key = (
         "combine",
+        capability,
+        stages,
         D,
         k_block_size,
         tile_m,
@@ -2220,7 +2228,7 @@ def combine(
                 num_threads=num_threads,
                 use_pdl=use_pdl,
                 min_blocks_per_mp=min_blocks_per_mp,
-                stages=2,
+                stages=stages,
                 raw_partial_stats=raw_partial_stats,
             )
             div = 128 // partial_dtype.width
