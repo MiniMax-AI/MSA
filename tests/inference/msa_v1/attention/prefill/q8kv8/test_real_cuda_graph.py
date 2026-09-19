@@ -25,8 +25,8 @@ def test_real_case_cuda_graph_replay(case) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) not in {(10, 0), (10, 3)}:
-        pytest.skip("Q8KV8 prefill attention requires SM100 or SM103")
+    if torch.cuda.get_device_capability(device) not in {(10, 0), (10, 3), (10, 7)}:
+        pytest.skip("Q8KV8 prefill attention requires SM100, SM103, or SM107")
     inputs = make_real_prefill_attention_inputs(case, device=device)
     wrapper = BatchPrefillWithPagedKVCacheWrapper()
     wrapper.plan(

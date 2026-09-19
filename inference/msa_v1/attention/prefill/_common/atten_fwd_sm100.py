@@ -1,4 +1,4 @@
-"""SM100 sparse attention forward kernel.
+"""SM100/SM103 sparse attention forward kernel with optional Rubin fast paths.
 
 This kernel implements the delivered Sparse Attention / Sparse Page Attention
 forward contract:
@@ -21,14 +21,27 @@ import torch
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass import Float32, Int32, Int64, const_expr
 import cutlass.pipeline as cutlass_pipeline
+from cutlass.cutlass_dsl import BaseDSL
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
+# Blackwell installations do not need the Rubin-specific CuTe helpers.
+try:
+    import cutlass.utils.rubin_helpers as sm107_utils
+except ModuleNotFoundError as error:
+    if error.name != "cutlass.utils.rubin_helpers":
+        raise
+    sm107_utils = None
+
+logger = logging.getLogger(__name__)
 
 from inference.msa_v1.attention.prefill._common.dsl import copy_utils
 from inference.msa_v1.attention.prefill._common.dsl import (
     blackwell_helpers as sm100_helpers,
 )
 from inference.msa_v1.attention.prefill._common.dsl import mma_sm100_desc as sm100_desc
+from inference.msa_v1.attention.prefill._common.dsl import (
+    rubin_helpers as sm107_mma_helpers,
+)
 from inference.msa_v1.attention.prefill._common.dsl import pipeline
 from inference.msa_v1.attention.prefill._common.dsl import utils
 from inference.msa_v1.aot_cache import (
@@ -64,8 +77,6 @@ from inference.msa_v1.attention.prefill._common.dsl.tma_utils import (
 from inference.msa_v1.attention.prefill._common.prepare_scheduler import (
     SparseAttentionSchedule,
 )
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -157,7 +168,7 @@ class _ForwardRowMetadata(ParamsBase):
 
 
 class SparseAttentionForwardSm100:
-    """Inference-only SM100 sparse PageKV attention forward kernel."""
+    """Inference-only Blackwell/Rubin sparse PageKV attention forward kernel."""
 
     k_tile = 64  # UTCMMA bf16 K-tile (matches sparse_fwd_utcmma.py)
 
@@ -174,6 +185,9 @@ class SparseAttentionForwardSm100:
         use_prepare_scheduler: bool = True,
         qk_dtype=None,
         pv_dtype=None,
+        enable_fp16_softmax: bool = False,
+        enable_2x_fp8: Optional[bool] = None,
+        enable_tmem_load_red: bool = True,
     ):
         if head_dim != 128:
             raise NotImplementedError(
@@ -196,6 +210,13 @@ class SparseAttentionForwardSm100:
         self.causal = causal
         self.qk_dtype_param = qk_dtype
         self.pv_dtype_param = pv_dtype
+        self.enable_fp16_softmax = bool(enable_fp16_softmax)
+        if enable_2x_fp8 is not None and not isinstance(enable_2x_fp8, bool):
+            raise TypeError("enable_2x_fp8 must be bool or None")
+        # Resolved against the actual dtypes/arch once tensors are known:
+        # None -> on for native FP8 Q/K/V on Rubin, off otherwise.
+        self.enable_2x_fp8_param = enable_2x_fp8
+        self.enable_tmem_load_red = bool(enable_tmem_load_red)
         if not use_prepare_scheduler:
             raise ValueError("SparseAttentionForwardSm100 requires prepare scheduler")
         if self.paged_kv:
@@ -214,8 +235,7 @@ class SparseAttentionForwardSm100:
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
 
-        # Pipeline configuration. FP8 specializes the Q ring to three stages
-        # in __call__; BF16 keeps the lower-overhead two-stage ring.
+        # __call__ selects Q stages by architecture and storage dtype.
         self.q_stage = 2
         self.s_stage = 2
         self.o_stage = 2
@@ -278,9 +298,12 @@ class SparseAttentionForwardSm100:
         self.ex2_emu_start_frg = 1
         self.buffer_align_bytes = 1024
 
-        # Blackwell config.
+        # Keep Rubin-only instructions out of Blackwell specializations.
         self.cta_group_size = 1
         self.cluster_shape_mnk = (1, 1, 1)
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        rubin_arch = getattr(arch.__class__, "sm_107", None)
+        self.is_rubin = rubin_arch is not None and arch.is_family_of(rubin_arch)
 
     @cute.jit
     def _batch_q_offset(
@@ -434,7 +457,6 @@ class SparseAttentionForwardSm100:
         stream=None,
     ):
         self.q_dtype = mQ_flat.element_type
-        self.q_stage = 3 if const_expr(self.q_dtype == cutlass.Float8E4M3FN) else 2
         self.k_input_dtype = mK.element_type
         self.v_input_dtype = mV.element_type
         self.qk_dtype = (
@@ -491,6 +513,45 @@ class SparseAttentionForwardSm100:
         self.kv_fp8_to_bf16 = self.k_fp8_to_bf16 or self.v_fp8_to_bf16
         self.qk_mma_kind = "f8f6f4" if const_expr(self.qk_dtype.width == 8) else "f16"
         self.pv_mma_kind = "f8f6f4" if const_expr(self.pv_dtype.width == 8) else "f16"
+        # FP8 operands take the SM107 FP8 MMA (sm107_utils); BF16 operands
+        # take the generic tcgen05 MMA (sm100_utils), which Rubin also runs.
+        self.rubin_qk_fp8 = self.is_rubin and self.qk_dtype == cutlass.Float8E4M3FN
+        self.rubin_pv_fp8 = self.is_rubin and self.pv_dtype == cutlass.Float8E4M3FN
+        # Both FP8 optimizations share one requirement: native FP8 (E4M3)
+        # Q/K/V. Packed FP16 softmax produces FP8 P; the doubled-K (K64) MMA
+        # is an FP8-only instruction.
+        native_fp8 = self.rubin_qk_fp8 and self.rubin_pv_fp8
+        if const_expr(self.enable_fp16_softmax and not native_fp8):
+            raise NotImplementedError(
+                "enable_fp16_softmax requires Rubin SM107 and FP8 (E4M3) Q/K/V"
+            )
+        if const_expr(self.enable_2x_fp8_param is None):
+            self.enable_2x_fp8 = native_fp8
+        else:
+            if const_expr(self.enable_2x_fp8_param and not native_fp8):
+                raise NotImplementedError(
+                    "enable_2x_fp8 requires Rubin SM107 and FP8 (E4M3) Q/K/V"
+                )
+            self.enable_2x_fp8 = self.enable_2x_fp8_param
+        # enable_2x_fp8 implies both operands are FP8, so one K width covers
+        # both MMAs.
+        self.rubin_fp8_mma_k = 64 if self.enable_2x_fp8 else 32
+        # Rubin uses Q4 for FP8 and Q5 for BF16; Blackwell retains Q3/Q2. Kept
+        # independent of the doubled-K flag so enable_2x_fp8=False is a clean
+        # K64-vs-K32 ablation.
+        self.q_stage = (
+            (4 if self.q_dtype == cutlass.Float8E4M3FN else 5)
+            if self.is_rubin
+            else (3 if self.q_dtype == cutlass.Float8E4M3FN else 2)
+        )
+        if const_expr((self.rubin_qk_fp8 or self.rubin_pv_fp8) and sm107_utils is None):
+            raise RuntimeError("Rubin FP8 requires a CuTe DSL build with rubin_helpers")
+        if const_expr(self.enable_2x_fp8):
+            if const_expr(self.n_block_size % 64 != 0):
+                raise ValueError(
+                    "Rubin FP8 K64 PV requires n_block_size divisible by 64"
+                )
+            self.split_P_arrive = 64 if self.n_block_size > 64 else 0
         elem_bytes = const_expr(self.q_dtype.width // 8)
         self.q_stage_stride_bytes = self.m_block_size * self.head_dim * elem_bytes
         self.k_tile_stride_bytes = self.m_block_size * self.k_tile * elem_bytes
@@ -536,23 +597,46 @@ class SparseAttentionForwardSm100:
         #  UTCMMA TiledMma: QK^T and PV
         # ------------------------------------------------------------------
         cta_group = tcgen05.CtaGroup.ONE
-        tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
-            self.q_dtype,
-            OperandMajorMode.K,
-            OperandMajorMode.K,
-            Float32,
-            cta_group,
-            self.mma_tiler_qk[:2],
-        )
-        tiled_mma_pv = sm100_utils.make_trivial_tiled_mma(
-            self.v_dtype,
-            OperandMajorMode.K,
-            OperandMajorMode.MN,
-            Float32,
-            cta_group,
-            self.mma_tiler_pv[:2],
-            tcgen05.OperandSource.TMEM,
-        )
+        if const_expr(self.rubin_qk_fp8):
+            tiled_mma_qk = sm107_utils.make_trivial_tiled_mma(
+                self.q_dtype,
+                self.k_dtype,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                Float32,
+                cta_group,
+                (*self.mma_tiler_qk[:2], self.rubin_fp8_mma_k),
+            )
+        else:
+            tiled_mma_qk = sm100_utils.make_trivial_tiled_mma(
+                self.q_dtype,
+                OperandMajorMode.K,
+                OperandMajorMode.K,
+                Float32,
+                cta_group,
+                self.mma_tiler_qk[:2],
+            )
+        if const_expr(self.rubin_pv_fp8):
+            tiled_mma_pv = sm107_utils.make_trivial_tiled_mma(
+                self.p_dtype,
+                self.v_dtype,
+                OperandMajorMode.K,
+                OperandMajorMode.MN,
+                Float32,
+                cta_group,
+                (*self.mma_tiler_pv[:2], self.rubin_fp8_mma_k),
+                a_source=tcgen05.OperandSource.TMEM,
+            )
+        else:
+            tiled_mma_pv = sm100_utils.make_trivial_tiled_mma(
+                self.v_dtype,
+                OperandMajorMode.K,
+                OperandMajorMode.MN,
+                Float32,
+                cta_group,
+                self.mma_tiler_pv[:2],
+                tcgen05.OperandSource.TMEM,
+            )
 
         cta_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_qk.thr_id.shape,)
@@ -666,7 +750,6 @@ class SparseAttentionForwardSm100:
                 cute.select(sQ_load_layout, mode=[0, 1]),
                 (self.qheadperkv, q_load_tile),
             )
-
         softmax_scale_log2 = softmax_scale * Float32(math.log2(math.e))
 
         # ------------------------------------------------------------------
@@ -2239,7 +2322,12 @@ class SparseAttentionForwardSm100:
                     tSrQ0.layout,
                     var_name_prefix="lean_q_desc",
                 )
-                sm100_helpers.declare_ptx_idesc(qk_mma_op, var_name="lean_qk_idesc")
+                if const_expr(self.rubin_qk_fp8):
+                    sm107_mma_helpers.declare_ptx_idesc(
+                        qk_mma_op, var_name="lean_qk_idesc"
+                    )
+                else:
+                    sm100_helpers.declare_ptx_idesc(qk_mma_op, var_name="lean_qk_idesc")
                 q_wrap_offset = -(self.q_stage - 1) * sQ_stage_stride
                 q_advance_offset = sQ_stage_stride
                 gemm_qk_s0_wrap = partial(
@@ -2290,8 +2378,11 @@ class SparseAttentionForwardSm100:
                     cta_group=self.cta_group_size,
                     mma_kind=self.qk_mma_kind,
                 )
+                gemm_pv_fn = sm100_helpers.gemm_ptx_partial
+                if const_expr(self.rubin_pv_fp8):
+                    gemm_pv_fn = sm107_mma_helpers.gemm_ptx_partial
                 gemm_pv_0 = partial(
-                    sm100_helpers.gemm_ptx_partial,
+                    gemm_pv_fn,
                     pv_mma_op,
                     Int32(self.tmem_o_offset),
                     tOrP[None, None, None, 0],
@@ -2304,7 +2395,7 @@ class SparseAttentionForwardSm100:
                     mma_kind=self.pv_mma_kind,
                 )
                 gemm_pv_1 = partial(
-                    sm100_helpers.gemm_ptx_partial,
+                    gemm_pv_fn,
                     pv_mma_op,
                     Int32(self.tmem_o_offset + self.tmem_o_stage_stride),
                     tOrP[None, None, None, 1],
@@ -2469,6 +2560,7 @@ class SparseAttentionForwardSm100:
         pipeline_sm_stats,
         sm_stats_barrier,
         stats_barrier_idx: Int32,
+        tiled_tmem_load,
         thr_tmem_load,
         thr_tmem_store,
         tStS_t2r: cute.Tensor,
@@ -2492,7 +2584,25 @@ class SparseAttentionForwardSm100:
         pipeline_s.consumer_wait_w_index_phase(slot_rt, s_consumer_phase)
 
         tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, self.qk_acc_dtype)
-        cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        use_tmem_load_red = const_expr(
+            self.is_rubin and self.enable_fp16_softmax and self.enable_tmem_load_red
+        )
+        row_max = Float32(0.0)
+        if const_expr(use_tmem_load_red):
+            tSrS_red = cute.make_rmem_tensor(
+                cute.make_layout((1, cute.size(tSrS_t2r, mode=[2]))),
+                self.qk_acc_dtype,
+            )
+            for red_i in cutlass.range_constexpr(
+                0, cute.size(tSrS_t2r, mode=[2])
+            ):
+                cute.copy_atom_call(
+                    tiled_tmem_load,
+                    tStS_t2r[None, 0, red_i],
+                    (tSrS_t2r[None, 0, red_i], tSrS_red[None, red_i]),
+                )
+        else:
+            cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
 
         seqlen_info = SeqlenInfoQK(
             Int32(0),
@@ -2552,12 +2662,30 @@ class SparseAttentionForwardSm100:
 
         # Each sparse CTA computes exactly one KV block for the current Q group,
         # so full-tile softmax is always the first and only online-softmax step.
-        row_max, _ = softmax.update_row_max(tSrS_t2r.load(), True)
-        softmax.scale_subtract_rowmax(
-            tSrS_t2r,
-            row_max,
-            fp8_probability=const_expr(self.p_dtype == cutlass.Float8E4M3FN),
-        )
+        if const_expr(use_tmem_load_red):
+            use_tmem_row_max = kv_valid_cols == Int32(self.n_block_size)
+            if const_expr(self.causal):
+                use_tmem_row_max = use_tmem_row_max & (
+                    masked_tok_count == Int32(0)
+                )
+            if use_tmem_row_max:
+                row_max_raw = tSrS_red.load().reduce(
+                    cute.ReductionOp.MAX, -Float32.inf, 0
+                )
+                softmax.row_max[0] = row_max_raw
+                row_max = (
+                    row_max_raw if row_max_raw != -Float32.inf else Float32(0.0)
+                )
+            else:
+                row_max, _ = softmax.update_row_max(tSrS_t2r.load(), True)
+        else:
+            row_max, _ = softmax.update_row_max(tSrS_t2r.load(), True)
+        if const_expr(not self.enable_fp16_softmax):
+            softmax.scale_subtract_rowmax(
+                tSrS_t2r,
+                row_max,
+                fp8_probability=const_expr(self.p_dtype == cutlass.Float8E4M3FN),
+            )
         if cutlass.const_expr(self.split_P_arrive > 0):
             # This full barrier is the late-P handoff consumed inside
             # gemm_ptx_partial after its early PV k-slices are issued.
@@ -2572,14 +2700,21 @@ class SparseAttentionForwardSm100:
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.p_dtype), tSrS_t2r.layout
         )
-        softmax.apply_exp2_convert(
-            tSrS_t2r,
-            tSrP_r2t,
-            ex2_emu_freq=(
-                0 if const_expr(self.p_dtype == cutlass.Float8E4M3FN) else self.ex2_emu_freq
-            ),
-            ex2_emu_start_frg=self.ex2_emu_start_frg,
-        )
+        if const_expr(self.enable_fp16_softmax):
+            softmax.row_sum[0] = softmax.apply_exp2_convert_fp16_mixed(
+                tSrS_t2r, row_max, tSrP_r2t
+            )
+        else:
+            softmax.apply_exp2_convert(
+                tSrS_t2r,
+                tSrP_r2t,
+                ex2_emu_freq=(
+                    self.ex2_emu_freq
+                    if const_expr(self.is_rubin)
+                    else (0 if const_expr(self.p_dtype == cutlass.Float8E4M3FN) else self.ex2_emu_freq)
+                ),
+                ex2_emu_start_frg=self.ex2_emu_start_frg,
+            )
 
         for k in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2])):
             cute.copy(
@@ -2603,7 +2738,8 @@ class SparseAttentionForwardSm100:
             pipeline_sm_stats.producer_acquire_w_index_phase(
                 slot_rt, sm_stats_producer_phase
             )
-        softmax.update_row_sum(tSrS_t2r.load(), Float32(0.0), True)
+        if const_expr(not self.enable_fp16_softmax):
+            softmax.update_row_sum(tSrS_t2r.load(), Float32(0.0), True)
         del tSrS_t2r
         if const_expr(publish_stats):
             sScale_slot = cute.make_tensor(
@@ -2670,10 +2806,24 @@ class SparseAttentionForwardSm100:
         tSAcc = tStS[(None, None), 0, 0, stage]
 
         softmax = SoftmaxSm100.create(softmax_scale_log2)
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.qk_acc_dtype
+        use_tmem_load_red = const_expr(
+            self.is_rubin and self.enable_fp16_softmax and self.enable_tmem_load_red
         )
-        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(
+        if const_expr(use_tmem_load_red):
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.LdRed32x32bOp(
+                    tcgen05.copy.Repetition(32),
+                    redOp=tcgen05.TmemLoadRedOp.MAX,
+                ),
+                self.qk_acc_dtype,
+            )
+        else:
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
+                self.qk_acc_dtype,
+            )
+        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tSAcc)
+        thr_tmem_load = tiled_tmem_load.get_slice(
             group_tidx
         )
         tStS_t2r = thr_tmem_load.partition_S(tSAcc)
@@ -2737,6 +2887,7 @@ class SparseAttentionForwardSm100:
                         pipeline_sm_stats,
                         sm_stats_barrier,
                         stats_barrier_idx,
+                        tiled_tmem_load,
                         thr_tmem_load,
                         thr_tmem_store,
                         tStS_t2r,
@@ -2769,6 +2920,7 @@ class SparseAttentionForwardSm100:
                         pipeline_sm_stats,
                         sm_stats_barrier,
                         stats_barrier_idx,
+                        tiled_tmem_load,
                         thr_tmem_load,
                         thr_tmem_store,
                         tStS_t2r,
@@ -3088,7 +3240,8 @@ class SparseAttentionForwardSm100:
 _HEAD_DIM = 128
 _PAGE_SIZE = 128
 _BLOCK_KV = 128
-_SUPPORTED_CAPABILITIES = {(10, 0), (10, 3)}
+_RUBIN_CAPABILITY = (10, 7)
+_SUPPORTED_CAPABILITIES = {(10, 0), (10, 3), _RUBIN_CAPABILITY}
 _COMPILE_CACHE: dict[tuple, object] = {}
 
 
@@ -3096,10 +3249,26 @@ def _check_architecture(device: torch.device) -> tuple[int, int]:
     capability = torch.cuda.get_device_capability(device)
     if capability not in _SUPPORTED_CAPABILITIES:
         raise RuntimeError(
-            "Paged sparse prefill supports only SM100 and SM103, "
+            "Paged sparse prefill supports SM100, SM103, and SM107, "
             f"got SM{capability[0]}{capability[1]}"
         )
     return capability
+
+
+def _resolve_rubin_options(capability, dtype, enable_fp16_softmax, enable_2x_fp8):
+    """Resolve optional flags before any in-memory or AOT cache lookup."""
+    supported = capability == _RUBIN_CAPABILITY and dtype == torch.float8_e4m3fn
+    resolved = []
+    for name, value in (
+        ("enable_fp16_softmax", enable_fp16_softmax),
+        ("enable_2x_fp8", enable_2x_fp8),
+    ):
+        if value is not None and not isinstance(value, bool):
+            raise TypeError(f"{name} must be bool or None")
+        if value is True and not supported:
+            raise NotImplementedError(f"{name} requires Rubin SM107 and FP8 (E4M3) Q/K/V")
+        resolved.append(supported if value is None else value)
+    return tuple(resolved)
 
 
 def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
@@ -3126,6 +3295,8 @@ def _compile_kernel(
     lse_partial: torch.Tensor,
     softmax_scale: float,
     max_seqlen_q: int,
+    enable_fp16_softmax: Optional[bool],
+    enable_2x_fp8: Optional[bool],
 ) -> object:
     scheduler_metadata = schedule.scheduler_metadata
     work_count = schedule.work_count
@@ -3145,6 +3316,9 @@ def _compile_kernel(
         mma_dtype = cutlass.BFloat16
     else:
         raise TypeError(f"unsupported Q dtype: {q.dtype}")
+    use_fp16_softmax, use_2x_fp8 = _resolve_rubin_options(
+        capability, q.dtype, enable_fp16_softmax, enable_2x_fp8
+    )
     if k_cache.dtype != q.dtype or v_cache.dtype != q.dtype:
         raise TypeError("Q, K, and V must use the same storage dtype")
     key = (
@@ -3156,6 +3330,8 @@ def _compile_kernel(
         q.dtype,
         torch.bfloat16,
         True,
+        use_fp16_softmax,
+        use_2x_fp8,
     )
     compiled = _COMPILE_CACHE.get(key)
     if compiled is not None:
@@ -3177,6 +3353,8 @@ def _compile_kernel(
         use_prepare_scheduler=True,
         qk_dtype=mma_dtype,
         pv_dtype=mma_dtype,
+        enable_fp16_softmax=use_fp16_softmax,
+        enable_2x_fp8=use_2x_fp8,
     )
     q_flat = q.reshape(-1, _HEAD_DIM)
     o_partial_flat = o_partial.reshape(-1, _HEAD_DIM)
@@ -3229,8 +3407,16 @@ def run_pagekv(
     *,
     softmax_scale: float,
     max_seqlen_q: int,
+    enable_fp16_softmax: Optional[bool] = None,
+    enable_2x_fp8: Optional[bool] = None,
 ) -> None:
-    """Compile if needed and launch the paged sparse-prefill K1 kernel."""
+    """Compile and launch K1, optionally overriding Rubin optimizations.
+
+    Both flags require native FP8 (E4M3) Q/K/V on SM107. ``None`` enables
+    them automatically in that case and leaves them off otherwise. Explicit
+    ``False`` selects the FP32-softmax / K32-MMA ablation path; explicit
+    ``True`` on any other configuration raises ``NotImplementedError``.
+    """
 
     qsplit_indices = schedule.qsplit_indices
     scheduler_metadata = schedule.scheduler_metadata
@@ -3252,6 +3438,8 @@ def run_pagekv(
         lse_partial=lse_partial,
         softmax_scale=softmax_scale,
         max_seqlen_q=max_seqlen_q,
+        enable_fp16_softmax=enable_fp16_softmax,
+        enable_2x_fp8=enable_2x_fp8,
     )
     with torch.cuda.nvtx.range("Fwd_PageKV_SparseAttn"):
         compiled(

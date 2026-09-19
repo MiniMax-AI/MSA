@@ -347,8 +347,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.slots < 0 or args.warmup < 1 or args.replays < 2:
         parser.error("slots must be non-negative, warmup positive, and replays >= 2")
-    if torch.cuda.get_device_capability() != (10, 3):
-        raise RuntimeError("BF16 performance benchmark requires GB300/SM103")
+    if torch.cuda.get_device_capability() not in {(10, 3), (10, 7)}:
+        raise RuntimeError("BF16 performance benchmark requires GB300/SM103 or Rubin/SM107")
 
     device = torch.device("cuda")
     _warm_compilation(device, args.num_kv_heads)

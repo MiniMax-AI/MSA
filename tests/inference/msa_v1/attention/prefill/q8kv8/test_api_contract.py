@@ -146,9 +146,12 @@ def test_plan_is_rejected_during_cuda_graph_capture() -> None:
             _plan_single_page(wrapper, topk, cu_seqlens, page_table)
 
 
-def test_run_uses_preallocated_output_and_lse() -> None:
+@pytest.mark.parametrize("flags", [(None, None), (False, False), (True, False), (False, True), (True, True)])
+def test_run_uses_preallocated_output_and_lse(flags) -> None:
+    if any(flag is True for flag in flags) and torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Explicit Rubin flags require SM107")
     topk, cu_seqlens, page_table, q, k_cache, v_cache = _make_single_page_inputs()
-    wrapper = BatchPrefillWithPagedKVCacheWrapper()
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(enable_fp16_softmax=flags[0], enable_2x_fp8=flags[1])
     _plan_single_page(wrapper, topk, cu_seqlens, page_table)
     out = torch.empty((1, 64, 128), dtype=torch.bfloat16, device="cuda")
     lse = torch.empty((1, 64), dtype=torch.float32, device="cuda")
