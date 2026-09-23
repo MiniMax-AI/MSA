@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 // SPDX-License-Identifier: MIT
+{% set kv_mode = kv_mode | default(0) %}
+{% set kv_suffix = kv_suffix | default("") %}
 
 // Auto-generated per-variant FMHA run binding: {{ variant_name }}
 #include "fmha_sm100_params.h"
@@ -38,10 +40,25 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
                     Optional<ffi::TensorView> maybe_kv_block_indexes,
                     int64_t pack_factor,
                     bool qo_len_uniform,
-                    int64_t stream_ptr) {
+                    int64_t stream_ptr
+{% if kv_mode >= 3 %}
+                    ,
+                    Optional<ffi::TensorView> maybe_nvfp4_k_data,
+                    Optional<ffi::TensorView> maybe_nvfp4_k_scale,
+                    Optional<ffi::TensorView> maybe_nvfp4_v_data,
+                    Optional<ffi::TensorView> maybe_nvfp4_v_scale,
+                    int64_t nvfp4_page_stride,
+                    int64_t nvfp4_head_stride_data,
+                    int64_t nvfp4_head_stride_scale,
+                    double dequant_g_k,
+                    double dequant_g_v,
+                    ffi::TensorView nvfp4_k_global_scale,
+                    ffi::TensorView nvfp4_v_global_scale
+{% endif %}
+                    ) {
   bool is_paged = maybe_kv_indices.has_value();
   int head_dim_qk = q.size(2);
-  int head_dim_vo = is_paged ? v.size(3) : v.size(2);
+  int head_dim_vo = {{ "128" if kv_mode >= 3 else "is_paged ? v.size(3) : v.size(2)" }};
   int num_qo_heads = q.size(1);
   int num_kv_heads = k.size(1);
   int page_size = is_paged ? k.size(2) : 0;
@@ -182,6 +199,36 @@ void FMHAVariantRun_{{ variant_name }}(ffi::TensorView workspace_buffer, ffi::Te
 
   params.pack_factor = static_cast<int>(pack_factor);
   params.num_ctas = static_cast<int>(packed_work_range.size(0));
+
+{% if kv_mode >= 3 %}
+  auto nvfp4_u8_ptr = [](const Optional<ffi::TensorView>& t, const char* name) -> void* {
+    if (!t.has_value()) return nullptr;
+    TVM_FFI_ICHECK(encode_dlpack_dtype(t.value().dtype()) == uint8_code)
+        << name << " must be uint8";
+    return t.value().data_ptr();
+  };
+  params.nvfp4_k_data_ptr  = nvfp4_u8_ptr(maybe_nvfp4_k_data,  "nvfp4_k_data");
+  params.nvfp4_k_scale_ptr = nvfp4_u8_ptr(maybe_nvfp4_k_scale, "nvfp4_k_scale");
+  params.nvfp4_v_data_ptr  = nvfp4_u8_ptr(maybe_nvfp4_v_data,  "nvfp4_v_data");
+  params.nvfp4_v_scale_ptr = nvfp4_u8_ptr(maybe_nvfp4_v_scale, "nvfp4_v_scale");
+  params.nvfp4_page_stride       = nvfp4_page_stride;
+  params.nvfp4_head_stride_data  = static_cast<int>(nvfp4_head_stride_data);
+  params.nvfp4_head_stride_scale = static_cast<int>(nvfp4_head_stride_scale);
+  params.dequant_g_k = static_cast<float>(dequant_g_k);
+  params.dequant_g_v = static_cast<float>(dequant_g_v);
+  params.nvfp4_k_global_scale = static_cast<const float*>(nvfp4_k_global_scale.data_ptr());
+  params.nvfp4_v_global_scale = static_cast<const float*>(nvfp4_v_global_scale.data_ptr());
+#if MSA_NVFP4_KV_MODE >= 3
+  TVM_FFI_ICHECK(params.nvfp4_k_data_ptr && params.nvfp4_k_scale_ptr &&
+                 params.nvfp4_v_data_ptr && params.nvfp4_v_scale_ptr)
+      << "MSA_NVFP4_KV_MODE=3 variant {{ variant_name }} requires all four NVFP4 KV views";
+  TVM_FFI_ICHECK(params.nvfp4_page_stride > 0)
+      << "MSA_NVFP4_KV_MODE=3 requires a positive nvfp4_page_stride";
+  TVM_FFI_ICHECK(params.dequant_g_k > 0.0f && params.dequant_g_v > 0.0f)
+      << "dequant_g_k / dequant_g_v must be positive; got "
+      << params.dequant_g_k << " / " << params.dequant_g_v;
+#endif
+{% endif %}
   if (pack_factor > 1) {
     params.q_stride_n_original = q.stride(0);
     params.q_stride_h_original = q.stride(1);

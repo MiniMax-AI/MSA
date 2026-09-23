@@ -135,7 +135,18 @@ struct FwdRunner {
                          int q_stride_h_original = 0,
                          int h_r_original = 0,
                          PackGQAUnpackParams pack_gqa = {},
-                         int num_ctas = 0) {
+                         int num_ctas = 0,
+                         const uint8_t* nvfp4_k_data = nullptr,
+                         const uint8_t* nvfp4_k_scale = nullptr,
+                         const uint8_t* nvfp4_v_data = nullptr,
+                         const uint8_t* nvfp4_v_scale = nullptr,
+                         int64_t nvfp4_page_stride = 0,
+                         int nvfp4_head_stride_data = 8192,
+                         int nvfp4_head_stride_scale = 1024,
+                         float dequant_g_k = 1.0f,
+                         float dequant_g_v = 1.0f,
+                         const float* nvfp4_k_global_scale = nullptr,
+                         const float* nvfp4_v_global_scale = nullptr) {
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id = 0;
     hw_info.sm_count = (num_ctas > 0)
@@ -147,6 +158,31 @@ struct FwdRunner {
 #ifdef FMHA_GMEM_BOUNDS_CHECK
     sched_args.packed_work_info_size = pack_gqa.gmem_bounds.packed_work_info_size;
 #endif
+
+    [[maybe_unused]] auto k3_install_nvfp4 = [&](auto& arguments) {
+#if MSA_NVFP4_KV_MODE >= 3
+      static_assert(KVPageSize > 0,
+                    "MSA_NVFP4_KV_MODE >= 3 is paged-only (k2::Nvfp4KvViews indexes a "
+                    "physical page); the non-paged load lambdas are untagged.");
+      arguments.mainloop.load.nvfp4_kv.k_data            = nvfp4_k_data;
+      arguments.mainloop.load.nvfp4_kv.k_scale           = nvfp4_k_scale;
+      arguments.mainloop.load.nvfp4_kv.v_data            = nvfp4_v_data;
+      arguments.mainloop.load.nvfp4_kv.v_scale           = nvfp4_v_scale;
+      arguments.mainloop.load.nvfp4_kv.page_stride       = nvfp4_page_stride;
+      arguments.mainloop.load.nvfp4_kv.head_stride_data  = nvfp4_head_stride_data;
+      arguments.mainloop.load.nvfp4_kv.head_stride_scale = nvfp4_head_stride_scale;
+      arguments.mainloop.dequant_g_k = dequant_g_k;
+      arguments.mainloop.dequant_g_v = dequant_g_v;
+      arguments.mainloop.k_global_scale = nvfp4_k_global_scale;
+      arguments.mainloop.v_global_scale = nvfp4_v_global_scale;
+      if constexpr (IsSplitKV) {
+        arguments.split_kv.scale_output_splitkv *= dequant_g_v;
+        arguments.split_kv.scale_output_nosplit *= dequant_g_v;
+      }
+#else
+      (void)arguments;
+#endif
+    };
 
     StrideQ stride_Q;
     StrideK stride_K;
@@ -261,6 +297,8 @@ struct FwdRunner {
           sched_args,
           hw_info};
       }
+
+      k3_install_nvfp4(arguments);
 
       Operation op;
       size_t workspace_size = Operation::get_workspace_size(arguments);
@@ -379,6 +417,8 @@ struct FwdRunner {
           hw_info};
       }
 
+      k3_install_nvfp4(arguments);
+
       Operation op;
       size_t workspace_size = Operation::get_workspace_size(arguments);
       AlignedAllocator allocator(workspace_buffer, workspace_size);
@@ -455,7 +495,18 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          int q_stride_h_original = 0,
                          int h_r_original = 0,
                          PackGQAUnpackParams pack_gqa = {},
-                         int num_ctas = 0) {
+                         int num_ctas = 0,
+                         const uint8_t* nvfp4_k_data = nullptr,
+                         const uint8_t* nvfp4_k_scale = nullptr,
+                         const uint8_t* nvfp4_v_data = nullptr,
+                         const uint8_t* nvfp4_v_scale = nullptr,
+                         int64_t nvfp4_page_stride = 0,
+                         int nvfp4_head_stride_data = 8192,
+                         int nvfp4_head_stride_scale = 1024,
+                         float dequant_g_k = 1.0f,
+                         float dequant_g_v = 1.0f,
+                         const float* nvfp4_k_global_scale = nullptr,
+                         const float* nvfp4_v_global_scale = nullptr) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
                    ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
       workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
@@ -472,7 +523,10 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
       max_score_stride_t, max_score_stride_h, max_score_stride_k,
       kv_block_indexes, kv_block_num,
       pack_factor, q_stride_n_original, q_stride_h_original, h_r_original,
-      pack_gqa, num_ctas);
+      pack_gqa, num_ctas,
+      nvfp4_k_data, nvfp4_k_scale, nvfp4_v_data, nvfp4_v_scale,
+      nvfp4_page_stride, nvfp4_head_stride_data, nvfp4_head_stride_scale,
+      dequant_g_k, dequant_g_v, nvfp4_k_global_scale, nvfp4_v_global_scale);
 }
 
 };  // namespace flashinfer
@@ -497,7 +551,7 @@ cudaError_t launch_fmha_reduction(
     int stride_o_n, int stride_o_h, int stride_partial_n, int stride_partial_h,
     ElementOut* ptr_O_direct, int num_qo_heads_orig,
     int num_kv_heads, int pack_factor,
-    cudaStream_t stream) {
+    cudaStream_t stream, const float* k_global_scale = nullptr) {
   if (total_qo_len <= 0) return cudaSuccess;
   using ReductionKernel = Sm100FmhaReductionKernel<ElementPartial, ElementOut>;
   typename ReductionKernel::Params params{
@@ -506,7 +560,7 @@ cudaError_t launch_fmha_reduction(
       scale_softmax_log2, inv_scale_o,
       num_kv_splits, total_qo_len, num_qo_heads, head_dim_vo,
       stride_o_n, stride_o_h, stride_partial_n, stride_partial_h,
-      ptr_O_direct, num_qo_heads_orig, num_kv_heads, pack_factor};
+      ptr_O_direct, num_qo_heads_orig, num_kv_heads, pack_factor, k_global_scale};
   dim3 grid = ReductionKernel::get_grid_shape(params);
   dim3 block = ReductionKernel::get_block_shape();
   fmha_reduction_kernel<ElementPartial, ElementOut><<<grid, block, 0, stream>>>(params);

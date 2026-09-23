@@ -26,7 +26,7 @@ _MM_SPARSE_DIR = os.path.join(
 if os.path.isdir(_MM_SPARSE_DIR) and _MM_SPARSE_DIR not in sys.path:
     sys.path.insert(0, os.path.abspath(_MM_SPARSE_DIR))
 
-from interface import sparse_atten_func
+from interface import sparse_atten_func, sparse_atten_nvfp4_kv_func
 from sparse_index_utils import build_k2q_csr
 from src.sm100.prepare_scheduler import SPARSE_SCHEDULE_MODEL
 from src.common.aot_cache import _key_to_path
@@ -257,8 +257,8 @@ def sparse_fmha(
     max_score: Optional[torch.Tensor] = None,
     sm_scale: Optional[float] = None,
     q_scale: Optional[float] = None,
-    k_scale: Optional[float] = None,
-    v_scale: Optional[float] = None,
+    k_scale: Optional[torch.Tensor | float] = None,
+    v_scale: Optional[torch.Tensor | float] = None,
     o_scale: Optional[float] = None,
     kv_indices: Optional[torch.Tensor] = None,
     output_maxscore: bool = True,
@@ -275,6 +275,8 @@ def sparse_fmha(
         Shape ``[total_q, num_qo_heads, 128]``.  BF16 or FP8 E4M3.
     k : torch.Tensor
         Paged KV tensor with shape ``[total_pages, num_kv_heads, page_size, 128]``.
+        NVFP4 uses uint8 ``[total_pages, num_kv_heads, 128, 72]`` with the
+        packed data/scales layout documented by ``fmha_sm100``.
     v : torch.Tensor
         Same layout as ``k``.
     plan_info : dict
@@ -287,8 +289,9 @@ def sparse_fmha(
     sm_scale : float, optional
         Softmax scale.  Defaults to ``1 / sqrt(head_dim)``.
     q_scale, k_scale, v_scale, o_scale : float, optional
-        Accepted for FMHA API compatibility; only ``sm_scale`` is used by this
-        backend.
+        For NVFP4, ``k_scale`` and ``v_scale`` are CUDA float32 global-scale
+        tensors; ``q_scale`` and ``o_scale`` are scalar multipliers.
+        Other cache formats retain the existing FMHA compatibility behavior.
     kv_indices : torch.Tensor, optional
         Flattened physical page table with dtype int32.  Required for paged KV.
     output_maxscore : bool, optional
@@ -312,6 +315,17 @@ def sparse_fmha(
         raise ValueError("sparse_fmha requires kv_block_indexes")
     
 
+    is_nvfp4 = k.dtype == torch.uint8
+    if is_nvfp4:
+        pages, heads = k.shape[:2]
+        k_sf = k.as_strided((pages, heads, 128, 8),
+                           (k.stride(0), 1024, 8, 1),
+                           k.storage_offset() + heads * 8192)
+        v_sf = v.as_strided((pages, heads, 128, 8),
+                           (v.stride(0), 1024, 8, 1),
+                           v.storage_offset() + heads * 8192)
+        k = k.as_strided((pages, heads, 128, 64), (k.stride(0), 8192, 64, 1))
+        v = v.as_strided((pages, heads, 128, 64), (v.stride(0), 8192, 64, 1))
     qo_segment_lens = plan_info["qo_segment_lens"]
     cu_seqlens_q = plan_info["cu_seqlens_q"]
     cu_seqlens_k = plan_info["cu_seqlens_k"]
@@ -381,6 +395,21 @@ def sparse_fmha(
         )
 
     softmax_scale = sm_scale if sm_scale is not None else q.shape[-1] ** -0.5
+
+    if is_nvfp4:
+        result = sparse_atten_nvfp4_kv_func(
+            q, k, v, k_sf, v_sf, k_scale, v_scale,
+            k2q_row_ptr, k2q_q_indices, topk,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            blk_kv=blk_kv, causal=causal,
+            softmax_scale=softmax_scale * (1.0 if q_scale is None else q_scale),
+            page_table=page_table, seqused_k=seqused_k,
+            schedule=schedule, out=out, kv_layout="vllm",
+        )
+        if o_scale not in (None, 1.0):
+            result.mul_(o_scale)
+        return result, None
 
     # print(q.shape, k.shape)
     result = sparse_atten_func(

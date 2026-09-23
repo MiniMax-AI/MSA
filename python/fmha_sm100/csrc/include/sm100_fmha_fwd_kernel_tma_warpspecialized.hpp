@@ -42,9 +42,13 @@
 #include "fmha_options.hpp"
 #include "fmha_tile_scheduler.hpp"
 
+#include "k2_nvfp4_kv.hpp"
+
 GPU_TRACE_SCOPE_DEC(KERNEL_LAUNCHED);
 
 namespace cutlass::fmha::kernel {
+
+
 
 using namespace cute;
 using namespace cutlass::fmha::collective;
@@ -52,13 +56,25 @@ using namespace cutlass::fmha::collective;
 template <bool SingleSoftmaxWarpGroup_ = false>
 struct Sm100FmhaCtxKernelWarpspecializedSchedule {
   static constexpr bool SingleSoftmaxWarpGroup = SingleSoftmaxWarpGroup_;
-  enum class WarpRole { Softmax0, Softmax1, Correction, MMA, Load, Epilogue, Empty };
+  enum class WarpRole { Softmax0, Softmax1, Correction, MMA, Load, Epilogue, Empty, Dequant };
+
+  static constexpr int DequantWarpBegin = SingleSoftmaxWarpGroup ? 12 : 16;
+  static constexpr int NumWarpsDequant  = k2::kNumWarpsDequant;
+  static_assert(DequantWarpBegin % 4 == 0, "Dequant must start on a warpgroup boundary");
+  static_assert(NumWarpsDequant % 4 == 0,
+                "Dequant must be a whole number of warpgroups: a 2-warp Dequant may NOT "
+                "call warpgroup_reg_set (.aligned would be executed by 64 of 128 threads).");
 
   static constexpr WarpRole warp_idx_to_WarpRole(int warp_idx) {
     if (warp_idx == 0) return WarpRole::Load;
     if (warp_idx == 1) return WarpRole::MMA;
     if (warp_idx == 2) return WarpRole::Epilogue;
     if (warp_idx == 3) return WarpRole::Empty;
+    if constexpr (NumWarpsDequant > 0) {
+      if (warp_idx >= DequantWarpBegin && warp_idx < DequantWarpBegin + NumWarpsDequant) {
+        return WarpRole::Dequant;
+      }
+    }
     if constexpr (SingleSoftmaxWarpGroup) {
       // Merged: warps 0-1 = Softmax0, 2-3 = Softmax1, no separate warpgroups
       if (warp_idx < 6) return WarpRole::Softmax0;
@@ -83,7 +99,24 @@ struct Sm100FmhaCtxKernelWarpspecializedSchedule {
   static const int NumRegsCorrection = SingleSoftmaxWarpGroup ? 96 : 64;
   static const int NumRegsOther = SingleSoftmaxWarpGroup ? 72 : 64;
 
-  static const int NumWarps = SingleSoftmaxWarpGroup ? 12 : 16;
+  static const int NumRegsDequant = 112;
+
+  static const int NumWarps = (SingleSoftmaxWarpGroup ? 12 : 16) + NumWarpsDequant;
+
+  static constexpr int kStaticRegCeiling = ((65536 / (NumWarps * 32)) / 8) * 8;
+  static constexpr int kNumDequantWarpgroups = NumWarpsDequant / 4;
+  static constexpr int kRegPoolRequested =
+      128 * (NumRegsOther + NumRegsSoftmax + NumRegsCorrection
+             + kNumDequantWarpgroups * NumRegsDequant);
+  static_assert(NumRegsDequant <= 256 && NumRegsSoftmax <= 256,
+                "setmaxnreg operand must be <= 256");
+  static_assert(kRegPoolRequested <= 65536,
+                "The warpgroup register allocation exceeds the register file");
+  static constexpr int kCtaRegPool = NumWarps * 32 * kStaticRegCeiling;
+  static_assert(kRegPoolRequested <= kCtaRegPool,
+                "The warpgroup register allocation exceeds the CTA register pool");
+  static_assert(NumRegsOther <= kStaticRegCeiling && NumRegsCorrection <= kStaticRegCeiling,
+                "Register-release targets must not exceed the initial allocation");
 };
 
 template <class ProblemShapeIn, class CollectiveMainloop, class CollectiveEpilogue,
@@ -105,6 +138,15 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   static const int NumRegsSoftmax = KernelSchedule::NumRegsSoftmax;
   static const int NumRegsCorrection = KernelSchedule::NumRegsCorrection;
   static const int NumRegsOther = KernelSchedule::NumRegsOther;
+
+  static const int NumWarpsDequant   = KernelSchedule::NumWarpsDequant;
+  static const int NumRegsDequant    = KernelSchedule::NumRegsDequant;
+  static const int NumThreadsDequant = NumWarpsDequant * cutlass::NumThreadsPerWarp;
+  static constexpr bool kHasDequantWG      = k2::kHasDequantWarpgroup;
+  static constexpr bool kDequantProducesKV = k2::kDequantProducesKV;
+  static_assert(kHasDequantWG == (NumWarpsDequant > 0),
+                "k2::kHasDequantWarpgroup and NumWarpsDequant disagree -- the two are "
+                "derived from the same macro and must never be edited independently.");
 
   static const int NumWarps = KernelSchedule::NumWarps;
 
@@ -132,12 +174,20 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       alignas(16) typename CollectiveMainloop::PipelineC::SharedStorage s1_corr;
       alignas(16) typename CollectiveMainloop::PipelineO::SharedStorage mma_corr;
       alignas(16) typename CollectiveMainloop::PipelineE::SharedStorage corr_epi;
+#if MSA_NVFP4_KV_MODE >= 2
+      alignas(16) typename CollectiveMainloop::PipelineKvStage::SharedStorage load_kv_stage;
+#endif
     } pipelines;
 
     uint32_t tmem_base_ptr;
   };
 
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
+
+  static constexpr int kSmemOptinCapBytes = 232448;
+  static_assert(SharedStorageSize <= kSmemOptinCapBytes,
+                "K2: SharedStorage exceeds GB300's max_shared_memory_per_block_optin. "
+                "Reduce StageCountKV or the staging-ring depth (k2_nvfp4_kv.hpp).");
   static constexpr bool IsSplitKV = CollectiveMainloop::IsSplitKV;
 
   using SplitKVParams = typename CollectiveMainloop::SplitKVParams;
@@ -214,10 +264,6 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   }
 
   CUTLASS_DEVICE void operator()(const Params& params, char* smem) {
-// #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-//     asm volatile("griddepcontrol.wait;");
-// #endif
-
     GPU_TRACE_INIT;
 
 
@@ -254,19 +300,45 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         /*mask calc*/ cute::false_type{});
 
     typename CollectiveMainloop::PipelineKV::Params pipeline_load_kv_params;
-    if (role == WarpRole::Load) {
-      pipeline_load_kv_params.role = CollectiveMainloop::PipelineKV::ThreadCategory::Producer;
+    if constexpr (!kDequantProducesKV) {
+      if (role == WarpRole::Load) {
+        pipeline_load_kv_params.role = CollectiveMainloop::PipelineKV::ThreadCategory::Producer;
+      }
+      pipeline_load_kv_params.is_leader = lane_predicate && (role == WarpRole::Load);
+      pipeline_load_kv_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadKV;
+    } else {
+      if (role == WarpRole::Dequant) {
+        pipeline_load_kv_params.role = CollectiveMainloop::PipelineKV::ThreadCategory::Producer;
+      }
+      pipeline_load_kv_params.producer_arv_count = NumThreadsDequant;
     }
     if (role == WarpRole::MMA) {
       pipeline_load_kv_params.role = CollectiveMainloop::PipelineKV::ThreadCategory::Consumer;
     }
-    pipeline_load_kv_params.is_leader = lane_predicate && (role == WarpRole::Load);
-    pipeline_load_kv_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadKV;
     pipeline_load_kv_params.initializing_warp = 1;
     typename CollectiveMainloop::PipelineKV pipeline_load_kv(
         shared_storage.pipelines.load_kv, pipeline_load_kv_params, ClusterShape{},
         /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
-    
+
+#if MSA_NVFP4_KV_MODE >= 2
+    typename CollectiveMainloop::PipelineKvStage::Params pipeline_kv_stage_params;
+    if (role == WarpRole::Load) {
+      pipeline_kv_stage_params.role =
+          CollectiveMainloop::PipelineKvStage::ThreadCategory::Producer;
+    }
+    if (role == WarpRole::Dequant) {
+      pipeline_kv_stage_params.role =
+          CollectiveMainloop::PipelineKvStage::ThreadCategory::Consumer;
+    }
+    pipeline_kv_stage_params.is_leader = lane_predicate && (role == WarpRole::Load);
+    pipeline_kv_stage_params.transaction_bytes = CollectiveMainloop::TransactionBytesKvStage;
+    pipeline_kv_stage_params.num_consumers = NumThreadsDequant;
+    pipeline_kv_stage_params.initializing_warp = 1;
+    typename CollectiveMainloop::PipelineKvStage pipeline_kv_stage(
+        shared_storage.pipelines.load_kv_stage, pipeline_kv_stage_params, ClusterShape{},
+        /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::true_type{});
+#endif
+
     __syncthreads();
 
     pipeline_load_q.init_masks(ClusterShape{});
@@ -280,7 +352,21 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     typename CollectiveMainloop::PipelineKV::PipelineState pipeline_load_kv_producer_state =
         cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineKV>();
 
+#if MSA_NVFP4_KV_MODE >= 2
+    typename CollectiveMainloop::PipelineKvStage::PipelineState pipeline_kv_stage_consumer_state;
+    typename CollectiveMainloop::PipelineKvStage::PipelineState pipeline_kv_stage_producer_state =
+        cutlass::make_producer_start_state<typename CollectiveMainloop::PipelineKvStage>();
+#endif
+
     CollectiveMainloop mainloop;
+
+#if MSA_NVFP4_KV_MODE >= 2
+    auto& kv_load_pipeline = pipeline_kv_stage;
+    auto& kv_load_state    = pipeline_kv_stage_producer_state;
+#else
+    auto& kv_load_pipeline = pipeline_load_kv;
+    auto& kv_load_state    = pipeline_load_kv_producer_state;
+#endif
 
     if (role == WarpRole::Load) {
       warpgroup_reg_set<NumRegsOther>();
@@ -313,7 +399,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           mainloop.load(blk_coord, logical_problem_shape, params.mainloop, params.problem_shape,
                         work_idx, shared_storage.mainloop,
                         pipeline_load_q, pipeline_load_q_producer_state,
-                        pipeline_load_kv, pipeline_load_kv_producer_state
+                        kv_load_pipeline, kv_load_state
                         #ifdef GPU_TRACE_ENABLED
                           , _gt_rec
                         #endif
@@ -323,7 +409,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
           mainloop.load(blk_coord, logical_problem_shape, params.mainloop, params.problem_shape,
                         work_idx, shared_storage.mainloop,
                         pipeline_load_q, pipeline_load_q_producer_state,
-                        pipeline_load_kv, pipeline_load_kv_producer_state
+                        kv_load_pipeline, kv_load_state
                         #ifdef GPU_TRACE_ENABLED
                           , _gt_rec
                         #endif
@@ -430,10 +516,11 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
                                                              /*barrier init*/ cute::true_type{});
 
     if (role != WarpRole::Load) {
-      if constexpr (kSingleSoftmaxWarpGroup)
-        asm volatile("bar.sync 8, 352;");
-      else
-        asm volatile("bar.sync 8, 480;");
+      constexpr int kAllButLoadThreads =
+          MaxThreadsPerBlock - NumWarpsLoad * cutlass::NumThreadsPerWarp;
+      static_assert(kAllButLoadThreads > 0 && kAllButLoadThreads <= 1024,
+                    "bar.sync participant count out of range");
+      asm volatile("bar.sync 8, %0;" ::"n"(kAllButLoadThreads));
 
       pipeline_mma_s0.init_masks(ClusterShape{});
       pipeline_mma_s1.init_masks(ClusterShape{});
@@ -676,6 +763,52 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       warpgroup_reg_set<NumRegsOther>();
 
       /* no-op, donate regs and exit */
+
+    } else if constexpr (kHasDequantWG) {
+      if (role == WarpRole::Dequant) {
+        warpgroup_reg_set<NumRegsDequant>();
+
+#if MSA_NVFP4_KV_MODE >= 2
+        const int dequant_tid =
+            static_cast<int>(threadIdx.x) - KernelSchedule::DequantWarpBegin * 32;
+
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (; tile_scheduler.is_valid(); ++tile_scheduler) {
+          auto blk_coord = tile_scheduler.get_block_coord();
+          auto logical_problem_shape =
+              apply_batch(params, params.problem_shape, get<2, 1>(blk_coord));
+
+          if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
+            continue;
+          }
+          if (get<1>(logical_problem_shape) == 0) {  // kv_len == 0
+            continue;
+          }
+
+          if constexpr (IsSplitKV) {
+            int wp = tile_scheduler.get_work_ptr();
+            int kv_tile_begin = SPLIT_KV_BEGIN(params.split_kv, wp);
+            int kv_tile_end = SPLIT_KV_END(params.split_kv, wp);
+            if (CollectiveMainloop::get_effective_trip_count(
+                    blk_coord, logical_problem_shape, kv_tile_begin, kv_tile_end,
+                    params.mainloop.load.kv_block_num) <= 0) {
+              continue;
+            }
+            mainloop.dequant(blk_coord, logical_problem_shape, params.mainloop,
+                             params.problem_shape, shared_storage.mainloop,
+                             pipeline_kv_stage, pipeline_kv_stage_consumer_state,
+                             pipeline_load_kv, pipeline_load_kv_producer_state,
+                             dequant_tid, kv_tile_begin, kv_tile_end);
+          } else {
+            mainloop.dequant(blk_coord, logical_problem_shape, params.mainloop,
+                             params.problem_shape, shared_storage.mainloop,
+                             pipeline_kv_stage, pipeline_kv_stage_consumer_state,
+                             pipeline_load_kv, pipeline_load_kv_producer_state,
+                             dequant_tid);
+          }
+        }
+#endif
+      }
     }
 
     GPU_TRACE_EXIT;

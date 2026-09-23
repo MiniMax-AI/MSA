@@ -42,9 +42,24 @@
 #include "fmha_common.hpp"
 #include "gpu_trace.h"
 #include "fmha_fusion.hpp"
+#include "k2_nvfp4_kv.hpp"
 
 #if (__CUDACC_VER_MAJOR__ >= 12) && !defined(__CUDACC_RTC__)
 #include <cuda.h>
+#endif
+
+
+#if MSA_NVFP4_KV_MODE >= 2
+#define K2_TAG_SEQ (pipeline_kv_producer_state.count())
+
+#define K2_TAG_ISV(x) (x)
+
+#define K2_TAG_STAGE(is_v_, page_)                                                       \
+  storage.stage_tag[pipeline_kv_producer_state.index()] =                                \
+      k2::StageTag::make(K2_TAG_ISV(is_v_), K2_TAG_SEQ,                                  \
+                         static_cast<uint32_t>(page_))
+#else
+#define K2_TAG_STAGE(is_v_, page_) do { } while (0)
 #endif
 
 GPU_TRACE_SCOPE_DEC(LOAD_Q);
@@ -73,6 +88,54 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 
   using TileShapeQK = typename CollectiveMmaQK::TileShape;
   using TileShapePV = typename CollectiveMmaPV::TileShape;
+
+  static constexpr int kNumKvSub = get<1>(TileShape{}) / get<1>(TileShapeQK{});
+
+  static constexpr int kKvEventsPerTile = (kNeedV ? 2 : 1) * kNumKvSub;
+
+  static_assert(!k2::kDequantProducesKV || (KVPageSize > 0),
+                "MSA_NVFP4_KV_MODE >= 2 requires the paged KV path (KVPageSize > 0); the "
+                "non-paged load lambdas do not write a k2::StageTag.");
+
+  template <class BlkCoord, class ProblemShape, class ParamsT>
+  CUTLASS_DEVICE static int compute_effective_end(BlkCoord const& blk_coord,
+                                                  ProblemShape const& problem_shape,
+                                                  ParamsT const& params, int kv_tile_end) {
+    int kv_len = get<1>(problem_shape);
+    int full_trip;
+    if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
+      constexpr int full_tile_kv = get<1>(TileShape{});
+      int valid_sparse_blocks = (kv_len + KVPageSize - 1) / KVPageSize;
+      valid_sparse_blocks = min(valid_sparse_blocks, params.kv_block_num);
+      valid_sparse_blocks = max(valid_sparse_blocks, 1);
+      full_trip = (valid_sparse_blocks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
+    } else {
+      full_trip = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+    }
+    return full_trip < kv_tile_end ? full_trip : kv_tile_end;
+  }
+
+#if MSA_NVFP4_KV_MODE >= 3
+  template <bool kIsV, class ParamsT, class TensorStorageType, class BarrierT>
+  CUTLASS_DEVICE static void k2_bulk_load_stage(ParamsT const& params,
+                                                TensorStorageType& storage, BarrierT* mbar,
+                                                int stage, int page, int head) {
+    static_assert(k2::kStageBytes == 8192 + 1024, "mode 3 staging stage must be 9216 B");
+    uint8_t* dst = storage.smem_kv_stage.data() + (size_t)stage * k2::kStageBytes;
+    uint64_t* mb = reinterpret_cast<uint64_t*>(mbar);
+    cute::SM90_BULK_COPY_G2S::copy(params.nvfp4_kv.data(kIsV, page, head), mb, dst, 8192);
+    cute::SM90_BULK_COPY_G2S::copy(params.nvfp4_kv.scale(kIsV, page, head), mb, dst + 8192, 1024);
+  }
+#endif
+
+  template <class BlkCoord, class ProblemShape, class ParamsT>
+  CUTLASS_DEVICE static int kv_event_count(BlkCoord const& blk_coord,
+                                           ProblemShape const& problem_shape,
+                                           ParamsT const& params, int kv_tile_begin,
+                                           int kv_tile_end) {
+    int m = compute_effective_end(blk_coord, problem_shape, params, kv_tile_end) - kv_tile_begin;
+    return m > 0 ? m * kKvEventsPerTile : 0;
+  }
 
   using GmemTiledCopyQ = cute::SM90_TMA_LOAD;
   using GmemTiledCopyKV = cute::SM90_TMA_LOAD;
@@ -121,6 +184,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     int q_stride_n_original = 0;
     int q_stride_h_original = 0;
     int h_r_original = 0;
+#if MSA_NVFP4_KV_MODE >= 3
+    k2::Nvfp4KvViews nvfp4_kv{};
+#endif
   };
 
   // using ShapeLseT = cute::Shape<int32_t, int32_t>;
@@ -158,6 +224,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     int q_stride_h_orig = 0;
     int h_r_orig = 0;
     cute::TmaDescriptor tma_desc_q_pack;
+#if MSA_NVFP4_KV_MODE >= 3
+    k2::Nvfp4KvViews nvfp4_kv{};
+#endif
   };
 
   template <class ProblemShape>
@@ -223,6 +292,9 @@ struct Sm100FmhaLoadTmaWarpspecialized {
 #endif
                   args.ptr_Q, args.q_stride_n_original, args.q_stride_h_original, args.h_r_original,
                   tma_desc_q_pack};
+#if MSA_NVFP4_KV_MODE >= 3
+    p.nvfp4_kv = args.nvfp4_kv;
+#endif
     return p;
   }
 
@@ -340,17 +412,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     int qo_segment_offset = get<0>(params_problem_shape).segment_offsets[batch_idx];
     int kv_segment_offset = get<1>(params_problem_shape).segment_offsets[batch_idx];
 
-    int full_trip;
-    if constexpr (kSparseAttnMode == SparseAttnMode::Sparse) {
-      constexpr int full_tile_kv = get<1>(TileShape{});
-      int valid_sparse_blocks = (kv_len + KVPageSize - 1) / KVPageSize;
-      valid_sparse_blocks = min(valid_sparse_blocks, params.kv_block_num);
-      valid_sparse_blocks = max(valid_sparse_blocks, 1);
-      full_trip = (valid_sparse_blocks * KVPageSize + full_tile_kv - 1) / full_tile_kv;
-    } else {
-      full_trip = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
-    }
-    int effective_end = full_trip < kv_tile_end ? full_trip : kv_tile_end;
+    int effective_end = compute_effective_end(blk_coord, problem_shape, params, kv_tile_end);
     int mask_tile_count = effective_end - kv_tile_begin;
     if constexpr (IsSplitKV) {
       if (mask_tile_count <= 0) return;
@@ -364,8 +426,10 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     ThrMMA mma_qk = typename CollectiveMmaQK::TiledMma{}.get_slice(0);
     ThrMMA mma_pv = typename CollectiveMmaPV::TiledMma{}.get_slice(0);
     Tensor sQ = make_tensor(make_smem_ptr(storage.smem_q.data()), SmemLayoutQ{});
-    Tensor sK = make_tensor(make_smem_ptr(storage.smem_kv.data()), SmemLayoutK{});
-    Tensor sV = make_tensor(make_smem_ptr(storage.smem_kv.data()), SmemLayoutV{});
+    Element* kv_dst = storage.smem_kv.data();
+
+    Tensor sK = make_tensor(make_smem_ptr(kv_dst), SmemLayoutK{});
+    Tensor sV = make_tensor(make_smem_ptr(kv_dst), SmemLayoutV{});
 
     auto gQ = get_local_tile_tensor(mQ, select<0, 2>(TileShapeQK{}), qo_head_idx, qo_segment_offset,
                                     qo_len);
@@ -376,7 +440,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
     uint32_t lane_predicate = cute::elect_one_sync();
 
     static constexpr int num_q_sub = get<0>(TileShape{}) / get<0>(TileShapeQK{});
-    static constexpr int num_kv_sub = get<1>(TileShape{}) / get<1>(TileShapeQK{});
+    static constexpr int num_kv_sub = kNumKvSub;
 
     int q0_index = num_q_sub * get<0>(blk_coord);
     int q1_index = num_q_sub * get<0>(blk_coord) + 1;
@@ -562,10 +626,17 @@ struct Sm100FmhaLoadTmaWarpspecialized {
         int physical_page = KV_INDICES_LOAD(params.kv_indices, kv_page_start + page_for_lookup, params.kv_indices_size);
         { GPU_TRACE_SCOPE(LOAD_K); pipeline_kv.producer_acquire(pipeline_kv_producer_state); }
         if (lane_predicate) {
+          K2_TAG_STAGE(/*is_v=*/false, physical_page);
           auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
+#if MSA_NVFP4_KV_MODE >= 3
+          k2_bulk_load_stage</*kIsV=*/false>(params, storage, tma_barrier,
+                                             pipeline_kv_producer_state.index(),
+                                             physical_page, kv_head_idx);
+#else
           copy(params.tma_load_K.with(*tma_barrier, 0),
                tKgK(_, sub_tile, kv_head_idx, physical_page),
                tKsK(_, pipeline_kv_producer_state.index()));
+#endif
         }
         ++pipeline_kv_producer_state;
       };
@@ -586,7 +657,13 @@ struct Sm100FmhaLoadTmaWarpspecialized {
         int physical_page = KV_INDICES_LOAD(params.kv_indices, kv_page_start + page_for_lookup, params.kv_indices_size);
         { GPU_TRACE_SCOPE(LOAD_V); pipeline_kv.producer_acquire(pipeline_kv_producer_state); }
         if (lane_predicate) {
+          K2_TAG_STAGE(/*is_v=*/true, physical_page);
           auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
+#if MSA_NVFP4_KV_MODE >= 3
+          k2_bulk_load_stage</*kIsV=*/true>(params, storage, tma_barrier,
+                                            pipeline_kv_producer_state.index(),
+                                            physical_page, kv_head_idx);
+#else
           if constexpr (LoadV) {
             copy(params.tma_load_V.with(*tma_barrier, 0),
                  tVgV(_, sub_tile, kv_head_idx, physical_page),
@@ -595,6 +672,7 @@ struct Sm100FmhaLoadTmaWarpspecialized {
             cutlass::arch::ClusterTransactionBarrier::complete_transaction(
                 tma_barrier, cute::block_rank_in_cluster(), kTransactionBytesKV);
           }
+#endif
         }
         ++pipeline_kv_producer_state;
       };

@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 // SPDX-License-Identifier: MIT
+{% set kv_mode = kv_mode | default(0) %}
+{% set kv_suffix = kv_suffix | default("") %}
 
 // Auto-generated FMHA variant: {{ variant_name }}
 // DTypeIn={{ dtype_in }}, Tile={{ tile_q }}x{{ tile_kv }}, Sparse={{ sparse_mode }}, Page={{ page_size }}, SplitKV={{ is_split_kv }}
@@ -67,5 +69,11 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
                                       , p.gmem_bounds
 #endif
                                       },
-      p.num_ctas);
+      p.num_ctas,
+      static_cast<const uint8_t*>(p.nvfp4_k_data_ptr),
+      static_cast<const uint8_t*>(p.nvfp4_k_scale_ptr),
+      static_cast<const uint8_t*>(p.nvfp4_v_data_ptr),
+      static_cast<const uint8_t*>(p.nvfp4_v_scale_ptr),
+      p.nvfp4_page_stride, p.nvfp4_head_stride_data, p.nvfp4_head_stride_scale,
+      p.dequant_g_k, p.dequant_g_v, p.nvfp4_k_global_scale, p.nvfp4_v_global_scale);
 }

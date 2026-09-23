@@ -72,6 +72,19 @@ struct FMHACutlassSM100Params {
   // qo_len uniform across batches, and FMHA_DISABLE_TMA_DIRECT_O env var not set.
   // When false, epilogue falls back to vec16 software scatter.
   bool tma_direct_o_enabled = false;
+
+  void* nvfp4_k_data_ptr = nullptr;
+  void* nvfp4_k_scale_ptr = nullptr;
+  void* nvfp4_v_data_ptr = nullptr;
+  void* nvfp4_v_scale_ptr = nullptr;
+  int64_t nvfp4_page_stride = 0;         // bytes between consecutive PHYSICAL pages
+  int nvfp4_head_stride_data = 8192; // bytes between kv heads, data region
+  int nvfp4_head_stride_scale = 1024;// bytes between kv heads, scale region
+  float dequant_g_k = 1.0f;
+  float dequant_g_v = 1.0f;
+  const float* nvfp4_k_global_scale = nullptr;
+  const float* nvfp4_v_global_scale = nullptr;
+
   GMEM_BOUNDS_FIELD
 };
 

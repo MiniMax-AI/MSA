@@ -53,6 +53,7 @@ struct Sm100FmhaReductionKernel {
     int num_qo_heads_orig = 0;
     int num_kv_heads = 0;
     int pack_factor = 1;
+    const float* k_global_scale = nullptr;
   };
 
   static dim3 get_grid_shape(Params const& params) {
@@ -62,6 +63,8 @@ struct Sm100FmhaReductionKernel {
   static dim3 get_block_shape() { return dim3(MaxThreadsPerBlock, 1, 1); }
 
   CUTLASS_DEVICE void operator()(Params const& params, char* /* smem */) {
+    const float scale_softmax_log2 = params.scale_softmax_log2 *
+        (params.k_global_scale ? *params.k_global_scale : 1.0f);
     int head_idx = blockIdx.x;
     int abs_row = blockIdx.y;
     int d = threadIdx.x;
@@ -139,12 +142,12 @@ struct Sm100FmhaReductionKernel {
       o_s = (lse_s != -INFINITY) ? o_s : 0.f;
 
       if (lse_s > running_lse) {
-        float rescale = exp2f(params.scale_softmax_log2 * (running_lse - lse_s));
+        float rescale = exp2f(scale_softmax_log2 * (running_lse - lse_s));
         running_o = fmaf(running_o, rescale, o_s);
         running_w = fmaf(running_w, rescale, 1.f);
         running_lse = lse_s;
       } else {
-        float rescale = exp2f(params.scale_softmax_log2 * (lse_s - running_lse));
+        float rescale = exp2f(scale_softmax_log2 * (lse_s - running_lse));
         running_o = fmaf(o_s, rescale, running_o);
         running_w += rescale;
       }
@@ -154,12 +157,12 @@ struct Sm100FmhaReductionKernel {
     if (num_splits > 0) {
       float o_last = (lse_cur != -INFINITY) ? o_s_cur : 0.f;
       if (lse_cur > running_lse) {
-        float rescale = exp2f(params.scale_softmax_log2 * (running_lse - lse_cur));
+        float rescale = exp2f(scale_softmax_log2 * (running_lse - lse_cur));
         running_o = fmaf(running_o, rescale, o_last);
         running_w = fmaf(running_w, rescale, 1.f);
         running_lse = lse_cur;
       } else {
-        float rescale = exp2f(params.scale_softmax_log2 * (lse_cur - running_lse));
+        float rescale = exp2f(scale_softmax_log2 * (lse_cur - running_lse));
         running_o = fmaf(o_last, rescale, running_o);
         running_w += rescale;
       }

@@ -101,11 +101,32 @@ _FMHA_SM100_DISPATCH = [
     ("int pack_factor", [(i, {"pack_factor": i}) for i in _PACK_FACTORS]),
 ]
 
+# NVFP4 has a separate cache identity; existing FP8 names and ABI stay stable.
+_FMHA_SM100_KV_DTYPE = [
+    # (runtime value, jinja/build params)
+    ("fp8",   {"kv_mode": 0, "kv_suffix": ""}),
+    ("nvfp4", {"kv_mode": 3, "kv_suffix": "_nvfp4_v1"}),
+]
+
+
+def _kv_dtype_idx(kv_dtype):
+    """Select the ordinary kernel or the explicit NVFP4 cache reader."""
+    if kv_dtype in (None, "fp8"):
+        return 0
+    if kv_dtype == "nvfp4":
+        return 1
+    raise ValueError(f"unknown kv_dtype {kv_dtype!r}; expected 'fp8' or 'nvfp4'")
+
+
 _FMHA_SM100_IMPOSSIBLE = lambda p: (
     (p.get("tile_q") == "_256" and p.get("single_wg") == "true") or
     (p.get("tile_q") == "_256" and p.get("is_split_kv") == "true") or
     (p.get("page_size") == -1 and p.get("sparse_mode") == "Sparse") or
-    (p.get("pack_factor", 1) > 1 and p.get("tile_q") == "_256")
+    (p.get("pack_factor", 1) > 1 and p.get("tile_q") == "_256") or
+    # NVFP4 uses the FP8 single-softmax-warpgroup decoder with page-128 tiles.
+    (p.get("kv_mode", 0) >= 3 and (
+        p.get("page_size") != 128 or p.get("single_wg") != "true" or
+        p.get("dtype_in") != "__nv_fp8_e4m3"))
 )
 
 
@@ -123,7 +144,8 @@ def _dlpack_dtype_code(torch_dtype):
 
 
 def _variant_key_from_runtime(dtype_code, qo_tile_size, single_wg,
-                               sparse_mode, page_size, split_kv, pack_factor):
+                               sparse_mode, page_size, split_kv, pack_factor,
+                               kv_dtype=None):
     """Compute a variant key string from runtime parameters."""
     dims = _FMHA_SM100_DISPATCH
 
@@ -148,11 +170,16 @@ def _variant_key_from_runtime(dtype_code, qo_tile_size, single_wg,
         _, tparams = dim_values[idx]
         params.update(tparams)
 
+    # name is byte-for-byte what it was before this axis existed.
+    kv_idx = _kv_dtype_idx(kv_dtype)
+    params.update(_FMHA_SM100_KV_DTYPE[kv_idx][1])
+
     if _FMHA_SM100_IMPOSSIBLE(params):
         raise ValueError(f"Impossible FMHA variant combination: {params}")
 
-    func_name = "fmha_sm100_" + "_".join(str(i) for i in indices)
-    variant_name = "_".join(str(i) for i in indices)
+    suffix = params["kv_suffix"]
+    func_name = "fmha_sm100_" + "_".join(str(i) for i in indices) + suffix
+    variant_name = "_".join(str(i) for i in indices) + suffix
     params["func_name"] = func_name
     params["variant_name"] = variant_name
     return variant_name, params
@@ -189,7 +216,7 @@ def _get_cuda_home():
 
 _ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
 
-def _get_nvcc_flags(cache_dir, fmha=True):
+def _get_nvcc_flags(cache_dir, fmha=True, kv_mode=0):
     tvm_include = _get_tvm_ffi_include()
     fmha_include = str(_FMHA_VARLEN_DIR / "include")
     cutlass_include = str(_CUTLASS_INCLUDE)
@@ -226,6 +253,12 @@ def _get_nvcc_flags(cache_dir, fmha=True):
         nvcc_flags.append("-DSM_TIMING_ENABLED")
     if os.environ.get("FMHA_GMEM_CHECK") is not None:
         nvcc_flags.append("-DFMHA_GMEM_BOUNDS_CHECK")
+    # Header templates need the mode macro. Ordinary variants keep their flags.
+    if kv_mode:
+        nvcc_flags.append(f"-DMSA_NVFP4_KV_MODE={int(kv_mode)}")
+        # The macro changes FMHA template bodies without changing their C++
+        # names. Hide weak symbols so FP8/FP4 load order cannot interpose them.
+        nvcc_flags += ["-Xcompiler", "-fvisibility=hidden"]
     return " ".join(nvcc_flags)
 
 class _VariantWrapper:
@@ -263,10 +296,11 @@ class FMHAVariantManager:
                 self._all_module = tvm_ffi.load_module(str(_ALL_VARIANTS_SO))
 
     def get_variant(self, dtype_code, qo_tile_size, single_wg,
-                    sparse_mode, page_size, split_kv, pack_factor):
+                    sparse_mode, page_size, split_kv, pack_factor,
+                    kv_dtype=None):
         variant_name, params = _variant_key_from_runtime(
             dtype_code, qo_tile_size, single_wg,
-            sparse_mode, page_size, split_kv, pack_factor)
+            sparse_mode, page_size, split_kv, pack_factor, kv_dtype)
 
         cached = self._loaded.get(variant_name)
         if cached is not None:
@@ -330,14 +364,15 @@ class FMHAVariantManager:
             if not dst.exists() or dst.read_text() != src.read_text():
                 shutil.copy2(src, dst)
 
-        self._write_ninja(cache_dir, variant_name, inst_cu, run_cu)
+        self._write_ninja(cache_dir, variant_name, inst_cu, run_cu,
+                          kv_mode=params.get("kv_mode", 0))
         self._run_ninja(cache_dir)
 
-    def _write_ninja(self, cache_dir, variant_name, inst_cu, run_cu):
+    def _write_ninja(self, cache_dir, variant_name, inst_cu, run_cu, kv_mode=0):
         cuda_home = _get_cuda_home()
         nvcc = os.path.join(cuda_home, "bin", "nvcc")
 
-        nvcc_flags = _get_nvcc_flags(cache_dir)
+        nvcc_flags = _get_nvcc_flags(cache_dir, kv_mode=kv_mode)
 
         so_path = cache_dir / f"{variant_name}.so"
         inst_obj = cache_dir / f"inst_{variant_name}.o"
@@ -381,11 +416,16 @@ _variant_manager = FMHAVariantManager()
 
 
 def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
-                     sparse_mode, page_size, split_kv, pack_factor):
-    """Get a compiled FMHA variant module. Thread-safe, lazy compilation."""
+                     sparse_mode, page_size, split_kv, pack_factor,
+                     kv_dtype=None):
+    """Get a compiled FMHA variant module. Thread-safe, lazy compilation.
+
+    None/'fp8' retains the ordinary cache identity and compiler flags.
+    'nvfp4' selects the page-128 packed cache in a separate variant.
+    """
     return _variant_manager.get_variant(
         dtype_code, qo_tile_size, single_wg,
-        sparse_mode, page_size, split_kv, pack_factor)
+        sparse_mode, page_size, split_kv, pack_factor, kv_dtype)
 
 
 # ============================================================================
@@ -581,12 +621,12 @@ def get_sparse_topk_module():
 # Split-KV reduction kernel JIT
 # ============================================================================
 
-_reduction_module = None
+_reduction_modules = {}
 _reduction_lock = threading.Lock()
 
 
-def _do_compile_reduction():
-    cache_dir = CACHE_BASE / "reduction"
+def _do_compile_reduction(nvfp4=False):
+    cache_dir = CACHE_BASE / ("reduction_nvfp4_v1" if nvfp4 else "reduction")
     so_path = cache_dir / "fmha_sm100_reduction.so"
 
     if so_path.exists():
@@ -609,6 +649,8 @@ def _do_compile_reduction():
     obj = cache_dir / "fmha_sm100_reduction.o"
 
     nvcc_flags = _get_nvcc_flags(cache_dir, False)
+    if nvfp4:
+        nvcc_flags += " -Xcompiler -fvisibility=hidden"
 
     ninja_content = f"""ninja_required_version = 1.5
 
@@ -642,21 +684,20 @@ build {so_path}: nvcc_link {obj}
         )
 
 
-def get_reduction_module():
-    """Get the split-KV reduction module. JIT compiles on first call."""
-    global _reduction_module
-    if _reduction_module is not None:
-        return _reduction_module
-
+def get_reduction_module(nvfp4=False):
+    """Load the ordinary or device-scale NVFP4 split-KV reduction ABI."""
+    key = "reduction_nvfp4_v1" if nvfp4 else "reduction"
+    if key in _reduction_modules:
+        return _reduction_modules[key]
     with _reduction_lock:
-        if _reduction_module is not None:
-            return _reduction_module
-        lock_fd = _acquire_file_lock(CACHE_BASE / "reduction.lock")
+        if key in _reduction_modules:
+            return _reduction_modules[key]
+        lock_fd = _acquire_file_lock(CACHE_BASE / (key + ".lock"))
         try:
-            _do_compile_reduction()
+            _do_compile_reduction(nvfp4)
             import tvm_ffi
-            so_path = CACHE_BASE / "reduction" / "fmha_sm100_reduction.so"
-            _reduction_module = tvm_ffi.load_module(str(so_path))
+            _reduction_modules[key] = tvm_ffi.load_module(
+                str(CACHE_BASE / key / "fmha_sm100_reduction.so"))
         finally:
             _release_file_lock(lock_fd)
-        return _reduction_module
+        return _reduction_modules[key]

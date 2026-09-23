@@ -43,6 +43,10 @@
 #include "fmha_fusion.hpp"
 #include "gpu_trace.h"
 #include "sm100_fmha_load_tma_warpspecialized.hpp"
+#include "k2_nvfp4_kv.hpp"
+#if MSA_NVFP4_KV_MODE >= 3
+#include "dequant_nvfp4_e4m3.cuh"
+#endif
 
 GPU_TRACE_SCOPE_DEC(SOFTMAX_Mask);
 GPU_TRACE_SCOPE_DEC(SOFTMAX_GetMax);
@@ -94,6 +98,7 @@ public:
     uint32_t consumer_arv_count = 1;
     uint32_t dst_blockid = cute::block_rank_in_cluster();
     int initializing_warp = 0;
+
   };
 
   struct SharedStorage {
@@ -271,11 +276,23 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static constexpr int StageCountKV_dynamic =
       (SmemBudget - SmemQ_bytes - SmemO_bytes) / SmemPerStageKV_bytes;
   // Use dynamic if it gives more stages, otherwise use base
-  static constexpr int StageCountKV = // values was found by profiling
+  static constexpr int StageCountKV_shipped = // values was found by profiling
       sizeof(Element_) == 1 ?
         ( (get<0>(ThreadShape{}) == 1) ? 8 : 2 )
         : ( (get<0>(ThreadShape{}) == 1) ? 4 : 2 );
       // (StageCountKV_dynamic > StageCountKV_base) ? StageCountKV_dynamic : StageCountKV_base;
+
+  static constexpr bool kDequantProducesKV = k2::kDequantProducesKV;
+  static constexpr int StageCountKV =
+      kDequantProducesKV ? k2::kStageCountKvK2 : StageCountKV_shipped;
+  static_assert(!kDequantProducesKV || StageCountKV >= 4,
+                "StageCountKV < 4 leaves K-split without K_even and K_odd simultaneously");
+
+  static constexpr int StageCountKvStage = k2::kRingDepth;
+  static constexpr int kKvStageBytes     = k2::kStageBytes;
+  static_assert(!kDequantProducesKV || k2::kIngressIsNvfp4 ||
+                    StageCountKvStage == StageCountKV,
+                "mode 2 pins the ring depth to StageCountKV so SmemLayoutK/V can be reused");
 
   using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
   using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
@@ -312,11 +329,24 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static constexpr size_t kSmemVCosize = cute::cosize_v<SmemLayoutV>;
   static constexpr size_t kSmemKVCosize = (kSmemKCosize > kSmemVCosize) ? kSmemKCosize : kSmemVCosize;
 
+  static constexpr int kSmemKvTileBytes =
+      static_cast<int>(kSmemKVCosize * sizeof(Element)) / StageCountKV;
+  static_assert(kSmemKvTileBytes * StageCountKV
+                    == static_cast<int>(kSmemKVCosize * sizeof(Element)),
+                "smem_kv cosize must divide evenly into StageCountKV stages");
+  static_assert(kSmemKvTileBytes % 1024 == 0,
+                "The destination swizzle uses absolute shared-memory addresses; "
+                "every smem_kv stage base must be 1024-byte aligned");
+
   // TensorStorage: shared K/V smem buffer + Q (no separate smem_v or smem_k)
   // smem_o is allocated separately in the kernel (no union overlap)
   struct TensorStorage {
     cute::array_aligned<Element, kSmemKVCosize> smem_kv;
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+#if MSA_NVFP4_KV_MODE >= 2
+    cute::array_aligned<uint8_t, StageCountKvStage * kKvStageBytes, 1024> smem_kv_stage;
+    k2::StageTag stage_tag[StageCountKvStage];
+#endif
   };
 
   enum class TmemAllocation : uint32_t {
@@ -343,8 +373,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       cutlass::PipelineTmaUmmaAsync<StageCountQ, typename CollectiveMmaQK::AtomThrShapeMNK>;
 
   // from load to mma warp, protects k/v in smem (merged: K and V share one pipeline)
-  using PipelineKV =
-      cutlass::PipelineTmaUmmaAsync<StageCountKV, typename CollectiveMmaQK::AtomThrShapeMNK>;
+  using PipelineKV = std::conditional_t<
+      kDequantProducesKV,
+      cutlass::PipelineUmmaConsumerAsync<StageCountKV, typename CollectiveMmaQK::AtomThrShapeMNK>,
+      cutlass::PipelineTmaUmmaAsync<StageCountKV, typename CollectiveMmaQK::AtomThrShapeMNK>>;
+
+  using PipelineKvStage = cutlass::PipelineTmaAsync<
+      kDequantProducesKV ? StageCountKvStage : 1>;
+  static constexpr int TransactionBytesKvStage = kKvStageBytes;
+
+  using PipelineKvForLoad = std::conditional_t<kDequantProducesKV, PipelineKvStage, PipelineKV>;
 
   // from mma to softmax0/1 warp, protects S in tmem
   // (not sure yet about the reverse direction)
@@ -379,8 +417,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
   using Load = Sm100FmhaLoadTmaWarpspecialized<Element, CollectiveMmaQK, CollectiveMmaPV,
                                                SmemLayoutQ, SmemLayoutK, SmemLayoutV, TensorStorage,
-                                               PipelineQ, PipelineKV, Mask, TileShape, KVPageSize,
-                                               kSparseAttnMode>;
+                                               PipelineQ, PipelineKvForLoad, Mask, TileShape,
+                                               KVPageSize, kSparseAttnMode>;
   using LayoutQ = typename Load::LayoutQ;
   using LayoutK = typename Load::LayoutK;
   using LayoutV = typename Load::LayoutV;
@@ -397,6 +435,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // scaling factor to quantize O
     float inv_scale_o = 1.0f;
+
+    float dequant_g_k = 1.0f;
+    float dequant_g_v = 1.0f;
+    const float* k_global_scale = nullptr;
+    const float* v_global_scale = nullptr;
   };
 
   struct Params {
@@ -406,6 +449,29 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float scale_softmax_log2;
 
     float scale_output;
+
+    float k2_inv_g_k;
+    float k2_inv_g_v;
+    const float* k_global_scale;
+    const float* v_global_scale;
+    CUTLASS_DEVICE float alpha_k() const {
+#if MSA_NVFP4_KV_MODE >= 3
+      return *k_global_scale;
+#else
+      return 1.0f;
+#endif
+    }
+    CUTLASS_DEVICE float alpha_v() const {
+#if MSA_NVFP4_KV_MODE >= 3
+      return *v_global_scale;
+#else
+      return 1.0f;
+#endif
+    }
+    CUTLASS_DEVICE float softmax_scale() const { return scale_softmax * alpha_k(); }
+    CUTLASS_DEVICE float softmax_scale_log2() const { return scale_softmax_log2 * alpha_k(); }
+    CUTLASS_DEVICE float output_scale() const { return scale_output * alpha_v(); }
+
   };
 
   template <class ProblemShape>
@@ -419,10 +485,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float scale_softmax = args.scale_softmax;
     float log2_e = static_cast<float>(std::log2(std::exp(1.0)));
 
+    float scale_k_eff = args.scale_k * args.dequant_g_k;
+    float scale_v_eff = args.scale_v * args.dequant_g_v;
+
     return Params{Load::to_underlying_arguments(problem_shape, args.load, workspace),
-                  args.scale_q * args.scale_k * scale_softmax,
-                  args.scale_q * args.scale_k * log2_e * scale_softmax,
-                  args.scale_v * args.inv_scale_o};
+                  args.scale_q * scale_k_eff * scale_softmax,
+                  args.scale_q * scale_k_eff * log2_e * scale_softmax,
+                  scale_v_eff * args.inv_scale_o,
+                  1.0f / args.dequant_g_k,
+                  1.0f / args.dequant_g_v,
+                  args.k_global_scale, args.v_global_scale};
   }
 
   CUTLASS_DEVICE
@@ -436,8 +508,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
                            int const& work_idx,
                            TensorStorageType& storage, PipelineQ& pipeline_q,
                            typename PipelineQ::PipelineState& pipeline_q_producer_state,
-                           PipelineKV& pipeline_kv,
-                           typename PipelineKV::PipelineState& pipeline_kv_producer_state
+                           PipelineKvForLoad& pipeline_kv,
+                           typename PipelineKvForLoad::PipelineState& pipeline_kv_producer_state
                            #ifdef GPU_TRACE_ENABLED
                              , gpu_trace::Recorder& _gt_rec
                            #endif
@@ -452,6 +524,77 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
               #endif
             );
   }
+
+#if MSA_NVFP4_KV_MODE >= 2
+  template <class BlkCoord, class ProblemShape, class ParamsProblemShape, class TensorStorageType>
+  CUTLASS_DEVICE void dequant(BlkCoord const& blk_coord, ProblemShape const& problem_shape,
+                              Params const& params,
+                              ParamsProblemShape const& params_problem_shape,
+                              TensorStorageType& storage,
+                              PipelineKvStage& pipeline_stage,
+                              typename PipelineKvStage::PipelineState& stage_consumer_state,
+                              PipelineKV& pipeline_kv,
+                              typename PipelineKV::PipelineState& kv_producer_state,
+                              int dequant_tid,
+                              int kv_tile_begin = 0, int kv_tile_end = INT_MAX) {
+    static_assert(sizeof(Element) == 1,
+                  "K2 assumes a 1-byte smem_kv element so that stage stride == kKvStageBytes");
+
+    const int n_events = Load::kv_event_count(blk_coord, problem_shape, params.load,
+                                              kv_tile_begin, kv_tile_end);
+
+    uint8_t* smem_kv_bytes = reinterpret_cast<uint8_t*>(storage.smem_kv.data());
+    uint8_t* ring_bytes    = storage.smem_kv_stage.data();
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int e = 0; e < n_events; ++e) {
+      pipeline_stage.consumer_wait(stage_consumer_state);
+      const int s_in = stage_consumer_state.index();
+
+      const k2::StageTag tag = storage.stage_tag[s_in];
+      K2_STAGE_ASSERT(tag.seq() == stage_consumer_state.count(),
+                      "ring seq %u != expected %u (stage %d)\n",
+                      tag.seq(), stage_consumer_state.count(), s_in);
+      K2_STAGE_ASSERT(tag.seq() == kv_producer_state.count(),
+                      "ring seq %u != kv producer count %u\n",
+                      tag.seq(), kv_producer_state.count());
+
+      pipeline_kv.producer_acquire(kv_producer_state);
+      const int s_out = kv_producer_state.index();
+
+      k2_convert_stage(ring_bytes + (size_t)s_in * kKvStageBytes,
+                       smem_kv_bytes + (size_t)s_out * kSmemKvTileBytes,
+                       tag, params, dequant_tid);
+
+      cutlass::arch::fence_view_async_shared();   // per-thread; see the block comment
+      pipeline_kv.producer_commit(kv_producer_state);
+      pipeline_stage.consumer_release(stage_consumer_state);
+
+      ++stage_consumer_state;
+      ++kv_producer_state;
+    }
+  }
+
+  CUTLASS_DEVICE static void k2_convert_stage(const uint8_t* __restrict__ src,
+                                              uint8_t* __restrict__ dst,
+                                              k2::StageTag tag, Params const& params,
+                                              int tid) {
+#if MSA_NVFP4_KV_MODE >= 3
+    const float inv_g = tag.is_v() ? params.k2_inv_g_v : params.k2_inv_g_k;
+    {
+      if (tag.is_v()) {
+        k1::dequant_page_tile</*kIsV=*/true, /*kNumWarps=*/k2::kNumActiveWarpsDequant,
+                              /*kScrubNaN=*/true, /*kPrefetch=*/2>(
+            src, src + k2::kStageBytesNvfp4 - 1024, dst, inv_g, tid);
+      } else {
+        k1::dequant_page_tile</*kIsV=*/false, /*kNumWarps=*/k2::kNumActiveWarpsDequant,
+                              /*kScrubNaN=*/true, /*kPrefetch=*/2>(
+            src, src + k2::kStageBytesNvfp4 - 1024, dst, inv_g, tid);
+      }
+    }
+#endif
+  }
+#endif  // MSA_NVFP4_KV_MODE >= 2
 
   template <bool kSingleWG = false, class BlkCoord, class ProblemShape, class TensorStorageType>
   CUTLASS_DEVICE auto mma(
@@ -987,7 +1130,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       Tensor tTMEM_STORErS_x4 = make_tensor<uint32_t>(shape(tTMEM_STOREcS));
 
       if constexpr (!skip_computation && kNeedOutput) {
-        ElementQK scale = params.scale_softmax_log2;
+        ElementQK scale = params.softmax_scale_log2();
         ElementQK row_max_scale = row_max_safe * scale;
 
         float2 scale_fp32x2 = make_float2(scale, scale);
@@ -1066,7 +1209,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       {GPU_TRACE_SCOPE(SOFTMAX_Sum);
       if constexpr (!skip_computation && kNeedOutput) {
-        ElementQK scale = params.scale_softmax_log2;
+        ElementQK scale = params.softmax_scale_log2();
         ElementQK acc_scale = 0.5f * ::exp2f(scale * (old_row_max - row_max_safe));
         row_sum *= acc_scale;
         float2 local_row_sum_f32x2 = make_float2(row_sum, row_sum);
@@ -1656,9 +1799,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     ElementPV total_max = ::fmaxf(row_max_0, row_max_1);
     // Guard against -inf - (-inf) = NaN when all positions are masked
     ElementPV rescale_0 = (total_max == -INFINITY) ? 0.f
-        : ::exp2f(params.scale_softmax_log2 * (row_max_0 - total_max));
+        : ::exp2f(params.softmax_scale_log2() * (row_max_0 - total_max));
     ElementPV rescale_1 = (total_max == -INFINITY) ? 0.f
-        : ::exp2f(params.scale_softmax_log2 * (row_max_1 - total_max));
+        : ::exp2f(params.softmax_scale_log2() * (row_max_1 - total_max));
     ElementPV total_sum = row_sum_0 * rescale_0 + row_sum_1 * rescale_1;
 
     // Fused rescale + accumulate: O0 = O0 * rescale_0 + O1 * rescale_1
@@ -1732,6 +1875,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < n_elem; j++) {
               smem_o_xchg[partner * n_elem + j] = rO(j) * rescale_1;
+
             }
           }
           corr_sync();
@@ -1743,6 +1887,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
             CUTLASS_PRAGMA_UNROLL
             for (int j = 0; j < n_elem; j++) {
               rO(j) = __fmaf_rn(rO(j), rescale_0, smem_o_xchg[thread_idx_corr * n_elem + j]);
+
             }
             copy(tmem_store_acc, rO, dst0);
           }
@@ -1943,7 +2088,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
         if constexpr (kNeedOutput) {
           // e^(scale * (old_max - new_max)
-          float scale = ::exp2f(params.scale_softmax_log2 *
+          float scale = ::exp2f(params.softmax_scale_log2() *
                                 (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
           bool warp_should_rescale = __any_sync(0xffffffff, scale != 1.f);
           if (warp_should_rescale) {
@@ -1972,7 +2117,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         }
 
         if constexpr (kNeedOutput) {
-          float scale = ::exp2f(params.scale_softmax_log2 *
+          float scale = ::exp2f(params.softmax_scale_log2() *
                           (tTMEM_LOADVrS(kIdxOldRowMax) - tTMEM_LOADVrS(kIdxNewRowMax)));
           bool warp_should_rescale = __any_sync(0xffffffff, scale != 1.f);
           if (warp_should_rescale) {
@@ -2044,10 +2189,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       {
         GPU_TRACE_SCOPE(CORRECTION_EPI);
         if constexpr (IsSplitKV) {
-          float corr_scale = (total_sum == 0.f) ? 0.f : split_kv.scale_output_splitkv / total_sum;
+          float corr_scale = (total_sum == 0.f) ? 0.f : split_kv.scale_output_splitkv * params.alpha_v() / total_sum;
           correction_epilogue(corr_scale, _0{}, sO);
         } else {
-          correction_epilogue(params.scale_output / total_sum, _0{}, sO);
+          correction_epilogue(params.output_scale() / total_sum, _0{}, sO);
         }
         cutlass::arch::fence_view_async_tmem_load();
       }
@@ -2063,7 +2208,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         // Write per-row LSE to smem; epilogue will flush to global memory
         int local_row = get<0>(tTMEM_LOADVcS(_0{}));
         float lse = (total_sum == 0.f) ? -INFINITY
-                    : total_max + __log2f(total_sum) / params.scale_softmax_log2;
+                    : total_max + __log2f(total_sum) / params.softmax_scale_log2();
         shared_storage_epi.smem_lse[local_row] = lse;
       }
 
@@ -2087,7 +2232,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_epi.producer_acquire(pipeline_epi_producer_state);
     if constexpr (kNeedOutput) {
       GPU_TRACE_SCOPE(CORRECTION_EPI);
-      correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
+      correction_epilogue(params.output_scale() / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
       if (epilogue.params.ptr_LSE != nullptr) {
         int qo_tile_idx = get<0>(blk_coord);
         int qo_head_idx = get<2, 0>(blk_coord);
@@ -2098,7 +2243,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         int row_idx = get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * qo_tile_idx;
 
         ElementPV lse = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
-                        params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
+                        params.softmax_scale_log2() * tTMEM_LOADVrS(kIdxFinalRowMax);
 
         if (row_idx < qo_len) {
           gLSE(segment_offset + row_idx, qo_head_idx) = lse;
@@ -2125,7 +2270,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     if constexpr (kNeedOutput) {
       GPU_TRACE_SCOPE(CORRECTION_EPI);
-      correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
+      correction_epilogue(params.output_scale() / tTMEM_LOADVrS(kIdxFinalRowSum), _1{}, sO);
       if (epilogue.params.ptr_LSE != nullptr) {
         int qo_tile_idx = get<0>(blk_coord);
         int qo_head_idx = get<2, 0>(blk_coord);
@@ -2137,7 +2282,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
             get<0>(tTMEM_LOADVcS(_0{})) + get<0>(TileShape{}) * qo_tile_idx + get<0>(TileShapeQK{});
 
         ElementPV lse = __log2f(tTMEM_LOADVrS(kIdxFinalRowSum)) +
-                        params.scale_softmax_log2 * tTMEM_LOADVrS(kIdxFinalRowMax);
+                        params.softmax_scale_log2() * tTMEM_LOADVrS(kIdxFinalRowMax);
 
         if (row_idx < qo_len) {
           gLSE(segment_offset + row_idx, qo_head_idx) = lse;

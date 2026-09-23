@@ -319,7 +319,10 @@ def _validate_csr_varlen_nvfp4_kv_inputs(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     seqused_k: Optional[torch.Tensor],
+    kv_layout: str = "legacy",
 ) -> tuple[int, int]:
+    if kv_layout not in ("legacy", "vllm"):
+        raise ValueError("kv_layout must be legacy or vllm")
     if q.ndim != 3:
         raise ValueError("KVFP4 CSR sparse forward requires q to have shape [total_q, Hq, D]")
     if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
@@ -356,13 +359,14 @@ def _validate_csr_varlen_nvfp4_kv_inputs(
         raise ValueError(f"KVFP4 k and v must have the same shape, got {k.shape} and {v.shape}")
     packed_dim = q.shape[-1] // 2
     scale_cols = q.shape[-1] // 16
-    if k_scale_128x4.ndim != 2 or v_scale_128x4.ndim != 2:
-        raise ValueError("KVFP4 block scales must be rank-2 128x4 tiled tensors")
-    if k_scale_128x4.shape[1] < scale_cols or v_scale_128x4.shape[1] < scale_cols:
-        raise ValueError(
-            "KVFP4 block scales must have at least D/16 columns; "
-            f"need {scale_cols}, got {k_scale_128x4.shape[1]} and {v_scale_128x4.shape[1]}"
-        )
+    if kv_layout == "legacy":
+        if k_scale_128x4.ndim != 2 or v_scale_128x4.ndim != 2:
+            raise ValueError("KVFP4 block scales must be rank-2 128x4 tiled tensors")
+        if k_scale_128x4.shape[1] < scale_cols or v_scale_128x4.shape[1] < scale_cols:
+            raise ValueError(
+                "KVFP4 block scales must have at least D/16 columns; "
+                f"need {scale_cols}, got {k_scale_128x4.shape[1]} and {v_scale_128x4.shape[1]}"
+            )
     if k_global_scale is not None and k_global_scale.numel() < 1:
         raise ValueError("KVFP4 K global scale must contain at least one element")
     if v_global_scale is not None and v_global_scale.numel() < 1:
@@ -409,14 +413,15 @@ def _validate_csr_varlen_nvfp4_kv_inputs(
             if not seqused_k.is_contiguous():
                 raise ValueError("seqused_k must be contiguous")
 
-    padded_scale_rows = ((required_scale_rows + 127) // 128) * 128
-    padded_scale_cols = ((scale_cols + 3) // 4) * 4
-    for name, scale in (("k_scale_128x4", k_scale_128x4), ("v_scale_128x4", v_scale_128x4)):
-        if scale.shape[0] < padded_scale_rows or scale.shape[1] < padded_scale_cols:
-            raise ValueError(
-                f"{name} is too small for 128x4 layout: got {tuple(scale.shape)}, "
-                f"need at least {(padded_scale_rows, padded_scale_cols)}"
-            )
+    if kv_layout == "legacy":
+        padded_scale_rows = ((required_scale_rows + 127) // 128) * 128
+        padded_scale_cols = ((scale_cols + 3) // 4) * 4
+        for name, scale in (("k_scale_128x4", k_scale_128x4), ("v_scale_128x4", v_scale_128x4)):
+            if scale.shape[0] < padded_scale_rows or scale.shape[1] < padded_scale_cols:
+                raise ValueError(
+                    f"{name} is too small for 128x4 layout: got {tuple(scale.shape)}, "
+                    f"need at least {(padded_scale_rows, padded_scale_cols)}"
+                )
 
     if k2q_row_ptr.device != q.device or k2q_q_indices.device != q.device:
         raise ValueError("CSR metadata must be on the same device as q")
@@ -806,8 +811,15 @@ def sparse_atten_nvfp4_kv_func(
     seqused_k: Optional[torch.Tensor] = None,
     schedule: Optional[SparseAttentionSchedule] = None,
     out: Optional[torch.Tensor] = None,
+    kv_layout: str = "legacy",
 ):
     """Run SM100 CSR sparse attention with packed NVFP4 K/V.
+
+    ``kv_layout="legacy"`` preserves rank-2 128x4 block scales. Explicit
+    ``kv_layout="vllm"`` consumes uint8 [P,H,128,8] K-linear/V-token-quad
+    scale views and [P,H,128,64] payload views with their true page strides.
+    Existing scale keyword names remain valid for both modes. Paged vLLM
+    caches require ``seqused_k`` so partial pages remain causally masked.
 
     Parameters
     ----------
@@ -908,7 +920,14 @@ def sparse_atten_nvfp4_kv_func(
         cu_seqlens_q,
         cu_seqlens_k,
         seqused_k,
+        kv_layout,
     )
+    # Both forward and combine consume rank-one scale arguments. Keep scalar
+    # model buffers as zero-copy views, including while capturing CUDA graphs.
+    if k_global_scale is not None:
+        k_global_scale = k_global_scale.reshape(-1)
+    if v_global_scale is not None:
+        v_global_scale = v_global_scale.reshape(-1)
     total_q, head_q, dim = q.shape
     max_num_kv_blocks = _csr_row_capacity(k2q_row_ptr)
     temperature_lse_fast_path = (
@@ -963,12 +982,12 @@ def sparse_atten_nvfp4_kv_func(
 
     schedule = _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
         q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        k_scale_128x4.contiguous(),
-        v_scale_128x4.contiguous(),
-        None if k_global_scale is None else k_global_scale.contiguous(),
-        None if v_global_scale is None else v_global_scale.contiguous(),
+        k if kv_layout == "vllm" else k.contiguous(),
+        v if kv_layout == "vllm" else v.contiguous(),
+        k_scale_128x4 if kv_layout == "vllm" else k_scale_128x4.contiguous(),
+        v_scale_128x4 if kv_layout == "vllm" else v_scale_128x4.contiguous(),
+        k_global_scale,
+        v_global_scale,
         k2q_row_ptr.contiguous(),
         k2q_q_indices.contiguous(),
         k2q_qsplit_indices.contiguous(),
@@ -989,6 +1008,7 @@ def sparse_atten_nvfp4_kv_func(
         int(max_seqlen_q),
         causal=bool(causal),
         schedule=schedule,
+        kv_layout=kv_layout,
     )
 
     combine(
@@ -1866,6 +1886,7 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
     causal=False,
     use_prepare_scheduler=True,
     schedule: Optional[SparseAttentionSchedule] = None,
+    kv_layout: str = "legacy",
 ):
     """Compile and launch the SM100 sparse forward K1 kernel with NVFP4 K/V."""
 
@@ -1938,6 +1959,12 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
 
     key = (
         "sparse_forward_sm100_csr_varlen_nvfp4_kv",
+        kv_layout,
+        head_kv,
+        tuple(k.stride()),
+        tuple(v.stride()),
+        tuple(k_scale_128x4.stride()),
+        tuple(v_scale_128x4.stride()),
         head_dim,
         n_block_size,
         qhead_per_kv,
@@ -1962,6 +1989,7 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
         else:
             kernel = SparseAttentionForwardNvfp4KvSm100(
                 head_dim=head_dim,
+                kv_layout=kv_layout,
                 qheadperkv=qhead_per_kv,
                 n_block_size=n_block_size,
                 paged_kv=paged_kv,
@@ -1977,8 +2005,8 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
                 kernel,
                 to_cute_tensor_kvouter(k_kernel),
                 to_cute_tensor_kvouter(v_kernel),
-                to_cute_tensor_kvouter(k_scale_128x4),
-                to_cute_tensor_kvouter(v_scale_128x4),
+                to_cute_tensor_kvouter(k_scale_128x4, assumed_align=1),
+                to_cute_tensor_kvouter(v_scale_128x4, assumed_align=1),
                 None if k_global_scale_kernel is None else to_cute_tensor_kvouter(k_global_scale_kernel),
                 None if v_global_scale_kernel is None else to_cute_tensor_kvouter(v_global_scale_kernel),
                 to_cute_tensor_kvouter(k2q_q_indices),

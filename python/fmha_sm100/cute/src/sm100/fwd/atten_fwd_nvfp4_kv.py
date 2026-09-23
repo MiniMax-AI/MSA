@@ -74,11 +74,13 @@ class SparseAttentionForwardNvfp4KvSm100:
         fp8_pair_dequant: bool = True,
         has_k_global_scale: bool = True,
         has_v_global_scale: bool = True,
+        kv_layout: str = "legacy",
     ):
         if head_dim != 128:
             raise NotImplementedError(
                 f"SparseAttentionForwardNvfp4KvSm100 currently supports only D=128, got D={head_dim}"
             )
+        self.vllm_layout = kv_layout == "vllm"
         self.head_dim = 128
         self.qheadperkv = qheadperkv
         self.use_q_gather4 = qheadperkv in (4, 2, 1)
@@ -358,9 +360,8 @@ class SparseAttentionForwardNvfp4KvSm100:
             not in [Float32, cutlass.BFloat16, cutlass.Float16, cutlass.Float8E4M3FN]
         ):
             raise TypeError(f"Unsupported O_partial dtype: {self.o_dtype}")
-        mK, mV, mKScale, mVScale = [
-            assume_tensor_aligned(t) for t in (mK, mV, mKScale, mVScale)
-        ]
+        # Scale rows are eight bytes, so they cannot promise 16-byte strides.
+        mK, mV = [assume_tensor_aligned(t) for t in (mK, mV)]
 
         if const_expr(not self.paged_kv):
             # Flat varlen K/V:
@@ -1216,14 +1217,15 @@ class SparseAttentionForwardNvfp4KvSm100:
     def _load_scale_bf16x2(
         self,
         scale: cute.Tensor,
-        logical_row: Int32,
+        logical_row: Int64,
         scale_col: Int32,
+        is_v: cutlass.Constexpr[bool],
     ) -> Int32:
-        scale_offset = self._scale_128x4_offset(
-            logical_row,
-            scale_col,
-            self.head_dim // 16,
-        )
+        if const_expr(self.vllm_layout):
+            scale_offset = logical_row + Int64(scale_col * (4 if is_v else 1))
+        else:
+            scale_offset = Int64(self._scale_128x4_offset(
+                logical_row, scale_col, self.head_dim // 16))
         scale_ptr = cute.make_ptr(
             cutlass.Uint8,
             scale.iterator.toint() + Int64(scale_offset),
@@ -1237,14 +1239,15 @@ class SparseAttentionForwardNvfp4KvSm100:
     def _load_scale_e4m3_u8(
         self,
         scale: cute.Tensor,
-        logical_row: Int32,
+        logical_row: Int64,
         scale_col: Int32,
+        is_v: cutlass.Constexpr[bool],
     ) -> Int32:
-        scale_offset = self._scale_128x4_offset(
-            logical_row,
-            scale_col,
-            self.head_dim // 16,
-        )
+        if const_expr(self.vllm_layout):
+            scale_offset = logical_row + Int64(scale_col * (4 if is_v else 1))
+        else:
+            scale_offset = Int64(self._scale_128x4_offset(
+                logical_row, scale_col, self.head_dim // 16))
         scale_ptr = cute.make_ptr(
             cutlass.Uint8,
             scale.iterator.toint() + Int64(scale_offset),
@@ -1332,8 +1335,16 @@ class SparseAttentionForwardNvfp4KvSm100:
         token_idx: Int32,
         head_kv_idx: Int32,
         num_heads_kv: Int32,
-    ) -> Int32:
-        return (page_idx * num_heads_kv + head_kv_idx) * Int32(self.page_size) + token_idx
+        scale: cute.Tensor,
+        is_v: cutlass.Constexpr[bool],
+    ) -> Int64:
+        if const_expr(self.vllm_layout):
+            region = (Int64(page_idx) * Int64(scale.layout.stride[0])
+                      + Int64(head_kv_idx) * Int64(scale.layout.stride[1]))
+            if const_expr(is_v):
+                return region + Int64((token_idx // 4) * 32 + token_idx % 4)
+            return region + Int64(token_idx * 8)
+        return (Int64(page_idx) * Int64(num_heads_kv) + Int64(head_kv_idx)) * Int64(self.page_size) + Int64(token_idx)
 
     @cute.jit
     def _load_k_fp4_to_smem(
@@ -1387,6 +1398,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                         row,
                         head_kv_idx,
                         num_heads_kv,
+                        mKScale, False,
                     )
                 else:
                     token = k_batch_offset + token
@@ -1404,11 +1416,12 @@ class SparseAttentionForwardNvfp4KvSm100:
                 )
                 s_vec = cute.make_tensor(s_ptr, cute.make_layout(bytes_per_pair // 4))
                 cute.copy(g2r_pair_atom, s_vec, r_words_pair)
-                scale_e4m3_lo = self._load_scale_e4m3_u8(mKScale, scale_row, scale_col)
+                scale_e4m3_lo = self._load_scale_e4m3_u8(mKScale, scale_row, scale_col, False)
                 scale_e4m3_hi = self._load_scale_e4m3_u8(
                     mKScale,
                     scale_row,
                     scale_col + Int32(1),
+                    False,
                 )
                 self._dequant_fp4x32_to_fp8(
                     r_words_pair,
@@ -1453,6 +1466,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                     row,
                     head_kv_idx,
                     num_heads_kv,
+                        mKScale, False,
                 )
             else:
                 token = k_batch_offset + token
@@ -1471,9 +1485,9 @@ class SparseAttentionForwardNvfp4KvSm100:
             s_vec = cute.make_tensor(s_ptr, cute.make_layout(bytes_per_block // 4))
             cute.copy(g2r_atom, s_vec, r_words)
             if const_expr(self.k_dtype == cutlass.Float8E4M3FN):
-                scale_e4m3 = self._load_scale_e4m3_u8(mKScale, scale_row, scale_col)
+                scale_e4m3 = self._load_scale_e4m3_u8(mKScale, scale_row, scale_col, False)
             else:
-                combined_bf16x2 = self._load_scale_bf16x2(mKScale, scale_row, scale_col)
+                combined_bf16x2 = self._load_scale_bf16x2(mKScale, scale_row, scale_col, False)
                 if const_expr(self.has_k_global_scale):
                     global_bf16x2 = utils.cvt_f16x2_f32(
                         mKGlobalScale[0],
@@ -1561,6 +1575,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                         row,
                         head_kv_idx,
                         num_heads_kv,
+                        mVScale, True,
                     )
                 else:
                     token = k_batch_offset + token
@@ -1578,11 +1593,12 @@ class SparseAttentionForwardNvfp4KvSm100:
                 )
                 s_vec = cute.make_tensor(s_ptr, cute.make_layout(bytes_per_pair // 4))
                 cute.copy(g2r_pair_atom, s_vec, r_words_pair)
-                scale_e4m3_lo = self._load_scale_e4m3_u8(mVScale, scale_row, scale_col)
+                scale_e4m3_lo = self._load_scale_e4m3_u8(mVScale, scale_row, scale_col, True)
                 scale_e4m3_hi = self._load_scale_e4m3_u8(
                     mVScale,
                     scale_row,
                     scale_col + Int32(1),
+                    True,
                 )
                 self._dequant_fp4x32_to_fp8(
                     r_words_pair,
@@ -1628,6 +1644,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                     row,
                     head_kv_idx,
                     num_heads_kv,
+                        mVScale, True,
                 )
             else:
                 token = k_batch_offset + token
@@ -1646,10 +1663,10 @@ class SparseAttentionForwardNvfp4KvSm100:
             s_vec = cute.make_tensor(s_ptr, cute.make_layout(bytes_per_block // 4))
             cute.copy(g2r_atom, s_vec, r_words)
             if const_expr(self.v_dtype == cutlass.Float8E4M3FN):
-                scale_e4m3 = self._load_scale_e4m3_u8(mVScale, scale_row, scale_col)
+                scale_e4m3 = self._load_scale_e4m3_u8(mVScale, scale_row, scale_col, True)
                 self._dequant_fp4x16_to_fp8(r_words, scale_e4m3, r_vals)
             else:
-                combined_bf16x2 = self._load_scale_bf16x2(mVScale, scale_row, scale_col)
+                combined_bf16x2 = self._load_scale_bf16x2(mVScale, scale_row, scale_col, True)
                 if const_expr(self.has_v_global_scale):
                     global_bf16x2 = utils.cvt_f16x2_f32(
                         mVGlobalScale[0],

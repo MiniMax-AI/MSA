@@ -759,20 +759,32 @@ def _fmha_sm100(
     max_score: Optional[torch.Tensor] = None,
     sm_scale: Optional[float] = None,
     q_scale: Optional[float] = None,
-    k_scale: Optional[float] = None,
-    v_scale: Optional[float] = None,
+    k_scale: Optional[Union[float, torch.Tensor]] = None,
+    v_scale: Optional[Union[float, torch.Tensor]] = None,
     o_scale: Optional[float] = None,
     output_maxscore: bool = True,
     output_o: bool = True,
     check_input_valid: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-
     if plan_info["MM-SA-Nv"]:
         return sparse_fmha(q=q, k=k, v=v, plan_info=plan_info, out=out, max_score=max_score, 
                 sm_scale=sm_scale, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale, o_scale=o_scale,
                 kv_indices=kv_indices, output_maxscore=output_maxscore, output_o=output_o, q_offset_override=q_offset_override,
                 kv_block_indexes=kv_block_indexes, check_input_valid=check_input_valid)
 
+    is_nvfp4 = k.dtype == torch.uint8
+    if is_nvfp4:
+        pages, heads = k.shape[:2]
+        k_sf = k.as_strided((pages, heads, 128, 8),
+                           (k.stride(0), 1024, 8, 1),
+                           k.storage_offset() + heads * 8192)
+        v_sf = v.as_strided((pages, heads, 128, 8),
+                           (v.stride(0), 1024, 8, 1),
+                           v.storage_offset() + heads * 8192)
+        k = k.as_strided((pages, heads, 128, 64), (k.stride(0), 8192, 64, 1))
+        v = v.as_strided((pages, heads, 128, 64), (v.stride(0), 8192, 64, 1))
+        k_global_scale, v_global_scale = k_scale, v_scale
+        k_scale = v_scale = 1.0
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
     if kv_indices is None:
@@ -782,6 +794,8 @@ def _fmha_sm100(
         nnz_kv, num_kv_heads, page_size, head_dim_vo = v.shape
         is_paged = True
 
+    if is_nvfp4:
+        head_dim_vo = 128
     qo_total_len = nnz_qo
 
     packed_work_range = plan_info["packed_work_range"]
@@ -910,9 +924,23 @@ def _fmha_sm100(
 
     variant_page_size = (k.shape[2] if is_paged else -1)
 
+    # Keep the ordinary variant's FFI signature/cache identity unchanged.
+    nvfp4_args = ()
+    _kv_dtype = None
+    _nv_g_k = 1.0
+    if is_nvfp4:
+        _kv_dtype = "nvfp4"
+        _nv_g_k = 6.0
+        nvfp4_args = (
+            k, k_sf, v, v_sf,
+            k.stride(0), k.stride(1), k_sf.stride(1),
+            6.0, 6.0, k_global_scale, v_global_scale,
+        )
+
     variant_module = get_fmha_variant(
         dtype_code, qo_tile_size, (max_qo_len <= 64),
-        sparse_mode, variant_page_size, use_split_kv, pack_factor)
+        sparse_mode, variant_page_size, use_split_kv, pack_factor,
+        kv_dtype=_kv_dtype)
 
     variant_module.run(
         workspace_buffer,
@@ -936,16 +964,21 @@ def _fmha_sm100(
         pack_factor,
         bool(qo_len_uniform),
         torch.cuda.current_stream().cuda_stream,
+        *nvfp4_args,
     )
 
     # Split-KV reduction
     if use_split_kv and out is not None:
         log2_e = math.log2(math.exp(1.0))
-        scale_softmax_log2 = float(q_scale * k_scale * sm_scale) * log2_e
+        # Gamma compensates raw code*block_scale/gamma staging. The kernel
+        # multiplies this by the same device alpha_k read by the mainloop.
+        scale_softmax_log2 = float(q_scale * k_scale * _nv_g_k * sm_scale) * log2_e
         inv_scale_o = float(o_scale)
 
-        reduction_module = get_reduction_module()
-        reduction_module.reduction(
+        reduction_module = get_reduction_module(nvfp4=is_nvfp4)
+        reduction = (reduction_module.reduction if not is_nvfp4
+                     else reduction_module.reduction_nvfp4)
+        reduction(
             workspace_o,
             out,
             workspace_lse,
@@ -958,6 +991,7 @@ def _fmha_sm100(
             num_kv_heads,
             pack_factor,
             torch.cuda.current_stream().cuda_stream,
+            *((k_global_scale,) if is_nvfp4 else ()),
         )
 
     return out, max_score
@@ -1071,7 +1105,8 @@ def fmha_sm100(
         Dense layout ``[total_kv_len, num_kv_heads, head_dim]`` or paged layout
         ``[total_pages, num_kv_heads, page_size, head_dim]``.
     v : torch.Tensor
-        Same layout as ``k``.  The output head dimension follows ``v.shape[-1]``.
+        Same layout as ``k``. The output head dimension is 128 for NVFP4,
+        otherwise it follows ``v.shape[-1]``.
     plan_info : tuple
         Return value from ``fmha_sm100_plan`` for the same lengths, head layout,
         page size, and sparse/output mode.
@@ -1099,6 +1134,20 @@ def fmha_sm100(
         Runtime options forwarded to the kernel runner.  Common options are
         ``sm_scale``, ``q_scale``, ``k_scale``, ``v_scale``, ``o_scale``,
         ``output_maxscore``, ``output_o``, and ``check_input_valid``.
+
+    NVFP4 cache layout
+    ------------------
+    Pass K and V as uint8 tensors of shape ``[pages, Hkv, 128, 72]``.
+    Each side stores all packed data first (8192 bytes per head), followed
+    by E4M3 block scales (1024 bytes per head). The last dimension describes
+    storage size, not interleaved token rows. Each byte packs two E2M1 values,
+    and each block scale covers 16 values. K scales use ``token*8+group``;
+    V scales use ``(token//4)*32+group*4+token%4`` within each head.
+    K and V have the same page stride; views into a shared
+    ``[pages, 2*Hkv, 128, 72]`` allocation preserve that stride and offset.
+    ``k_scale`` and ``v_scale`` are CUDA float32 scalar tensors for NVFP4:
+    ``value = E2M1(code) * E4M3(block_scale) * global_scale``.
+    Use BF16 Q for prefill and E4M3 Q for decode. No cache conversion is needed.
 
     Returns
     -------
