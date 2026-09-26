@@ -9,6 +9,7 @@ independently on first use and cached to ~/.cache/minfer/fmha_sm100/.
 To recompile after kernel changes: scripts/clear_fmha_cache.sh
 """
 
+import hashlib
 import itertools
 import fcntl
 import logging
@@ -216,7 +217,7 @@ def _get_cuda_home():
 
 _ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
 
-def _get_nvcc_flags(cache_dir, fmha=True, kv_mode=0):
+def _get_nvcc_flags(cache_dir, fmha=True, kv_mode=0, fast_math=True):
     tvm_include = _get_tvm_ffi_include()
     fmha_include = str(_FMHA_VARLEN_DIR / "include")
     cutlass_include = str(_CUTLASS_INCLUDE)
@@ -243,10 +244,11 @@ def _get_nvcc_flags(cache_dir, fmha=True, kv_mode=0):
         f"-I{cutlass_util_include}",
         f"-I{tvm_include}",
         f"-I{cache_dir}",
-        "-use_fast_math",
         "-DNDEBUG", "-Xptxas", "-O1" if fmha else "-O3",
         "-Xcompiler", "-fPIC",
     ]
+    if fast_math:
+        nvcc_flags.append("-use_fast_math")
     if os.environ.get("GPU_TRACE") is not None:
         nvcc_flags.append("-DGPU_TRACE_ENABLED")
     if os.environ.get("SM_TIMING") is not None:
@@ -701,3 +703,97 @@ def get_reduction_module(nvfp4=False):
         finally:
             _release_file_lock(lock_fd)
         return _reduction_modules[key]
+
+
+# ============================================================================
+# Q8KV4/Q8KV8 paged indexer kernels JIT
+# ============================================================================
+
+# Each module is one TVM-FFI translation unit plus the header directory it owns.
+_INDEXER_MODULE_SOURCES = {
+    "indexer_topk_select": ("indexer_topk_select.cu", "indexer_topk"),
+    "q8kv4_indexer_decode": ("q8kv4_indexer_decode.cu", "q8kv4_indexer"),
+}
+_indexer_modules = {}
+_indexer_lock = threading.Lock()
+
+
+def _indexer_module_build(name):
+    """Return the digest-keyed cache directory, shared library, and build inputs."""
+    source_name, header_dir = _INDEXER_MODULE_SOURCES[name]
+    source = _FMHA_VARLEN_DIR / source_name
+    headers = sorted((_FMHA_VARLEN_DIR / "include" / header_dir).glob("*"))
+    headers.append(_FMHA_VARLEN_DIR / "tvm_ffi_utils.h")
+    nvcc = str(Path(_get_cuda_home(), "bin", "nvcc").resolve())
+    # Sources compile in place, so csrc/ provides tvm_ffi_utils.h. The ported
+    # kernels were validated with IEEE division and denormals.
+    nvcc_flags = _get_nvcc_flags(_FMHA_VARLEN_DIR, False, fast_math=False)
+    digest = hashlib.sha256()
+    for path in [source, *headers, _CUTLASS_INCLUDE / "cutlass" / "version.h"]:
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    import tvm_ffi
+    digest.update(tvm_ffi.__version__.encode())
+    digest.update(nvcc.encode())
+    digest.update(nvcc_flags.encode())
+    cache_dir = CACHE_BASE / f"{name}_{digest.hexdigest()[:16]}"
+    return cache_dir, cache_dir / f"{name}.so", nvcc, nvcc_flags, source, headers
+
+
+def _do_compile_indexer_module(name):
+    cache_dir, so_path, nvcc, nvcc_flags, source, headers = _indexer_module_build(name)
+    if so_path.exists():
+        return so_path
+
+    logger.info(f"JIT compiling {name} module")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    obj = cache_dir / f"{name}.o"
+    implicit_deps = " ".join(str(path) for path in headers)
+    ninja_content = f"""ninja_required_version = 1.5
+
+nvcc = {nvcc}
+nvcc_flags = {nvcc_flags}
+
+rule nvcc_compile
+  command = $nvcc $nvcc_flags -c $in -o $out
+  description = Compiling $in
+
+rule nvcc_link
+  command = $nvcc -shared $in -o $out -lcuda
+  description = Linking $out
+
+build {obj}: nvcc_compile {source} | {implicit_deps}
+build {so_path}: nvcc_link {obj}
+"""
+    (cache_dir / "build.ninja").write_text(ninja_content)
+
+    result = subprocess.run(
+        ["ninja", "-j1"],
+        cwd=str(cache_dir),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"{name} compilation failed:\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+    return so_path
+
+
+def get_indexer_module(name):
+    """Load one of ``_INDEXER_MODULE_SOURCES``. JIT compiles on first call."""
+    if name in _indexer_modules:
+        return _indexer_modules[name]
+    with _indexer_lock:
+        if name in _indexer_modules:
+            return _indexer_modules[name]
+        lock_fd = _acquire_file_lock(CACHE_BASE / f"{name}.lock")
+        try:
+            so_path = _do_compile_indexer_module(name)
+            import tvm_ffi
+            _indexer_modules[name] = tvm_ffi.load_module(str(so_path))
+        finally:
+            _release_file_lock(lock_fd)
+        return _indexer_modules[name]

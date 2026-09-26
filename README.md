@@ -108,8 +108,9 @@ out, _ = fmha_sm100(
 )
 ```
 
-For block-sparse prefill with CSR metadata, the FP4 indexer, NVFP4 K/V, and
-the paged FP8 decode wrapper, see the **CuTe-DSL deep dive**:
+For block-sparse prefill with CSR metadata, the FP4 indexer, the Q8KV4/Q8KV8
+paged indexers over the vLLM index-K cache, NVFP4 K/V, and the paged FP8
+decode wrapper, see the **CuTe-DSL deep dive**:
 
 - [`python/fmha_sm100/cute/README.md`](python/fmha_sm100/cute/README.md)
 

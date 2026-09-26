@@ -15,6 +15,9 @@ can simply do::
 
     from fmha_sm100.sparse import (
         fp4_indexer_block_scores,      # block-score indexer (topk is caller-owned)
+        BatchDecodeIndexerQ8KV4Wrapper,   # Q8KV4 paged decode indexer (plan/run)
+        BatchDecodeIndexerQ8KV8Wrapper,   # Q8KV8 paged decode indexer (plan/run)
+        BatchPrefillIndexerQ8KV8Wrapper,  # Q8KV8 varlen prefill indexer (plan/run)
         build_k2q_csr,                 # q2k indices -> CSR + schedule
         SparseK2qCsrBuilderSm100,      # SM100 CSR builder (fused schedule)
         sparse_atten_func,             # block-sparse prefill
@@ -75,6 +78,14 @@ from src.sm100.prepare_k2q_csr import SparseK2qCsrBuilderSm100  # noqa: E402
 # remain caller-owned downstream steps.
 from fp4_indexer_interface import fp4_indexer_block_scores  # noqa: E402
 
+# Q8KV4/Q8KV8 paged indexers over the vLLM index-K cache, with fused TopK
+# (cute/q8_indexer_interface.py).
+from q8_indexer_interface import (  # noqa: E402
+    BatchDecodeIndexerQ8KV4Wrapper,
+    BatchDecodeIndexerQ8KV8Wrapper,
+    BatchPrefillIndexerQ8KV8Wrapper,
+)
+
 # NVFP4 quantization helpers used to feed the FP4 indexer / NVFP4 attention
 # (cute/quantize.py).
 from quantize import (  # noqa: E402
@@ -97,6 +108,9 @@ __all__ = [
     "SparseDecodePagedAttentionWrapper",
     # indexing / CSR
     "fp4_indexer_block_scores",
+    "BatchDecodeIndexerQ8KV4Wrapper",
+    "BatchDecodeIndexerQ8KV8Wrapper",
+    "BatchPrefillIndexerQ8KV8Wrapper",
     "build_k2q_csr",
     "SparseK2qCsrBuilderSm100",
     # kv-outer prefill

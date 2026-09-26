@@ -7,7 +7,8 @@ the dense csrc JIT path, see the
 
 The rest of this file documents the **sparse (CuTe-DSL)** surface only: CSR
 metadata, schedules, sparse page attention, FP8 / NVFP4 / FP4 quantization,
-the paged FP8 decode wrapper, and the FP4 indexer.
+the paged FP8 decode wrapper, the FP4 indexer, and the Q8KV4/Q8KV8 paged
+indexers.
 
 ---
 
@@ -39,6 +40,7 @@ The current public support contract is intentionally narrow:
 | NVFP4 KV prefill | Forward-only, BF16 or FP8 e4m3 Q + packed NVFP4 K/V, flat and paged KV |
 | Paged FP8 decode | Forward-only, FP8 e4m3 Q/K/V → BF16 O, `qhead_per_kv=16`, `page_size=128`, SM100 |
 | FP4 indexer | SM100 block-score API, MXFP4/NVFP4, `D=128`, paged K, `blk_kv=128` |
+| Q8KV4/Q8KV8 paged indexers | SM100/SM103, FP8 e4m3 Q + NVFP4 or FP8 K, vLLM index-K cache, top-16 pages, 8-token MTP decode and varlen prefill |
 | Tests and benchmarks | CUDA required |
 
 ## Installation
@@ -410,6 +412,75 @@ mapping is intentionally not recorded in the open-source tree. Command:
 | `decode_1x3x` | NVFP4 | `preordered_mma` | `B=30, q=30x8, k=202752 + 29x62923, Hq=64, Hkv=4, D=128, blk_kv=128, causal=True` | 967.486 | 908.008 |
 | `decode_1x4x` | NVFP4 | `preordered_mma` | `B=30, q=30x8, k=270336 + 29x60592, Hq=64, Hkv=4, D=128, blk_kv=128, causal=True` | 959.060 | 905.458 |
 
+## Q8KV4/Q8KV8 Paged Indexers
+
+[`q8_indexer_interface.py`](./q8_indexer_interface.py) scores the historical
+128-token pages of every query with an FP8 e4m3 Q and returns 16 logical page
+indices per query. The inputs are the MiniMax-M3 vLLM index-K cache and
+metadata with one index head per rank, so no cache conversion is needed.
+
+| Wrapper | Phase | K cache |
+|---|---|---|
+| `BatchDecodeIndexerQ8KV4Wrapper` | Decode, 8 MTP tokens per request | NVFP4, `[num_blocks, 128, 72]` uint8 |
+| `BatchDecodeIndexerQ8KV8Wrapper` | Decode, 8 MTP tokens per request | FP8 e4m3, `[num_blocks, 128, 128]` |
+| `BatchPrefillIndexerQ8KV8Wrapper` | Varlen prefill, bottom-right causal | FP8 e4m3, `[num_blocks, 128, 128]` |
+
+```python
+from fmha_sm100 import BatchDecodeIndexerQ8KV4Wrapper, BatchPrefillIndexerQ8KV8Wrapper
+
+decode = BatchDecodeIndexerQ8KV4Wrapper()
+decode.plan(block_table, seq_lens)                   # once per step, outside CUDA Graph capture
+topk_indices = decode.run(index_q, index_k_cache)    # per layer; [batch * 8, 1, 16] int32
+
+prefill = BatchPrefillIndexerQ8KV8Wrapper()
+prefill.plan(
+    cu_seqlens_q, seq_lens, block_table,
+    total_q=total_q, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+)
+topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 1, 16] int32
+```
+
+### Q8KV Input And Output Contract
+
+- `index_q`: `[num_tokens, 1, 128]`, `torch.float8_e4m3fn`, contiguous. Decode
+  tokens are grouped per request, eight MTP tokens each.
+- FP8 `index_k_cache`: `[num_blocks, 128, 128]`, `torch.float8_e4m3fn`.
+- NVFP4 `index_k_cache`: `[num_blocks, 128, 72]`, `torch.uint8`. Each page
+  stores the packed E2M1 values of its 128 tokens first (64 bytes per token,
+  low nibble first, 8192 bytes), followed by the E4M3 scales of 16-element
+  groups (index `token * 8 + group`, 1024 bytes). The per-tensor global scale
+  must be positive; it does not change the ranking and is not an input.
+- Pages may be padded: `stride(0)` may exceed the page size if it is 16-byte
+  aligned, and each page itself must be contiguous.
+- `block_table`: `[batch, max_blocks]`, contiguous CUDA `torch.int32`,
+  `max_blocks <= 8192`. Pages may be scattered and unordered.
+- `seq_lens`: `[batch]`, CUDA `torch.int32`, KV lengths including the current
+  queries. Decode query `i` of request `b` sits at `seq_lens[b] - 8 + i`.
+- `cu_seqlens_q` (prefill): `[batch + 1]`, CUDA `torch.int32`, starting at 0.
+  `total_q`, `max_seqlen_q`, and `max_seqlen_k` are host upper bounds used to
+  size buffers; `max_seqlen_k >= max_seqlen_q`.
+- Output: `[num_tokens, 1, 16]`, `torch.int32` logical page indices. The first
+  15 slots are the highest-scoring historical pages, score-descending with ties
+  toward the lower page; the last slot is the query's local page. A query with
+  `n <= 16` candidate pages gets `0 .. n - 1` followed by `-1`, so the last
+  valid entry is always the local page. Scores are ranked with 16-bit keys
+  quantized over each row's score range.
+
+### Q8KV Runtime Notes
+
+- `plan()` launches device work and never synchronizes with the host; call it
+  outside CUDA Graph capture whenever lengths or pages change, then reuse it
+  for every layer. Decode wrappers take `use_cuda_graph=True` with fixed
+  `block_table_buffer` / `seq_lens_buffer`; pass a preallocated `out=` to
+  `run()` when capturing. Prefill supports `replan()` after in-place metadata
+  updates and must be warmed up before capture.
+- Batch size, page counts, and lengths never trigger recompilation.
+- The Q8KV4 kernel uses the public QMUL4 instruction when built with CUDA
+  13.4 or newer and otherwise the exact FP16 dequantization path; both give
+  identical results.
+- A wrapper owns its workspace and output buffers; use one wrapper per
+  concurrently running stream.
+
 ## Testing
 
 Run the full interface-level test file:
@@ -430,6 +501,7 @@ Useful focused runs:
 ```bash
 pytest -q test_sparse_atten.py -k test_sparse_atten
 pytest -q test_sparse_atten.py -k test_sparse_page_atten
+pytest -q test_q8_indexer.py
 ```
 
 ## Benchmark
@@ -666,12 +738,15 @@ High-signal files:
 
 - [`interface.py`](./interface.py): public sparse attention interface
 - [`fp4_indexer_interface.py`](./fp4_indexer_interface.py): public FP4 indexer block-score interface
+- [`q8_indexer_interface.py`](./q8_indexer_interface.py): public Q8KV4/Q8KV8 paged indexer wrappers
 - [`example.py`](./example.py): customer-facing e2e CSR schedule + attention example with NVTX
 - [`sparse_index_utils.py`](./sparse_index_utils.py): public CSR build wrapper and reference helpers
 - [`src/sm100/prepare_k2q_csr.py`](./src/sm100/prepare_k2q_csr.py): SM100 CUDA CSR builder dispatcher
 - [`src/sm100/fp4_indexer.py`](./src/sm100/fp4_indexer.py): SM100 FP4 indexer kernel classes
 - [`test_sparse_atten.py`](./test_sparse_atten.py): interface-level tests, benchmark CLI, and profile entrypoint
 - [`test_fp4_indexer.py`](./test_fp4_indexer.py): FP4 indexer correctness tests and benchmark CLI
+- [`src/sm100/q8kv8_indexer_decode.py`](./src/sm100/q8kv8_indexer_decode.py), [`src/sm100/q8kv8_indexer_prefill.py`](./src/sm100/q8kv8_indexer_prefill.py): Q8KV8 indexer kernels; the Q8KV4 decode kernel and the indexer TopK are csrc JIT modules
+- [`test_q8_indexer.py`](./test_q8_indexer.py): Q8KV4/Q8KV8 indexer correctness tests
 - [`Makefile`](./Makefile): setup, test, benchmark, and profiling shortcuts
 - [`src/sm100/fwd`](./src/sm100/fwd): forward kernels (prefill)
 - [`src/sm100/fwd_decode`](./src/sm100/fwd_decode): forward kernels (paged FP8 decode)
@@ -682,6 +757,9 @@ High-signal files:
 - `D=128` is the only documented and tested head dimension in the current contract.
 - The FP4 indexer currently returns block max scores only; topK selection and
   CSR construction remain caller-owned downstream steps.
+- The Q8KV4/Q8KV8 indexers support one index head per rank, `D=128`, 128-token
+  pages, top-16, and only a forced local page (no forced initial pages); decode
+  requires exactly 8 MTP tokens per request.
 - This repo is not packaged as a pip module yet; it is used directly from the source tree.
 - Paged FP8 decode currently requires `qhead_per_kv=16`, `page_size=128`, and SM100. Other configurations are not supported by the schedule kernel.
 - Paged FP8 decode `batch <= 1024`. The single-CTA schedule kernel stores per-batch state in shared memory; larger batches need a multi-CTA cooperative redesign (planned but not yet implemented).
