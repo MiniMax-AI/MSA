@@ -55,6 +55,9 @@ E2M1_VALUES = (
 )
 DECODE_FORMATS = ("q8kv8", "q8kv4")
 DECODE_WRAPPERS = {"q8kv8": BatchDecodeIndexerQ8KV8Wrapper, "q8kv4": BatchDecodeIndexerQ8KV4Wrapper}
+DECODE_HEADS = {"q8kv8": (1, 2, 4), "q8kv4": (1, 4)}
+DECODE_CASES = [(fmt, num_heads) for fmt in DECODE_FORMATS for num_heads in DECODE_HEADS[fmt]]
+PREFILL_HEADS = (1, 2, 4)
 
 
 @pytest.fixture(autouse=True)
@@ -173,9 +176,11 @@ def _page_scores(q_rows: torch.Tensor, k_pages: torch.Tensor) -> torch.Tensor:
 
 
 def _decode_reference(q: torch.Tensor, k: _PagedK, block_table: torch.Tensor) -> torch.Tensor:
+    """Scores ``[batch, 8 * num_heads, max_pages]`` with rows ``token * num_heads + head``."""
+
     batch, max_pages = block_table.shape
-    q_rows = q.view(batch, MTP, HEAD_DIM).float()
-    output = torch.empty((batch, MTP, max_pages), dtype=torch.float32, device="cuda")
+    q_rows = q.view(batch, MTP * q.shape[1], HEAD_DIM).float()
+    output = torch.empty((batch, q_rows.shape[1], max_pages), dtype=torch.float32, device="cuda")
     page_chunk = 64
     for b in range(batch):
         for begin in range(0, max_pages, page_chunk):
@@ -199,14 +204,21 @@ def _decode_lengths(batch: int, max_pages: int, seed: int) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, device="cuda")
 
 
-def _decode_local_pages(seq_lens: torch.Tensor) -> torch.Tensor:
+def _decode_local_pages(seq_lens: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """Local page of every ``[batch, token * num_heads + head]`` row."""
+
     positions = seq_lens[:, None] - MTP + torch.arange(MTP, dtype=torch.int32, device="cuda")
-    return torch.div(positions, PAGE_SIZE, rounding_mode="floor")
+    local = torch.div(positions, PAGE_SIZE, rounding_mode="floor")
+    return local.repeat_interleave(num_heads, dim=1)
+
+
+def _decode_valid_pages(seq_lens: torch.Tensor, num_heads: int) -> torch.Tensor:
+    return (_decode_local_pages(seq_lens, num_heads) + 1).reshape(-1)
 
 
 def _assert_decode_scores(actual, expected, seq_lens) -> None:
     pages = torch.arange(actual.shape[-1], device="cuda").view(1, 1, -1)
-    scored = pages < _decode_local_pages(seq_lens)[:, :, None]
+    scored = pages < _decode_local_pages(seq_lens, actual.shape[1] // MTP)[:, :, None]
     assert torch.isfinite(actual[scored]).all()
     torch.testing.assert_close(actual[scored], expected[scored], atol=1e-4, rtol=1e-4)
     assert torch.all(actual[~scored] == POISON)
@@ -253,11 +265,20 @@ def _assert_topk_contract(scores: torch.Tensor, lengths: torch.Tensor, topk: tor
 
 
 def _make_decode(
-    fmt, batch, max_pages, seed, *, page_pad=0, q_scale=0.5, k_scale=0.5, seq_lens=None
+    fmt,
+    batch,
+    max_pages,
+    seed,
+    *,
+    num_heads=1,
+    page_pad=0,
+    q_scale=0.5,
+    k_scale=0.5,
+    seq_lens=None,
 ):
     generator = _generator(seed)
     physical_pages = max_pages + 3
-    q = _e4m3((batch * MTP, 1, HEAD_DIM), generator, q_scale)
+    q = _e4m3((batch * MTP, num_heads, HEAD_DIM), generator, q_scale)
     k = _PagedK(fmt, physical_pages, generator, page_pad=page_pad, k_scale=k_scale)
     block_table = _block_table(batch, max_pages, physical_pages, generator)
     if seq_lens is None:
@@ -275,7 +296,7 @@ def _run_decode_scores(wrapper, q, k_cache):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("fmt", DECODE_FORMATS)
+@pytest.mark.parametrize("fmt,num_heads", DECODE_CASES)
 @pytest.mark.parametrize(
     "batch,max_pages,page_pad,q_scale,k_scale",
     [
@@ -287,21 +308,29 @@ def _run_decode_scores(wrapper, q, k_cache):
         (1025, 2, 0, 0.5, 0.5),
     ],
 )
-def test_decode_matches_reference(fmt, batch, max_pages, page_pad, q_scale, k_scale):
+def test_decode_matches_reference(fmt, num_heads, batch, max_pages, page_pad, q_scale, k_scale):
     """Full scores and TopK over irregular lengths, scattered pages, and padded pages."""
 
     seed = 1000 * batch + max_pages
     q, k, block_table, seq_lens = _make_decode(
-        fmt, batch, max_pages, seed, page_pad=page_pad, q_scale=q_scale, k_scale=k_scale
+        fmt,
+        batch,
+        max_pages,
+        seed,
+        num_heads=num_heads,
+        page_pad=page_pad,
+        q_scale=q_scale,
+        k_scale=k_scale,
     )
-    wrapper = DECODE_WRAPPERS[fmt]()
+    wrapper = DECODE_WRAPPERS[fmt](num_heads=num_heads)
     wrapper.plan(block_table, seq_lens)
     wrapper.run(q, k.cache)  # compile outside the timed run
     scores = _timed(f"{fmt}-decode-scores", lambda: _run_decode_scores(wrapper, q, k.cache))
     _assert_decode_scores(scores, _decode_reference(q, k, block_table), seq_lens)
 
     topk = _timed(f"{fmt}-decode-topk", lambda: wrapper.run(q, k.cache).clone())
-    lengths = (_decode_local_pages(seq_lens) + 1).reshape(-1)
+    assert topk.shape == (batch * MTP, num_heads, TOP_K)
+    lengths = _decode_valid_pages(seq_lens, num_heads)
     torch.testing.assert_close(wrapper._num_valid_pages, lengths, atol=0, rtol=0)
     _assert_topk_contract(scores, lengths, topk)
 
@@ -311,8 +340,8 @@ def test_decode_matches_reference(fmt, batch, max_pages, page_pad, q_scale, k_sc
         assert torch.equal(wrapper.run(q, k.cache), topk)
 
 
-@pytest.mark.parametrize("fmt", DECODE_FORMATS)
-def test_decode_long_context_upper_bound(fmt):
+@pytest.mark.parametrize("fmt,num_heads", DECODE_CASES)
+def test_decode_long_context_upper_bound(fmt, num_heads):
     """1M-token rows at the 8192-page table limit next to short rows."""
 
     batch, max_pages = 8, 8192
@@ -321,26 +350,30 @@ def test_decode_long_context_upper_bound(fmt):
         dtype=torch.int32,
         device="cuda",
     )
-    q, k, block_table, seq_lens = _make_decode(fmt, batch, max_pages, 91, seq_lens=seq_lens)
-    wrapper = DECODE_WRAPPERS[fmt]()
+    q, k, block_table, seq_lens = _make_decode(
+        fmt, batch, max_pages, 91, num_heads=num_heads, seq_lens=seq_lens
+    )
+    wrapper = DECODE_WRAPPERS[fmt](num_heads=num_heads)
     wrapper.plan(block_table, seq_lens)
     wrapper.run(q, k.cache)
     scores = _timed(f"{fmt}-decode-1m", lambda: _run_decode_scores(wrapper, q, k.cache))
     _assert_decode_scores(scores, _decode_reference(q, k, block_table), seq_lens)
-    lengths = (_decode_local_pages(seq_lens) + 1).reshape(-1)
+    lengths = _decode_valid_pages(seq_lens, num_heads)
     _assert_topk_contract(scores, lengths, wrapper.run(q, k.cache))
 
 
-@pytest.mark.parametrize("fmt", DECODE_FORMATS)
-def test_decode_boundary_values(fmt):
+@pytest.mark.parametrize("fmt,num_heads", DECODE_CASES)
+def test_decode_boundary_values(fmt, num_heads):
     """All-zero K ties break toward lower pages; saturated E4M3 stays finite."""
 
     batch, max_pages = 4, 40
     seq_lens = torch.full((batch,), max_pages * PAGE_SIZE, dtype=torch.int32, device="cuda")
-    q, k, block_table, seq_lens = _make_decode(fmt, batch, max_pages, 7, seq_lens=seq_lens)
-    wrapper = DECODE_WRAPPERS[fmt]()
+    q, k, block_table, seq_lens = _make_decode(
+        fmt, batch, max_pages, 7, num_heads=num_heads, seq_lens=seq_lens
+    )
+    wrapper = DECODE_WRAPPERS[fmt](num_heads=num_heads)
     wrapper.plan(block_table, seq_lens)
-    lengths = (_decode_local_pages(seq_lens) + 1).reshape(-1)
+    lengths = _decode_valid_pages(seq_lens, num_heads)
 
     pages = k.cache.shape[0]
     if fmt == "q8kv8":
@@ -381,32 +414,39 @@ def test_decode_boundary_values(fmt):
     _assert_topk_contract(scores, lengths, wrapper.run(q, k.cache))
 
 
-@pytest.mark.parametrize("fmt", DECODE_FORMATS)
-def test_decode_plan_reuse_and_replan(fmt):
+@pytest.mark.parametrize("fmt,num_heads", DECODE_CASES)
+def test_decode_plan_reuse_and_replan(fmt, num_heads):
     """One plan serves several layers; replanning picks up new lengths and pages."""
 
     batch, max_pages = 129, 5
-    wrapper = DECODE_WRAPPERS[fmt]()
+    wrapper_class = DECODE_WRAPPERS[fmt]
+    workspace = torch.empty(
+        wrapper_class.workspace_size(batch, num_heads=num_heads), dtype=torch.uint8, device="cuda"
+    )
+    wrapper = wrapper_class(workspace, num_heads=num_heads)
     for plan_seed in (11, 12):
         _, _, block_table, seq_lens = _make_decode(fmt, batch, max_pages, plan_seed)
         wrapper.plan(block_table, seq_lens)
         for layer_seed in (21, 22):
-            q, k, _, _ = _make_decode(fmt, batch, max_pages, layer_seed * plan_seed)
+            q, k, _, _ = _make_decode(
+                fmt, batch, max_pages, layer_seed * plan_seed, num_heads=num_heads
+            )
             scores = _run_decode_scores(wrapper, q, k.cache)
             _assert_decode_scores(scores, _decode_reference(q, k, block_table), seq_lens)
 
 
-@pytest.mark.parametrize("fmt", DECODE_FORMATS)
-def test_decode_cuda_graph_replay_and_replan(fmt):
+@pytest.mark.parametrize("fmt,num_heads", DECODE_CASES)
+def test_decode_cuda_graph_replay_and_replan(fmt, num_heads):
     batch, max_pages = 64, 6
-    q, k, block_table, seq_lens = _make_decode(fmt, batch, max_pages, 31)
+    q, k, block_table, seq_lens = _make_decode(fmt, batch, max_pages, 31, num_heads=num_heads)
     wrapper = DECODE_WRAPPERS[fmt](
+        num_heads=num_heads,
         use_cuda_graph=True,
         block_table_buffer=torch.empty_like(block_table),
         seq_lens_buffer=torch.empty_like(seq_lens),
     )
     wrapper.plan(block_table, seq_lens)
-    out = torch.empty((batch * MTP, 1, TOP_K), dtype=torch.int32, device="cuda")
+    out = torch.empty((batch * MTP, num_heads, TOP_K), dtype=torch.int32, device="cuda")
     wrapper.run(q, k.cache, out=out)
     expected = out.clone()
 
@@ -426,16 +466,16 @@ def test_decode_cuda_graph_replay_and_replan(fmt):
     graph.replay()
     torch.cuda.synchronize()
     _assert_decode_scores(wrapper._scores, _decode_reference(q, k, next_table), next_lens)
-    lengths = (_decode_local_pages(next_lens) + 1).reshape(-1)
+    lengths = _decode_valid_pages(next_lens, num_heads)
     _assert_topk_contract(wrapper._scores, lengths, out)
 
 
-@pytest.mark.parametrize("fmt", DECODE_FORMATS)
-def test_decode_concurrent_streams_do_not_alias(fmt):
+@pytest.mark.parametrize("fmt,num_heads", DECODE_CASES)
+def test_decode_concurrent_streams_do_not_alias(fmt, num_heads):
     """Independent wrappers on two streams match their serial results."""
 
-    inputs = [_make_decode(fmt, 96, 7, seed) for seed in (41, 42)]
-    wrappers = [DECODE_WRAPPERS[fmt]() for _ in inputs]
+    inputs = [_make_decode(fmt, 96, 7, seed, num_heads=num_heads) for seed in (41, 42)]
+    wrappers = [DECODE_WRAPPERS[fmt](num_heads=num_heads) for _ in inputs]
     serial = []
     for wrapper, (q, k, block_table, seq_lens) in zip(wrappers, inputs, strict=True):
         wrapper.plan(block_table, seq_lens)
@@ -455,13 +495,15 @@ def test_decode_concurrent_streams_do_not_alias(fmt):
 
 
 def test_decode_compile_is_shape_independent_and_workspace_is_released():
-    """Batch, page-table width, and lengths reuse one compiled kernel per format."""
+    """Batch, page-table width, and lengths reuse one compiled kernel per format and heads."""
 
     baseline_keys = None
     for batch, max_pages in ((3, 2), (77, 9), (300, 4)):
-        for fmt in DECODE_FORMATS:
-            q, k, block_table, seq_lens = _make_decode(fmt, batch, max_pages, batch)
-            wrapper = DECODE_WRAPPERS[fmt]()
+        for fmt, num_heads in DECODE_CASES:
+            q, k, block_table, seq_lens = _make_decode(
+                fmt, batch, max_pages, batch, num_heads=num_heads
+            )
+            wrapper = DECODE_WRAPPERS[fmt](num_heads=num_heads)
             wrapper.plan(block_table, seq_lens)
             wrapper.run(q, k.cache)
             del wrapper
@@ -493,28 +535,30 @@ def _int32_misaligned_copy(tensor: torch.Tensor) -> torch.Tensor:
     return view
 
 
-@pytest.mark.parametrize("phase", ("q8kv8-decode", "q8kv4-decode", "prefill"))
-def test_metadata_slices_need_only_int32_alignment(phase):
+@pytest.mark.parametrize(
+    "phase,num_heads", [*((f"{fmt}-decode", h) for fmt, h in DECODE_CASES), ("prefill", 4)]
+)
+def test_metadata_slices_need_only_int32_alignment(phase, num_heads):
     if phase == "prefill":
-        inputs = _make_prefill([300, 1, 700], [0, 1000, 130], seed=17)
+        inputs = _make_prefill([300, 1, 700], [0, 1000, 130], seed=17, num_heads=num_heads)
         metadata = ("cu_seqlens_q", "seq_lens", "block_table")
         results = []
         for shifted in (
             inputs,
             {**inputs, **{n: _int32_misaligned_copy(inputs[n]) for n in metadata}},
         ):
-            wrapper = BatchPrefillIndexerQ8KV8Wrapper()
+            wrapper = BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
             _plan_prefill(wrapper, shifted)
             results.append(wrapper.run(shifted["q"], shifted["k"].cache).clone())
     else:
         fmt = phase.split("-")[0]
-        q, k, block_table, seq_lens = _make_decode(fmt, 37, 5, 13)
+        q, k, block_table, seq_lens = _make_decode(fmt, 37, 5, 13, num_heads=num_heads)
         results = []
         for table, lens in (
             (block_table, seq_lens),
             tuple(map(_int32_misaligned_copy, (block_table, seq_lens))),
         ):
-            wrapper = DECODE_WRAPPERS[fmt]()
+            wrapper = DECODE_WRAPPERS[fmt](num_heads=num_heads)
             wrapper.plan(table, lens)
             results.append(wrapper.run(q, k.cache).clone())
     assert torch.equal(results[0], results[1])
@@ -574,9 +618,16 @@ def test_decode_rejects_invalid_inputs(fmt):
         wrapper.plan(torch.zeros((4, 8193), dtype=torch.int32, device="cuda"), seq_lens)
     with pytest.raises(ValueError, match="use_cuda_graph"):
         DECODE_WRAPPERS[fmt](block_table_buffer=block_table)
+    for num_heads in (0, 3, 8, *({1, 2, 4} - set(DECODE_HEADS[fmt]))):
+        with pytest.raises(ValueError, match="num_heads must be one of"):
+            DECODE_WRAPPERS[fmt](num_heads=num_heads)
+        with pytest.raises(ValueError, match="num_heads must be one of"):
+            DECODE_WRAPPERS[fmt].workspace_size(4, num_heads=num_heads)
     wrapper.plan(block_table, seq_lens)
     with pytest.raises(ValueError, match="q must have shape"):
         wrapper.run(q.view(4, MTP, HEAD_DIM), k.cache)
+    with pytest.raises(ValueError, match="q must have shape"):
+        wrapper.run(q.expand(-1, 4, -1).contiguous(), k.cache)
     with pytest.raises(TypeError, match="q must have dtype"):
         wrapper.run(q.to(torch.bfloat16), k.cache)
     with pytest.raises(ValueError, match="k_cache must have shape"):
@@ -605,7 +656,9 @@ PREFILL_CASES = {
 }
 
 
-def _make_prefill(query_lens, prefix_lens, seed, *, page_pad=0, q_scale=0.25, k_scale=0.25):
+def _make_prefill(
+    query_lens, prefix_lens, seed, *, num_heads=1, page_pad=0, q_scale=0.25, k_scale=0.25
+):
     generator = _generator(seed)
     batch = len(query_lens)
     seq_lens_list = [q + p for q, p in zip(query_lens, prefix_lens, strict=True)]
@@ -614,7 +667,7 @@ def _make_prefill(query_lens, prefix_lens, seed, *, page_pad=0, q_scale=0.25, k_
     k = _PagedK("q8kv8", physical_pages, generator, page_pad=page_pad, k_scale=k_scale)
     total_q = sum(query_lens)
     return {
-        "q": _e4m3((total_q, 1, HEAD_DIM), generator, q_scale),
+        "q": _e4m3((total_q, num_heads, HEAD_DIM), generator, q_scale),
         "k": k,
         "block_table": _block_table(batch, max_pages, physical_pages, generator),
         "cu_seqlens_q": torch.tensor(np.cumsum([0, *query_lens]), dtype=torch.int32, device="cuda"),
@@ -639,27 +692,32 @@ def _plan_prefill(wrapper, inputs):
 
 
 def _prefill_lengths(inputs) -> torch.Tensor:
+    """Candidate pages of every ``token * num_heads + head`` row."""
+
     values = [
         (prefix + i) // PAGE_SIZE + 1
         for q_len, prefix in zip(inputs["query_lens"], inputs["prefix_lens"], strict=True)
         for i in range(q_len)
     ]
-    return torch.tensor(values, dtype=torch.int32, device="cuda")
+    lengths = torch.tensor(values, dtype=torch.int32, device="cuda")
+    return lengths.repeat_interleave(inputs["q"].shape[1])
 
 
 def _prefill_reference(inputs, max_pages: int) -> torch.Tensor:
     """Historical-page scores with NaN at the local page and beyond."""
 
-    output = torch.full((inputs["total_q"], max_pages), float("nan"), device="cuda")
+    num_heads = inputs["q"].shape[1]
+    q_flat = inputs["q"].reshape(-1, HEAD_DIM)
+    output = torch.full((q_flat.shape[0], max_pages), float("nan"), device="cuda")
     lengths = _prefill_lengths(inputs)
-    offsets = inputs["cu_seqlens_q"].tolist()
+    offsets = [offset * num_heads for offset in inputs["cu_seqlens_q"].tolist()]
     k = inputs["k"].dequantized
     row_chunk, page_chunk = 1024, 64
     for b in range(len(inputs["query_lens"])):
         for row in range(offsets[b], offsets[b + 1], row_chunk):
             rows = slice(row, min(row + row_chunk, offsets[b + 1]))
             history = int(lengths[rows].max()) - 1
-            q_rows = inputs["q"][rows, 0].float()
+            q_rows = q_flat[rows].float()
             for page in range(0, history, page_chunk):
                 cols = slice(page, min(page + page_chunk, history))
                 pages = inputs["block_table"][b, cols].long()
@@ -676,13 +734,18 @@ def _run_prefill_scores(wrapper, q, k_cache):
     return wrapper._run_scores(q, k_cache)
 
 
+@pytest.mark.parametrize("num_heads", PREFILL_HEADS)
 @pytest.mark.parametrize("case", sorted(PREFILL_CASES))
-def test_prefill_matches_reference(case):
+def test_prefill_matches_reference(case, num_heads):
     query_lens, prefix_lens = PREFILL_CASES[case]
     inputs = _make_prefill(
-        query_lens, prefix_lens, seed=len(case) * 7919, page_pad=256 if "prefix" in case else 0
+        query_lens,
+        prefix_lens,
+        seed=len(case) * 7919,
+        num_heads=num_heads,
+        page_pad=256 if "prefix" in case else 0,
     )
-    wrapper = BatchPrefillIndexerQ8KV8Wrapper()
+    wrapper = BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
     _plan_prefill(wrapper, inputs)
     q, k_cache = inputs["q"], inputs["k"].cache
     wrapper.run(q, k_cache)
@@ -698,6 +761,7 @@ def test_prefill_matches_reference(case):
     torch.testing.assert_close(scores, expected, atol=2e-4, rtol=2e-4, equal_nan=True)
 
     topk = _timed(f"prefill-{case}-topk", lambda: wrapper.run(q, k_cache).clone())
+    assert topk.shape == (inputs["total_q"], num_heads, TOP_K)
     _assert_topk_contract(scores, lengths, topk)
     for _ in range(2):
         repeated = _run_prefill_scores(wrapper, q, k_cache)
@@ -705,12 +769,13 @@ def test_prefill_matches_reference(case):
         assert torch.equal(wrapper.run(q, k_cache), topk)
 
 
-def test_prefill_plan_reuse_replan_and_cuda_graph():
+@pytest.mark.parametrize("num_heads", (1, 4))
+def test_prefill_plan_reuse_replan_and_cuda_graph(num_heads):
     query_lens, prefix_lens = [300, 45, 900], [100, 2000, 0]
-    inputs = _make_prefill(query_lens, prefix_lens, seed=5)
-    wrapper = BatchPrefillIndexerQ8KV8Wrapper()
+    inputs = _make_prefill(query_lens, prefix_lens, seed=5, num_heads=num_heads)
+    wrapper = BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
     _plan_prefill(wrapper, inputs)
-    layer = _make_prefill(query_lens, prefix_lens, seed=6)
+    layer = _make_prefill(query_lens, prefix_lens, seed=6, num_heads=num_heads)
     for q, k in ((inputs["q"], inputs["k"]), (layer["q"], layer["k"])):
         scores = _run_prefill_scores(wrapper, q, k.cache)
         expected = _prefill_reference({**inputs, "q": q, "k": k}, scores.shape[1])
@@ -725,7 +790,7 @@ def test_prefill_plan_reuse_replan_and_cuda_graph():
         scores, _prefill_reference(inputs, scores.shape[1]), atol=2e-4, rtol=2e-4, equal_nan=True
     )
 
-    out = torch.empty((inputs["total_q"], 1, TOP_K), dtype=torch.int32, device="cuda")
+    out = torch.empty((inputs["total_q"], num_heads, TOP_K), dtype=torch.int32, device="cuda")
     wrapper.run(inputs["q"], inputs["k"].cache, out=out)
     expected = out.clone()
     expected_scores = wrapper._state.scores.nan_to_num(POISON)
@@ -733,7 +798,7 @@ def test_prefill_plan_reuse_replan_and_cuda_graph():
     with torch.cuda.graph(graph):
         wrapper.run(inputs["q"], inputs["k"].cache, out=out)
         with pytest.raises(RuntimeError, match=r"plan\(\) must be called outside"):
-            _plan_prefill(BatchPrefillIndexerQ8KV8Wrapper(), inputs)
+            _plan_prefill(BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads), inputs)
     # Poison both stages so the replay must rerun the score kernel and the TopK.
     wrapper._state.scores.fill_(float("nan"))
     out.fill_(-777)
@@ -752,10 +817,13 @@ def test_prefill_compile_is_shape_independent():
         ([700, 3, 90], [128, 0, 4000]),
         ([1] * 33, list(range(33))),
     ):
-        inputs = _make_prefill(query_lens, prefix_lens, seed=sum(query_lens))
-        wrapper = BatchPrefillIndexerQ8KV8Wrapper()
-        _plan_prefill(wrapper, inputs)
-        wrapper.run(inputs["q"], inputs["k"].cache)
+        for num_heads in PREFILL_HEADS:
+            inputs = _make_prefill(
+                query_lens, prefix_lens, seed=sum(query_lens), num_heads=num_heads
+            )
+            wrapper = BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
+            _plan_prefill(wrapper, inputs)
+            wrapper.run(inputs["q"], inputs["k"].cache)
         current = set(q8_indexer_interface._COMPILE_CACHE)
         keys = current if keys is None else keys
         assert current == keys
@@ -763,6 +831,9 @@ def test_prefill_compile_is_shape_independent():
 
 def test_prefill_rejects_invalid_inputs():
     inputs = _make_prefill([10, 20], [0, 100], seed=9)
+    for num_heads in (0, 3, 8):
+        with pytest.raises(ValueError, match="num_heads must be one of"):
+            BatchPrefillIndexerQ8KV8Wrapper(num_heads=num_heads)
     wrapper = BatchPrefillIndexerQ8KV8Wrapper()
     with pytest.raises(RuntimeError, match=r"plan\(\) must be called before"):
         wrapper.run(inputs["q"], inputs["k"].cache)
@@ -796,6 +867,8 @@ def test_prefill_rejects_invalid_inputs():
     _plan_prefill(wrapper, inputs)
     with pytest.raises(ValueError, match="q must have shape"):
         wrapper.run(inputs["q"][:-1], inputs["k"].cache)
+    with pytest.raises(ValueError, match="q must have shape"):
+        wrapper.run(inputs["q"].expand(-1, 2, -1).contiguous(), inputs["k"].cache)
     with pytest.raises(TypeError, match="k_cache must have dtype"):
         wrapper.run(inputs["q"], inputs["k"].cache.view(torch.uint8))
 

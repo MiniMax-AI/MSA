@@ -416,34 +416,36 @@ mapping is intentionally not recorded in the open-source tree. Command:
 
 [`q8_indexer_interface.py`](./q8_indexer_interface.py) scores the historical
 128-token pages of every query with an FP8 e4m3 Q and returns 16 logical page
-indices per query. The inputs are the MiniMax-M3 vLLM index-K cache and
-metadata with one index head per rank, so no cache conversion is needed.
+indices per query and index head. The inputs are the vLLM index-K cache and
+metadata, so no cache conversion is needed. All index heads of a
+rank share the single index-K head; one launch scores every head, and each head
+selects its own pages.
 
-| Wrapper | Phase | K cache |
-|---|---|---|
-| `BatchDecodeIndexerQ8KV4Wrapper` | Decode, 8 MTP tokens per request | NVFP4, `[num_blocks, 128, 72]` uint8 |
-| `BatchDecodeIndexerQ8KV8Wrapper` | Decode, 8 MTP tokens per request | FP8 e4m3, `[num_blocks, 128, 128]` |
-| `BatchPrefillIndexerQ8KV8Wrapper` | Varlen prefill, bottom-right causal | FP8 e4m3, `[num_blocks, 128, 128]` |
+| Wrapper | Phase | K cache | `num_heads` |
+|---|---|---|---|
+| `BatchDecodeIndexerQ8KV4Wrapper` | Decode, 8 MTP tokens per request | NVFP4, `[num_blocks, 128, 72]` uint8 | 1 or 4 |
+| `BatchDecodeIndexerQ8KV8Wrapper` | Decode, 8 MTP tokens per request | FP8 e4m3, `[num_blocks, 128, 128]` | 1, 2, or 4 |
+| `BatchPrefillIndexerQ8KV8Wrapper` | Varlen prefill, bottom-right causal | FP8 e4m3, `[num_blocks, 128, 128]` | 1, 2, or 4 |
 
 ```python
 from fmha_sm100 import BatchDecodeIndexerQ8KV4Wrapper, BatchPrefillIndexerQ8KV8Wrapper
 
-decode = BatchDecodeIndexerQ8KV4Wrapper()
+decode = BatchDecodeIndexerQ8KV4Wrapper(num_heads=4)
 decode.plan(block_table, seq_lens)                   # once per step, outside CUDA Graph capture
-topk_indices = decode.run(index_q, index_k_cache)    # per layer; [batch * 8, 1, 16] int32
+topk_indices = decode.run(index_q, index_k_cache)    # per layer; [batch * 8, 4, 16] int32
 
-prefill = BatchPrefillIndexerQ8KV8Wrapper()
+prefill = BatchPrefillIndexerQ8KV8Wrapper(num_heads=4)
 prefill.plan(
     cu_seqlens_q, seq_lens, block_table,
     total_q=total_q, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
 )
-topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 1, 16] int32
+topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 4, 16] int32
 ```
 
 ### Q8KV Input And Output Contract
 
-- `index_q`: `[num_tokens, 1, 128]`, `torch.float8_e4m3fn`, contiguous. Decode
-  tokens are grouped per request, eight MTP tokens each.
+- `index_q`: `[num_tokens, num_heads, 128]`, `torch.float8_e4m3fn`,
+  contiguous. Decode tokens are grouped per request, eight MTP tokens each.
 - FP8 `index_k_cache`: `[num_blocks, 128, 128]`, `torch.float8_e4m3fn`.
 - NVFP4 `index_k_cache`: `[num_blocks, 128, 72]`, `torch.uint8`. Each page
   stores the packed E2M1 values of its 128 tokens first (64 bytes per token,
@@ -462,9 +464,10 @@ topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 1, 16] int32
 - `cu_seqlens_q` (prefill): `[batch + 1]`, CUDA `torch.int32`, starting at 0.
   `total_q`, `max_seqlen_q`, and `max_seqlen_k` are host upper bounds used to
   size buffers; `max_seqlen_k >= max_seqlen_q`.
-- Output: `[num_tokens, 1, 16]`, `torch.int32` logical page indices. The first
-  15 slots are the highest-scoring historical pages, score-descending with ties
-  toward the lower page; the last slot is the query's local page. A query with
+- Output: `[num_tokens, num_heads, 16]`, `torch.int32` logical page indices,
+  selected per token and head. The first 15 slots are the highest-scoring
+  historical pages, score-descending with ties toward the lower page; the last
+  slot is the query's local page. A query with
   `n <= 16` candidate pages gets `0 .. n - 1` followed by `-1`, so the last
   valid entry is always the local page. Scores are ranked with 16-bit keys
   quantized over each row's score range.
@@ -478,7 +481,9 @@ topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 1, 16] int32
   `run()` when capturing. Prefill supports `replan()` after in-place metadata
   updates and must be warmed up before capture.
 - Batch size, page counts, and lengths never trigger recompilation.
-- The Q8KV4 kernel uses the public QMUL4 instruction when built with CUDA
+- A caller-owned decode `workspace_buffer` needs at least
+  `workspace_size(batch_size, num_heads=num_heads)` bytes.
+- The Q8KV4 kernels use the public QMUL4 instruction when built with CUDA
   13.4 or newer and otherwise the exact FP16 dequantization path; both give
   identical results.
 - A wrapper owns its workspace and output buffers; use one wrapper per
@@ -748,7 +753,8 @@ High-signal files:
 - [`src/sm100/fp4_indexer.py`](./src/sm100/fp4_indexer.py): SM100 FP4 indexer kernel classes
 - [`test_sparse_atten.py`](./test_sparse_atten.py): interface-level tests, benchmark CLI, and profile entrypoint
 - [`test_fp4_indexer.py`](./test_fp4_indexer.py): FP4 indexer correctness tests and benchmark CLI
-- [`src/sm100/q8kv8_indexer_decode.py`](./src/sm100/q8kv8_indexer_decode.py), [`src/sm100/q8kv8_indexer_prefill.py`](./src/sm100/q8kv8_indexer_prefill.py): Q8KV8 indexer kernels; the Q8KV4 decode kernel and the indexer TopK are csrc JIT modules
+- [`src/sm100/q8kv8_indexer_decode.py`](./src/sm100/q8kv8_indexer_decode.py), [`src/sm100/q8kv8_indexer_prefill.py`](./src/sm100/q8kv8_indexer_prefill.py): Q8KV8 indexer kernels
+- [`src/sm100/q8kv4_indexer_decode.py`](./src/sm100/q8kv4_indexer_decode.py): four-head Q8KV4 decode kernel; the one-head Q8KV4 decode kernel and the indexer TopK are csrc JIT modules
 - [`test_q8_indexer.py`](./test_q8_indexer.py): Q8KV4/Q8KV8 indexer correctness tests
 - [`Makefile`](./Makefile): setup, test, benchmark, and profiling shortcuts
 - [`src/sm100/fwd`](./src/sm100/fwd): forward kernels (prefill)
@@ -760,9 +766,10 @@ High-signal files:
 - `D=128` is the only documented and tested head dimension in the current contract.
 - The FP4 indexer currently returns block max scores only; topK selection and
   CSR construction remain caller-owned downstream steps.
-- The Q8KV4/Q8KV8 indexers support one index head per rank, `D=128`, 128-token
-  pages, top-16, and only a forced local page (no forced initial pages); decode
-  requires exactly 8 MTP tokens per request.
+- The Q8KV4/Q8KV8 indexers support 1, 2, or 4 index heads per rank (Q8KV4
+  decode: 1 or 4), `D=128`, 128-token pages, top-16, and only a forced local
+  page (no forced initial pages); decode requires exactly 8 MTP tokens per
+  request.
 - This repo is not packaged as a pip module yet; it is used directly from the source tree.
 - Paged FP8 decode currently requires `qhead_per_kv=16`, `page_size=128`, and SM100. Other configurations are not supported by the schedule kernel.
 - Paged FP8 decode `batch <= 1024`. The single-CTA schedule kernel stores per-batch state in shared memory; larger batches need a multi-CTA cooperative redesign (planned but not yet implemented).

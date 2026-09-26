@@ -23,7 +23,11 @@ class NamedBarrierIndexerSm100(enum.IntEnum):
 
 
 class Q8KV8PrefillIndexerSm100:
-    """Compute raw FP32 historical-page maxima with native FP8 UMMA."""
+    """Compute raw FP32 historical-page maxima with native FP8 UMMA.
+
+    Q rows are ``token * num_heads + head``: all index heads share the single
+    K head, so heads simply extend the Q (M) dimension of every task.
+    """
 
     supported_compute_capabilities = frozenset({(10, 0), (10, 3)})
     head_dim = 128
@@ -82,6 +86,7 @@ class Q8KV8PrefillIndexerSm100:
         mScores: cute.Tensor,
         mTaskDescriptors: cute.Tensor,
         mTaskCounts: cute.Tensor,
+        num_heads: cutlass.Int32,
         stream: cuda.CUstream = None,
     ):
         """Build descriptors and launch the 2-CTA kernel."""
@@ -163,6 +168,7 @@ class Q8KV8PrefillIndexerSm100:
             mScores,
             mTaskDescriptors,
             mTaskCounts,
+            num_heads,
         ).launch(
             grid=(
                 self.num_persistent_clusters * self.cta_group_size,
@@ -247,6 +253,7 @@ class Q8KV8PrefillIndexerSm100:
         mScores: cute.Tensor,
         mTaskDescriptors: cute.Tensor,
         mTaskCounts: cute.Tensor,
+        num_heads: cutlass.Int32,
     ) -> None:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -437,7 +444,7 @@ class Q8KV8PrefillIndexerSm100:
                     q_global = q_global_begin + row_m
                     q_valid = row_m < q_rows
                     local_block = (
-                        q_position_begin + row_m
+                        q_position_begin + row_m // num_heads
                     ) >> cutlass.Int32(7)
                     local_start = tile_worker_idx ^ (
                         tile_base & cutlass.Int32(1)

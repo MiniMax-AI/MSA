@@ -26,15 +26,20 @@ class _NamedBarrier(enum.IntEnum):
 
 
 class Q8KV8DecodeIndexerSm100:
-    """Compute direct-E4M3 page scores with balanced persistent workers."""
+    """Compute direct-E4M3 page scores with balanced persistent workers.
 
+    Every index head shares the single K head, so the eight MTP tokens of all
+    ``num_heads`` heads form one MMA N tile of ``8 * num_heads`` query columns
+    (``token * num_heads + head``) and each K page is loaded once per request.
+    """
+
+    supported_num_heads = (1, 2, 4)
     query_length = 8
     page_size = 128
     head_dim = 128
     k_chunk = head_dim
     chunks_per_page = head_dim // k_chunk
     m_tile = page_size
-    n_tile = query_length
     k_stages = 6
     q_stages = chunks_per_page
     acc_stages = 4
@@ -46,10 +51,15 @@ class Q8KV8DecodeIndexerSm100:
     tmem_copy_threads = 128
     target_ctas_per_sm = 2
 
-    def __init__(self, *, sm_count: int) -> None:
+    def __init__(self, *, sm_count: int, num_heads: int) -> None:
         if sm_count <= 0:
             raise ValueError("sm_count must be positive")
+        if num_heads not in self.supported_num_heads:
+            raise ValueError(f"num_heads must be one of {self.supported_num_heads}")
         self.grid_ctas = sm_count * self.target_ctas_per_sm
+        self.num_heads = num_heads
+        self.num_queries = self.query_length * num_heads
+        self.n_tile = self.num_queries
 
     @cute.jit
     def __call__(
@@ -83,8 +93,8 @@ class Q8KV8DecodeIndexerSm100:
         mQ_nkb = cute.make_tensor(
             mQ.iterator,
             cute.make_layout(
-                (self.query_length, self.head_dim, batch_size),
-                stride=(self.head_dim, 1, self.query_length * self.head_dim),
+                (self.num_queries, self.head_dim, batch_size),
+                stride=(self.head_dim, 1, self.num_queries * self.head_dim),
             ),
         )
         mQ_kcr = cute.make_tensor(
@@ -93,7 +103,7 @@ class Q8KV8DecodeIndexerSm100:
                 (
                     self.k_chunk,
                     self.chunks_per_page,
-                    self.query_length * batch_size,
+                    self.num_queries * batch_size,
                 ),
                 stride=(1, self.k_chunk, self.head_dim),
             ),
@@ -154,11 +164,11 @@ class Q8KV8DecodeIndexerSm100:
                 (
                     self.k_chunk,
                     self.chunks_per_page,
-                    self.query_length,
+                    self.num_queries,
                 ),
                 stride=(
                     1,
-                    self.query_length * self.k_chunk,
+                    self.num_queries * self.k_chunk,
                     self.k_chunk,
                 ),
             ),
@@ -178,7 +188,7 @@ class Q8KV8DecodeIndexerSm100:
             (
                 self.k_chunk,
                 self.chunks_per_page,
-                self.query_length,
+                self.num_queries,
             ),
         )
 
@@ -286,8 +296,8 @@ class Q8KV8DecodeIndexerSm100:
         sPartialMax = smem.allocate_tensor(
             element_type=Float32,
             layout=cute.make_layout(
-                (2, self.score_warps, self.query_length),
-                stride=(self.score_warps * self.query_length, self.query_length, 1),
+                (2, self.score_warps, self.num_queries),
+                stride=(self.score_warps * self.num_queries, self.num_queries, 1),
             ),
             byte_alignment=16,
         )
@@ -304,7 +314,7 @@ class Q8KV8DecodeIndexerSm100:
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
         )
-        tmem.allocate(32)
+        tmem.allocate(self.acc_stages * self.num_queries)
 
         k_producer, k_consumer = pipeline.PipelineTmaUmma.create(
             num_stages=self.k_stages,
@@ -318,7 +328,7 @@ class Q8KV8DecodeIndexerSm100:
             num_stages=1,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            tx_count=self.query_length * self.head_dim,
+            tx_count=self.num_queries * self.head_dim,
             barrier_storage=storage.q_mbar_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
@@ -347,7 +357,7 @@ class Q8KV8DecodeIndexerSm100:
             (
                 self.k_chunk,
                 self.chunks_per_page,
-                self.query_length,
+                self.num_queries,
             ),
         )
         tQsQ, tQgQ = cpasync.tma_partition(
@@ -369,7 +379,7 @@ class Q8KV8DecodeIndexerSm100:
         tCtAcc_staged = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x8),
+            tcgen05.Ld32x32bOp(getattr(tcgen05.Repetition, f"x{self.num_queries}")),
             Float32,
         )
         tmem_tiled_copy = tcgen05.make_tmem_copy(
@@ -497,7 +507,7 @@ class Q8KV8DecodeIndexerSm100:
             score_warp_idx = warp_idx - Int32(self.score_warp_begin)
             rScoresFlat = cute.make_tensor(
                 rScores.iterator,
-                cute.make_layout(self.query_length),
+                cute.make_layout(self.num_queries),
             )
             current_batch = batch_idx
             logical_page = logical_page_begin
@@ -507,10 +517,12 @@ class Q8KV8DecodeIndexerSm100:
             if (
                 num_pages > Int32(0)
                 and score_warp_idx == Int32(0)
-                and lane_idx < Int32(self.query_length)
+                and lane_idx < Int32(self.num_queries)
             ):
                 seq_len = mSeqLens[current_batch]
-                query_position = seq_len - Int32(self.query_length) + lane_idx
+                query_position = (
+                    seq_len - Int32(self.query_length) + lane_idx // Int32(self.num_heads)
+                )
                 local_block = query_position // Int32(self.page_size)
             while pages_remaining > Int32(0):
                 segment_pages = mScheduler[current_batch + 1] - global_page
@@ -527,7 +539,7 @@ class Q8KV8DecodeIndexerSm100:
                         rScores,
                     )
                     cute.arch.fence_view_async_tmem_load()
-                    for query_idx in cutlass.range_constexpr(self.query_length):
+                    for query_idx in cutlass.range_constexpr(self.num_queries):
                         partial_max = cute.arch.warp_redux_sync(
                             rScoresFlat[query_idx],
                             "fmax",
@@ -542,7 +554,7 @@ class Q8KV8DecodeIndexerSm100:
                     score_barrier.arrive_and_wait()
 
                     if score_warp_idx == Int32(0) and lane_idx < Int32(
-                        self.query_length
+                        self.num_queries
                     ):
                         query_idx = lane_idx
                         row_max = -Float32.inf
@@ -573,11 +585,13 @@ class Q8KV8DecodeIndexerSm100:
                     current_batch += Int32(1)
                     logical_page = global_page - mScheduler[current_batch]
                 if score_warp_idx == Int32(0) and lane_idx < Int32(
-                    self.query_length
+                    self.num_queries
                 ):
                     seq_len = mSeqLens[current_batch]
                     query_position = (
-                        seq_len - Int32(self.query_length) + lane_idx
+                        seq_len
+                        - Int32(self.query_length)
+                        + lane_idx // Int32(self.num_heads)
                     )
                     local_block = query_position // Int32(self.page_size)
 

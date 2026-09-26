@@ -7,10 +7,12 @@ Each wrapper scores the historical 128-token pages of every query with an E4M3
 Q and selects 16 logical pages: 15 ranked by score plus the query's local page,
 which is always the final valid entry.
 
-Tensors follow the vLLM MiniMax-M3 indexer layout with one index head:
+Tensors follow the vLLM indexer layout. All ``num_heads`` index heads (1, 2,
+or 4 per rank) share the single index-K head and each head selects its own
+pages:
 
-* ``q``: ``[num_tokens, 1, 128]`` E4M3, token-major (decode tokens are grouped
-  per request, eight MTP tokens each).
+* ``q``: ``[num_tokens, num_heads, 128]`` E4M3, token-major (decode tokens are
+  grouped per request, eight MTP tokens each).
 * Q8KV8 ``k_cache``: ``[num_blocks, 128, 128]`` E4M3.
 * Q8KV4 ``k_cache``: ``[num_blocks, 128, 72]`` uint8. Each page stores the packed
   E2M1 values of all 128 tokens (8192 bytes, 64 bytes per token, the low nibble
@@ -18,7 +20,7 @@ Tensors follow the vLLM MiniMax-M3 indexer layout with one index head:
   ``token * 8 + group``).
 * ``block_table``: ``[batch, max_blocks]`` int32 logical-to-physical page map;
   ``seq_lens``: ``[batch]`` int32 KV lengths including the current queries.
-* Output: ``[num_tokens, 1, 16]`` int32 logical page indices.
+* Output: ``[num_tokens, num_heads, 16]`` int32 logical page indices.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack
 
 from src.common.aot_cache import save_aot, try_load_aot
+from src.sm100.q8kv4_indexer_decode import Q8KV4DecodeIndexerSm100
 from src.sm100.q8kv8_indexer_decode import Q8KV8DecodeIndexerSm100
 from src.sm100.q8kv8_indexer_prefill import Q8KV8PrefillIndexerSm100
 from src.sm100.q8kv8_indexer_prefill_plan import (
@@ -50,6 +53,7 @@ _PAGE_SIZE = 128
 _HEAD_DIM = 128
 _TOP_K = 16
 _DECODE_QUERY_LENGTH = 8
+_SUPPORTED_NUM_HEADS = (1, 2, 4)
 _MAXIMUM_PAGES = 8192
 _NVFP4_PAGE_BYTES = _PAGE_SIZE * _HEAD_DIM // 2 + _PAGE_SIZE * _HEAD_DIM // 16
 _NVFP4_PAGE_WIDTH = _NVFP4_PAGE_BYTES // _PAGE_SIZE
@@ -62,6 +66,7 @@ _SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
 # Kernels plus this interface, which fixes the compiled argument alignments.
 _CODEGEN_SOURCES = (
     "q8_indexer_interface.py",
+    "src/sm100/q8kv4_indexer_decode.py",
     "src/sm100/q8kv8_indexer_decode.py",
     "src/sm100/q8kv8_indexer_prefill.py",
     "src/sm100/q8kv8_indexer_prefill_plan.py",
@@ -175,10 +180,17 @@ def _check_block_table(block_table: torch.Tensor, batch: int, device: torch.devi
         raise ValueError(f"block_table max_blocks must be in [1, {_MAXIMUM_PAGES}]")
 
 
-def _check_query(q: torch.Tensor, num_tokens: int, device: torch.device) -> None:
+def _check_num_heads(num_heads: int, supported: tuple[int, ...] = _SUPPORTED_NUM_HEADS) -> int:
+    if num_heads not in supported:
+        raise ValueError(f"num_heads must be one of {supported}, got {num_heads!r}")
+    return num_heads
+
+
+def _check_query(q: torch.Tensor, num_tokens: int, num_heads: int, device: torch.device) -> None:
     _check_cuda_tensor(q, name="q", dtype=torch.float8_e4m3fn, device=device)
-    if tuple(q.shape) != (num_tokens, 1, _HEAD_DIM):
-        raise ValueError(f"q must have shape [{num_tokens}, 1, {_HEAD_DIM}], got {tuple(q.shape)}")
+    expected = (num_tokens, num_heads, _HEAD_DIM)
+    if tuple(q.shape) != expected:
+        raise ValueError(f"q must have shape {list(expected)}, got {tuple(q.shape)}")
     if q.data_ptr() % _TMA_ALIGNMENT != 0:
         raise ValueError(f"q data pointer must be {_TMA_ALIGNMENT}-byte aligned")
 
@@ -207,10 +219,13 @@ def _check_paged_cache(
         raise ValueError(f"k_cache data pointer must be {_TMA_ALIGNMENT}-byte aligned")
 
 
-def _check_topk_output(out: torch.Tensor, num_tokens: int, device: torch.device) -> None:
+def _check_topk_output(
+    out: torch.Tensor, num_tokens: int, num_heads: int, device: torch.device
+) -> None:
     _check_cuda_tensor(out, name="out", dtype=torch.int32, device=device)
-    if tuple(out.shape) != (num_tokens, 1, _TOP_K):
-        raise ValueError(f"out must have shape [{num_tokens}, 1, {_TOP_K}], got {tuple(out.shape)}")
+    expected = (num_tokens, num_heads, _TOP_K)
+    if tuple(out.shape) != expected:
+        raise ValueError(f"out must have shape {list(expected)}, got {tuple(out.shape)}")
 
 
 def _load_indexer_module_from_source_tree(name: str):
@@ -251,19 +266,16 @@ def _topk_select(scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor)
     return out
 
 
-def _decode_num_valid_pages(seq_lens: torch.Tensor, max_pages: int) -> torch.Tensor:
-    """Candidate pages per MTP token, including its local page."""
+def _decode_num_valid_pages(seq_lens: torch.Tensor, max_pages: int, num_heads: int) -> torch.Tensor:
+    """Candidate pages per (MTP token, head) row, including the token's local page."""
 
     query_offsets = torch.arange(
         -_DECODE_QUERY_LENGTH, 0, dtype=torch.int32, device=seq_lens.device
     )
     positions = seq_lens[:, None] + query_offsets[None, :]
-    return (
-        torch.div(positions, _PAGE_SIZE, rounding_mode="floor")
-        .add_(1)
-        .clamp_(min=1, max=max_pages)
-        .reshape(-1)
-    )
+    lengths = torch.div(positions, _PAGE_SIZE, rounding_mode="floor").add_(1)
+    lengths.clamp_(min=1, max=max_pages)
+    return lengths[:, :, None].expand(-1, -1, num_heads).reshape(-1)
 
 
 class _BatchDecodeIndexerBase:
@@ -271,14 +283,17 @@ class _BatchDecodeIndexerBase:
 
     ``seq_lens`` includes the current eight MTP tokens, so query ``i`` of
     request ``b`` sits at position ``seq_lens[b] - 8 + i`` and its local page is
-    that position divided by 128. A wrapper instance owns its workspace and
-    buffers and must not be shared by concurrently running streams.
+    that position divided by 128. The eight tokens of all ``num_heads`` heads
+    are scored together, reading each K page once. A wrapper instance owns its
+    workspace and buffers and must not be shared by concurrently running
+    streams.
     """
 
     def __init__(
         self,
         workspace_buffer: torch.Tensor | None = None,
         *,
+        num_heads: int = 1,
         use_cuda_graph: bool = False,
         block_table_buffer: torch.Tensor | None = None,
         seq_lens_buffer: torch.Tensor | None = None,
@@ -297,6 +312,7 @@ class _BatchDecodeIndexerBase:
             raise ValueError(
                 "block_table_buffer and seq_lens_buffer are only valid with use_cuda_graph=True"
             )
+        self._num_heads = _check_num_heads(num_heads, self._supported_num_heads)
         self._workspace = workspace_buffer
         self._owns_workspace = workspace_buffer is None
         self._use_cuda_graph = use_cuda_graph
@@ -308,28 +324,61 @@ class _BatchDecodeIndexerBase:
         self._num_valid_pages: torch.Tensor | None = None
         self._topk_indices: torch.Tensor | None = None
 
-    @staticmethod
-    def _scheduler_workspace_size(batch_size: int) -> int:
-        raise NotImplementedError
-
-    def _plan_scheduler(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
-        raise NotImplementedError
+    _supported_num_heads = _SUPPORTED_NUM_HEADS
+    _kernel_name: str
+    _kernel_class: type
 
     def _check_k_cache(self, k_cache: torch.Tensor, device: torch.device) -> None:
         raise NotImplementedError
 
+    @classmethod
+    def _scheduler_workspace_size(cls, batch_size: int, num_heads: int) -> int:
+        return (batch_size + 1) * torch.int32.itemsize
+
+    def _plan_scheduler(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
+        """Prefix-sum the historical pages each request scores."""
+
+        batch_size, max_pages = block_table.shape
+        scheduler_bytes = self._scheduler_workspace_size(batch_size, self._num_heads)
+        scheduler = self._workspace[:scheduler_bytes].view(torch.int32)
+        history_pages = torch.div(seq_lens - 1, _PAGE_SIZE, rounding_mode="floor").clamp_(
+            min=0, max=max_pages
+        )
+        scheduler[:1].zero_()
+        torch.cumsum(history_pages, dim=0, out=scheduler[1:])
+
     def _launch_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> None:
-        raise NotImplementedError
+        device = q.device
+        sm_count = _sm_count(device)
+        key = _cute_kernel_key(
+            self._kernel_name,
+            _require_supported_device(device),
+            sm_count,
+            self._num_heads,
+        )
+        metadata = (self._block_table, self._seq_lens, self._scores, self._workspace)
+        compiled = _compile_or_load(
+            key,
+            lambda: cute.compile(
+                self._kernel_class(sm_count=sm_count, num_heads=self._num_heads),
+                *_cute_arguments((q, k_cache), metadata),
+                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+                options="--enable-tvm-ffi --opt-level 2",
+            ),
+        )
+        compiled(q, k_cache, *metadata)
 
     @classmethod
-    def workspace_size(cls, batch_size: int) -> int:
+    def workspace_size(cls, batch_size: int, *, num_heads: int = 1) -> int:
         """Return the opaque scheduler workspace size in bytes."""
 
         if not isinstance(batch_size, int) or isinstance(batch_size, bool):
             raise TypeError("batch_size must be an integer")
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        return cls._scheduler_workspace_size(batch_size)
+        return cls._scheduler_workspace_size(
+            batch_size, _check_num_heads(num_heads, cls._supported_num_heads)
+        )
 
     @staticmethod
     def _check_metadata(block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
@@ -364,7 +413,7 @@ class _BatchDecodeIndexerBase:
             seq_lens = self._seq_lens_buffer
 
         batch_size, max_pages = block_table.shape
-        required_bytes = self._scheduler_workspace_size(batch_size)
+        required_bytes = self._scheduler_workspace_size(batch_size, self._num_heads)
         workspace = self._workspace
         if workspace is None or workspace.device != device or workspace.numel() < required_bytes:
             if not self._owns_workspace:
@@ -376,17 +425,21 @@ class _BatchDecodeIndexerBase:
         self._seq_lens = seq_lens
         self._plan_scheduler(block_table, seq_lens)
 
-        rows = batch_size * _DECODE_QUERY_LENGTH
-        score_shape = (batch_size, _DECODE_QUERY_LENGTH, max_pages)
+        tokens = batch_size * _DECODE_QUERY_LENGTH
+        score_shape = (batch_size, _DECODE_QUERY_LENGTH * self._num_heads, max_pages)
         if (
             self._scores is None
             or self._scores.shape != score_shape
             or self._scores.device != device
         ):
             self._scores = torch.empty(score_shape, dtype=torch.float32, device=device)
-            self._num_valid_pages = torch.empty((rows,), dtype=torch.int32, device=device)
-            self._topk_indices = torch.empty((rows, 1, _TOP_K), dtype=torch.int32, device=device)
-        self._num_valid_pages.copy_(_decode_num_valid_pages(seq_lens, max_pages))
+            self._num_valid_pages = torch.empty(
+                (tokens * self._num_heads,), dtype=torch.int32, device=device
+            )
+            self._topk_indices = torch.empty(
+                (tokens, self._num_heads, _TOP_K), dtype=torch.int32, device=device
+            )
+        self._num_valid_pages.copy_(_decode_num_valid_pages(seq_lens, max_pages, self._num_heads))
 
     def _run_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> torch.Tensor:
         """Write historical page scores; the local page and later pages stay untouched."""
@@ -394,7 +447,7 @@ class _BatchDecodeIndexerBase:
         if self._scores is None:
             raise RuntimeError("plan() must be called before run()")
         device = self._scores.device
-        _check_query(q, self._num_valid_pages.shape[0], device)
+        _check_query(q, self._topk_indices.shape[0], self._num_heads, device)
         self._check_k_cache(k_cache, device)
         self._launch_scores(q, k_cache)
         return self._scores
@@ -406,95 +459,78 @@ class _BatchDecodeIndexerBase:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return ``[batch * 8, 1, 16]`` logical page indices for one layer."""
+        """Return ``[batch * 8, num_heads, 16]`` logical page indices for one layer."""
 
         scores = self._run_scores(q, k_cache)
         if out is None:
             out = self._topk_indices
         else:
-            _check_topk_output(out, self._num_valid_pages.shape[0], scores.device)
+            _check_topk_output(out, self._topk_indices.shape[0], self._num_heads, scores.device)
         return _topk_select(scores.view(-1, scores.shape[-1]), self._num_valid_pages, out)
 
 
 class BatchDecodeIndexerQ8KV8Wrapper(_BatchDecodeIndexerBase):
-    """E4M3 Q and E4M3 K paged decode indexer (CuTe DSL).
+    """E4M3 Q and E4M3 K paged decode indexer.
 
     Example::
 
-        wrapper = BatchDecodeIndexerQ8KV8Wrapper()
+        wrapper = BatchDecodeIndexerQ8KV8Wrapper(num_heads=4)
         wrapper.plan(block_table, seq_lens)
         topk_indices = wrapper.run(q, k_cache)
     """
 
-    @staticmethod
-    def _scheduler_workspace_size(batch_size: int) -> int:
-        return (batch_size + 1) * torch.int32.itemsize
-
-    def _plan_scheduler(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
-        batch_size, max_pages = block_table.shape
-        scheduler = self._workspace[: self._scheduler_workspace_size(batch_size)].view(torch.int32)
-        history_pages = torch.div(seq_lens - 1, _PAGE_SIZE, rounding_mode="floor").clamp_(
-            min=0, max=max_pages
-        )
-        scheduler[:1].zero_()
-        torch.cumsum(history_pages, dim=0, out=scheduler[1:])
+    _kernel_name = "q8kv8_indexer_decode_sm100"
+    _kernel_class = Q8KV8DecodeIndexerSm100
 
     def _check_k_cache(self, k_cache: torch.Tensor, device: torch.device) -> None:
         _check_paged_cache(k_cache, dtype=torch.float8_e4m3fn, page_width=_HEAD_DIM, device=device)
 
-    def _launch_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> None:
-        device = q.device
-        sm_count = _sm_count(device)
-        key = _cute_kernel_key(
-            "q8kv8_indexer_decode_sm100", _require_supported_device(device), sm_count
-        )
-        metadata = (self._block_table, self._seq_lens, self._scores, self._workspace)
-        compiled = _compile_or_load(
-            key,
-            lambda: cute.compile(
-                Q8KV8DecodeIndexerSm100(sm_count=sm_count),
-                *_cute_arguments((q, k_cache), metadata),
-                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                options="--enable-tvm-ffi --opt-level 2",
-            ),
-        )
-        compiled(q, k_cache, *metadata)
-
 
 class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
-    """E4M3 Q and NVFP4 K paged decode indexer (CUTLASS C++).
+    """E4M3 Q and NVFP4 K paged decode indexer for one or four index heads.
 
     ``k_cache`` is the vLLM packed NVFP4 page; the per-tensor global scale is
-    positive and does not change the ranking, so it is not an input. Toolkits
-    with the public QMUL4 instruction (CUDA 13.4+) use it on SM100/SM103, and
-    other builds select the exact FP16 dequantization path.
+    positive and does not change the ranking, so it is not an input. One head
+    runs the CUTLASS C++ kernel and four heads run the CuTe DSL kernel. Builds
+    on CUDA 13.4 or newer use the public QMUL4 instruction on SM100/SM103, and
+    older ones select the exact FP16 dequantization.
 
     Example::
 
-        wrapper = BatchDecodeIndexerQ8KV4Wrapper()
+        wrapper = BatchDecodeIndexerQ8KV4Wrapper(num_heads=4)
         wrapper.plan(block_table, seq_lens)
         topk_indices = wrapper.run(q, k_cache)
     """
+
+    _supported_num_heads = (1, Q8KV4DecodeIndexerSm100.num_heads)
+    _kernel_name = "q8kv4_indexer_decode_sm100"
+    _kernel_class = Q8KV4DecodeIndexerSm100
 
     @staticmethod
     def _module():
         return _indexer_module_loader("q8kv4_indexer_decode")
 
-    @staticmethod
-    def _scheduler_workspace_size(batch_size: int) -> int:
-        return int(
-            BatchDecodeIndexerQ8KV4Wrapper._module().q8kv4_indexer_workspace_size(batch_size)
-        )
+    @classmethod
+    def _scheduler_workspace_size(cls, batch_size: int, num_heads: int) -> int:
+        if num_heads == 1:
+            return int(cls._module().q8kv4_indexer_workspace_size(batch_size))
+        return super()._scheduler_workspace_size(batch_size, num_heads)
 
     def _plan_scheduler(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
-        self._module().q8kv4_indexer_plan(
-            block_table, seq_lens, self._workspace, _stream_ptr(block_table.device)
-        )
+        if self._num_heads == 1:
+            self._module().q8kv4_indexer_plan(
+                block_table, seq_lens, self._workspace, _stream_ptr(block_table.device)
+            )
+        else:
+            super()._plan_scheduler(block_table, seq_lens)
 
     def _check_k_cache(self, k_cache: torch.Tensor, device: torch.device) -> None:
         _check_paged_cache(k_cache, dtype=torch.uint8, page_width=_NVFP4_PAGE_WIDTH, device=device)
 
     def _launch_scores(self, q: torch.Tensor, k_cache: torch.Tensor) -> None:
+        if self._num_heads != 1:
+            super()._launch_scores(q, k_cache)
+            return
         device = q.device
         self._module().q8kv4_indexer_run(
             q,
@@ -519,6 +555,7 @@ class _PrefillPlanState:
     task_capacity: int
     num_candidate_q_tiles: int
     total_q: int
+    num_heads: int
     scores: torch.Tensor
     num_valid_pages: torch.Tensor
     topk_indices: torch.Tensor
@@ -555,19 +592,21 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
             *_cute_arguments((), build_args),
             Int32(state.num_candidate_q_tiles),
             Int32(state.task_capacity),
+            Int32(state.num_heads),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         ),
     )
     reset_compiled(state.task_counts, state.plan_error)
-    build_compiled(*build_args, state.num_candidate_q_tiles, state.task_capacity)
+    build_compiled(*build_args, state.num_candidate_q_tiles, state.task_capacity, state.num_heads)
 
 
 class BatchPrefillIndexerQ8KV8Wrapper:
     """E4M3 Q and E4M3 K true-varlen paged prefill indexer (CuTe DSL).
 
     Queries use bottom-right causal alignment: query ``i`` of request ``b``
-    sits at position ``seq_lens[b] - query_len[b] + i``.
+    sits at position ``seq_lens[b] - query_len[b] + i``. All ``num_heads`` heads
+    are scored in one launch as Q rows ``token * num_heads + head``.
 
     Example::
 
@@ -579,7 +618,8 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         topk_indices = wrapper.run(q, k_cache)
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, num_heads: int = 1) -> None:
+        self._num_heads = _check_num_heads(num_heads)
         self._state: _PrefillPlanState | None = None
 
     def plan(
@@ -621,7 +661,8 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             raise ValueError("block_table max_blocks is smaller than ceil(max_seqlen_k / 128)")
 
         q_tile = Q8KV8PrefillIndexerPlanBuild.q_tile
-        q_tile_capacity = -(-total_q // q_tile) + batch - 1
+        total_rows = total_q * self._num_heads
+        q_tile_capacity = -(-total_rows // q_tile) + batch - 1
         task_capacity = q_tile_capacity * -(-max_pages // _PREFILL_TASK_CAPACITY_PAGE_CHUNK)
         options = {"device": device}
         self._state = _PrefillPlanState(
@@ -642,11 +683,14 @@ class BatchPrefillIndexerQ8KV8Wrapper:
             ),
             plan_error=torch.empty((1,), dtype=torch.int32, **options),
             task_capacity=task_capacity,
-            num_candidate_q_tiles=batch * -(-max_seqlen_q // q_tile),
+            num_candidate_q_tiles=batch * -(-max_seqlen_q * self._num_heads // q_tile),
             total_q=total_q,
-            scores=torch.empty((total_q, max_pages), dtype=torch.float32, **options),
-            num_valid_pages=torch.empty((total_q,), dtype=torch.int32, **options),
-            topk_indices=torch.empty((total_q, 1, _TOP_K), dtype=torch.int32, **options),
+            num_heads=self._num_heads,
+            scores=torch.empty((total_rows, max_pages), dtype=torch.float32, **options),
+            num_valid_pages=torch.empty((total_rows,), dtype=torch.int32, **options),
+            topk_indices=torch.empty(
+                (total_q, self._num_heads, _TOP_K), dtype=torch.int32, **options
+            ),
         )
         _run_prefill_plan(self._state)
 
@@ -664,10 +708,12 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         if state is None:
             raise RuntimeError("plan() must be called before run()")
         device = state.block_table.device
-        _check_query(q, state.total_q, device)
+        _check_query(q, state.total_q, state.num_heads, device)
         _check_paged_cache(k_cache, dtype=torch.float8_e4m3fn, page_width=_HEAD_DIM, device=device)
         capability = _require_supported_device(device)
         num_persistent_clusters = _sm_count(device) // Q8KV8PrefillIndexerSm100.cta_group_size
+        # Q rows are token * num_heads + head, matching the scores and TopK rows.
+        q_rows = q.view(state.total_q * state.num_heads, 1, _HEAD_DIM)
         metadata = (state.block_table, state.scores, state.task_descriptors, state.task_counts)
         compiled = _compile_or_load(
             _cute_kernel_key(
@@ -683,12 +729,13 @@ class BatchPrefillIndexerQ8KV8Wrapper:
                     compute_capability=capability,
                     num_persistent_clusters=num_persistent_clusters,
                 ),
-                *_cute_arguments((q, k_cache), metadata),
+                *_cute_arguments((q_rows, k_cache), metadata),
+                Int32(state.num_heads),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             ),
         )
-        compiled(q, k_cache, *metadata)
+        compiled(q_rows, k_cache, *metadata, state.num_heads)
         return state.scores
 
     def run(
@@ -698,14 +745,14 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         *,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return ``[total_q, 1, 16]`` logical page indices for one layer."""
+        """Return ``[total_q, num_heads, 16]`` logical page indices for one layer."""
 
         scores = self._run_scores(q, k_cache)
         state = self._state
         if out is None:
             out = state.topk_indices
         else:
-            _check_topk_output(out, state.total_q, scores.device)
+            _check_topk_output(out, state.total_q, state.num_heads, scores.device)
         return _topk_select(scores, state.num_valid_pages, out)
 
 
