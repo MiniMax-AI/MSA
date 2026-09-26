@@ -451,7 +451,10 @@ topk_indices = prefill.run(index_q, index_k_cache)   # [total_q, 1, 16] int32
   groups (index `token * 8 + group`, 1024 bytes). The per-tensor global scale
   must be positive; it does not change the ranking and is not an input.
 - Pages may be padded: `stride(0)` may exceed the page size if it is 16-byte
-  aligned, and each page itself must be contiguous.
+  aligned, and each page itself must be contiguous. `index_q` and
+  `index_k_cache` need 16-byte aligned data pointers; the int32 metadata only
+  needs int32 alignment, so slices such as `seq_lens[lo:hi]` can be passed
+  directly.
 - `block_table`: `[batch, max_blocks]`, contiguous CUDA `torch.int32`,
   `max_blocks <= 8192`. Pages may be scattered and unordered.
 - `seq_lens`: `[batch]`, CUDA `torch.int32`, KV lengths including the current

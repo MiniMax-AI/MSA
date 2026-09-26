@@ -54,9 +54,14 @@ _MAXIMUM_PAGES = 8192
 _NVFP4_PAGE_BYTES = _PAGE_SIZE * _HEAD_DIM // 2 + _PAGE_SIZE * _HEAD_DIM // 16
 _NVFP4_PAGE_WIDTH = _NVFP4_PAGE_BYTES // _PAGE_SIZE
 _TMA_ALIGNMENT = 16
+# Metadata and scores use scalar accesses, so vLLM slices such as
+# seq_lens[lo:hi] only need int32 alignment.
+_SCALAR_ALIGNMENT = torch.int32.itemsize
 _PREFILL_TASK_CAPACITY_PAGE_CHUNK = 4
 _SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
-_KERNEL_SOURCES = (
+# Kernels plus this interface, which fixes the compiled argument alignments.
+_CODEGEN_SOURCES = (
+    "q8_indexer_interface.py",
     "src/sm100/q8kv8_indexer_decode.py",
     "src/sm100/q8kv8_indexer_prefill.py",
     "src/sm100/q8kv8_indexer_prefill_plan.py",
@@ -68,7 +73,7 @@ _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
 def _kernel_source_digest() -> str:
     root = Path(__file__).resolve().parent
     digest = hashlib.sha256()
-    for source in _KERNEL_SOURCES:
+    for source in _CODEGEN_SOURCES:
         digest.update((root / source).read_bytes())
     return digest.hexdigest()[:16]
 
@@ -96,12 +101,21 @@ def _stream_ptr(device: torch.device) -> int:
     return torch.cuda.current_stream(device).cuda_stream
 
 
-def _to_cute_tensor(tensor: torch.Tensor) -> cute.Tensor:
+def _to_cute_tensor(tensor: torch.Tensor, *, assumed_align: int) -> cute.Tensor:
     return from_dlpack(
         tensor.detach(),
-        assumed_align=_TMA_ALIGNMENT,
+        assumed_align=assumed_align,
         enable_tvm_ffi=True,
     ).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
+
+
+def _cute_arguments(
+    tma_operands: tuple[torch.Tensor, ...], scalar_operands: tuple[torch.Tensor, ...]
+) -> list[cute.Tensor]:
+    return [
+        *(_to_cute_tensor(tensor, assumed_align=_TMA_ALIGNMENT) for tensor in tma_operands),
+        *(_to_cute_tensor(tensor, assumed_align=_SCALAR_ALIGNMENT) for tensor in scalar_operands),
+    ]
 
 
 def _compile_or_load(key: tuple[object, ...], compile_fn):
@@ -165,6 +179,8 @@ def _check_query(q: torch.Tensor, num_tokens: int, device: torch.device) -> None
     _check_cuda_tensor(q, name="q", dtype=torch.float8_e4m3fn, device=device)
     if tuple(q.shape) != (num_tokens, 1, _HEAD_DIM):
         raise ValueError(f"q must have shape [{num_tokens}, 1, {_HEAD_DIM}], got {tuple(q.shape)}")
+    if q.data_ptr() % _TMA_ALIGNMENT != 0:
+        raise ValueError(f"q data pointer must be {_TMA_ALIGNMENT}-byte aligned")
 
 
 def _check_paged_cache(
@@ -197,6 +213,26 @@ def _check_topk_output(out: torch.Tensor, num_tokens: int, device: torch.device)
         raise ValueError(f"out must have shape [{num_tokens}, 1, {_TOP_K}], got {tuple(out.shape)}")
 
 
+def _load_indexer_module_from_source_tree(name: str):
+    from fmha_sm100.jit import get_indexer_module
+
+    return get_indexer_module(name)
+
+
+# The csrc JIT lives in the parent package, whose import name depends on how
+# fmha_sm100 is vendored (for example vllm.third_party.fmha_sm100), so the
+# package's sparse.py binds its own loader. Direct imports of this module from
+# the source tree or an installed fmha_sm100 use the fallback.
+_indexer_module_loader = _load_indexer_module_from_source_tree
+
+
+def bind_indexer_module_loader(loader) -> None:
+    """Load csrc indexer modules through the parent package's ``jit.get_indexer_module``."""
+
+    global _indexer_module_loader
+    _indexer_module_loader = loader
+
+
 def _topk_select(scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     """Write 15 score-ranked pages and the forced local page for every row.
 
@@ -206,9 +242,7 @@ def _topk_select(scores: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor)
     at most 16 candidates emit ``0 .. lengths[row] - 1`` followed by ``-1``.
     """
 
-    from fmha_sm100.jit import get_indexer_module
-
-    get_indexer_module("indexer_topk_select").indexer_topk_select(
+    _indexer_module_loader("indexer_topk_select").indexer_topk_select(
         scores,
         lengths,
         out.view(scores.shape[0], _TOP_K),
@@ -253,6 +287,8 @@ class _BatchDecodeIndexerBase:
             _check_cuda_tensor(workspace_buffer, name="workspace_buffer", dtype=torch.uint8)
             if workspace_buffer.ndim != 1:
                 raise ValueError("workspace_buffer must be one-dimensional")
+            if workspace_buffer.data_ptr() % _SCALAR_ALIGNMENT != 0:
+                raise ValueError(f"workspace_buffer must be {_SCALAR_ALIGNMENT}-byte aligned")
         if use_cuda_graph:
             if block_table_buffer is None or seq_lens_buffer is None:
                 raise ValueError("CUDA Graph mode requires block_table_buffer and seq_lens_buffer")
@@ -412,17 +448,17 @@ class BatchDecodeIndexerQ8KV8Wrapper(_BatchDecodeIndexerBase):
         key = _cute_kernel_key(
             "q8kv8_indexer_decode_sm100", _require_supported_device(device), sm_count
         )
-        tensors = (q, k_cache, self._block_table, self._seq_lens, self._scores, self._workspace)
+        metadata = (self._block_table, self._seq_lens, self._scores, self._workspace)
         compiled = _compile_or_load(
             key,
             lambda: cute.compile(
                 Q8KV8DecodeIndexerSm100(sm_count=sm_count),
-                *(_to_cute_tensor(tensor) for tensor in tensors),
+                *_cute_arguments((q, k_cache), metadata),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi --opt-level 2",
             ),
         )
-        compiled(*tensors)
+        compiled(q, k_cache, *metadata)
 
 
 class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
@@ -442,9 +478,7 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
 
     @staticmethod
     def _module():
-        from fmha_sm100.jit import get_indexer_module
-
-        return get_indexer_module("q8kv4_indexer_decode")
+        return _indexer_module_loader("q8kv4_indexer_decode")
 
     @staticmethod
     def _scheduler_workspace_size(batch_size: int) -> int:
@@ -501,8 +535,7 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
         _cute_kernel_key("q8kv8_indexer_prefill_plan_reset_sm100", capability, *plan_static),
         lambda: cute.compile(
             Q8KV8PrefillIndexerPlanReset(),
-            _to_cute_tensor(state.task_counts),
-            _to_cute_tensor(state.plan_error),
+            *_cute_arguments((), (state.task_counts, state.plan_error)),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         ),
@@ -519,7 +552,7 @@ def _run_prefill_plan(state: _PrefillPlanState) -> None:
         _cute_kernel_key("q8kv8_indexer_prefill_plan_build_sm100", capability, *plan_static),
         lambda: cute.compile(
             Q8KV8PrefillIndexerPlanBuild(),
-            *(_to_cute_tensor(tensor) for tensor in build_args),
+            *_cute_arguments((), build_args),
             Int32(state.num_candidate_q_tiles),
             Int32(state.task_capacity),
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -635,14 +668,7 @@ class BatchPrefillIndexerQ8KV8Wrapper:
         _check_paged_cache(k_cache, dtype=torch.float8_e4m3fn, page_width=_HEAD_DIM, device=device)
         capability = _require_supported_device(device)
         num_persistent_clusters = _sm_count(device) // Q8KV8PrefillIndexerSm100.cta_group_size
-        tensors = (
-            q,
-            k_cache,
-            state.block_table,
-            state.scores,
-            state.task_descriptors,
-            state.task_counts,
-        )
+        metadata = (state.block_table, state.scores, state.task_descriptors, state.task_counts)
         compiled = _compile_or_load(
             _cute_kernel_key(
                 "q8kv8_indexer_prefill_sm100",
@@ -657,12 +683,12 @@ class BatchPrefillIndexerQ8KV8Wrapper:
                     compute_capability=capability,
                     num_persistent_clusters=num_persistent_clusters,
                 ),
-                *(_to_cute_tensor(tensor) for tensor in tensors),
+                *_cute_arguments((q, k_cache), metadata),
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             ),
         )
-        compiled(*tensors)
+        compiled(q, k_cache, *metadata)
         return state.scores
 
     def run(

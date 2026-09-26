@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -479,6 +483,85 @@ def test_decode_compile_is_shape_independent_and_workspace_is_released():
     assert torch.cuda.memory_allocated() == before
 
 
+def _int32_misaligned_copy(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy metadata to a view 4 bytes past 16-byte alignment, like vLLM's seq_lens[lo:hi]."""
+
+    storage = torch.empty(tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device)
+    view = storage[1:].view(tensor.shape)
+    view.copy_(tensor)
+    assert view.data_ptr() % 16 == 4
+    return view
+
+
+@pytest.mark.parametrize("phase", ("q8kv8-decode", "q8kv4-decode", "prefill"))
+def test_metadata_slices_need_only_int32_alignment(phase):
+    if phase == "prefill":
+        inputs = _make_prefill([300, 1, 700], [0, 1000, 130], seed=17)
+        metadata = ("cu_seqlens_q", "seq_lens", "block_table")
+        results = []
+        for shifted in (
+            inputs,
+            {**inputs, **{n: _int32_misaligned_copy(inputs[n]) for n in metadata}},
+        ):
+            wrapper = BatchPrefillIndexerQ8KV8Wrapper()
+            _plan_prefill(wrapper, shifted)
+            results.append(wrapper.run(shifted["q"], shifted["k"].cache).clone())
+    else:
+        fmt = phase.split("-")[0]
+        q, k, block_table, seq_lens = _make_decode(fmt, 37, 5, 13)
+        results = []
+        for table, lens in (
+            (block_table, seq_lens),
+            tuple(map(_int32_misaligned_copy, (block_table, seq_lens))),
+        ):
+            wrapper = DECODE_WRAPPERS[fmt]()
+            wrapper.plan(table, lens)
+            results.append(wrapper.run(q, k.cache).clone())
+    assert torch.equal(results[0], results[1])
+
+
+_VENDORED_LAYOUT_CHECK = """
+import importlib.util
+import sys
+
+import torch
+
+if importlib.util.find_spec("fmha_sm100") is not None:
+    sys.exit(77)
+from vendor.fmha_sm100.sparse import BatchDecodeIndexerQ8KV4Wrapper
+
+batch, pages = 2, 3
+block_table = torch.arange(batch * pages, dtype=torch.int32, device="cuda").view(batch, pages)
+seq_lens = torch.full((batch,), pages * 128, dtype=torch.int32, device="cuda")
+q = torch.zeros((batch * 8, 1, 128), device="cuda").to(torch.float8_e4m3fn)
+k_cache = torch.zeros((batch * pages, 128, 72), dtype=torch.uint8, device="cuda")
+wrapper = BatchDecodeIndexerQ8KV4Wrapper()
+wrapper.plan(block_table, seq_lens)
+topk = wrapper.run(q, k_cache).view(-1, 16).cpu()
+assert topk[:, :3].eq(torch.arange(3)).all() and topk[:, 3:].eq(-1).all(), topk
+"""
+
+
+def test_vendored_package_layout_loads_csrc_modules(tmp_path):
+    """Vendored under another package (vLLM), cute/ cannot import ``fmha_sm100`` by name."""
+
+    package_dir = Path(q8_indexer_interface.__file__).resolve().parents[1]
+    (tmp_path / "vendor").mkdir()
+    (tmp_path / "vendor" / "__init__.py").write_text("")
+    (tmp_path / "vendor" / "fmha_sm100").symlink_to(package_dir, target_is_directory=True)
+    result = subprocess.run(
+        [sys.executable, "-c", _VENDORED_LAYOUT_CHECK],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if result.returncode == 77:
+        pytest.skip("an installed fmha_sm100 hides the vendored layout")
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
 @pytest.mark.parametrize("fmt", DECODE_FORMATS)
 def test_decode_rejects_invalid_inputs(fmt):
     q, k, block_table, seq_lens = _make_decode(fmt, 4, 3, 3)
@@ -645,15 +728,19 @@ def test_prefill_plan_reuse_replan_and_cuda_graph():
     out = torch.empty((inputs["total_q"], 1, TOP_K), dtype=torch.int32, device="cuda")
     wrapper.run(inputs["q"], inputs["k"].cache, out=out)
     expected = out.clone()
+    expected_scores = wrapper._state.scores.nan_to_num(POISON)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         wrapper.run(inputs["q"], inputs["k"].cache, out=out)
         with pytest.raises(RuntimeError, match=r"plan\(\) must be called outside"):
             _plan_prefill(BatchPrefillIndexerQ8KV8Wrapper(), inputs)
+    # Poison both stages so the replay must rerun the score kernel and the TopK.
+    wrapper._state.scores.fill_(float("nan"))
     out.fill_(-777)
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, expected)
+    assert torch.equal(wrapper._state.scores.nan_to_num(POISON), expected_scores)
 
 
 def test_prefill_compile_is_shape_independent():

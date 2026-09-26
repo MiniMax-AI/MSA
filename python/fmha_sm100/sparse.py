@@ -84,7 +84,14 @@ from q8_indexer_interface import (  # noqa: E402
     BatchDecodeIndexerQ8KV4Wrapper,
     BatchDecodeIndexerQ8KV8Wrapper,
     BatchPrefillIndexerQ8KV8Wrapper,
+    bind_indexer_module_loader,
 )
+
+from .jit import get_indexer_module  # noqa: E402
+
+# The cute/ modules cannot import this package by name when it is vendored under
+# another package, so hand them this package's csrc JIT loader.
+bind_indexer_module_loader(get_indexer_module)
 
 # NVFP4 quantization helpers used to feed the FP4 indexer / NVFP4 attention
 # (cute/quantize.py).
