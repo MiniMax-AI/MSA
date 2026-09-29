@@ -25,7 +25,7 @@ share one Python package:
 
 ## Requirements
 
-- **GPU**: NVIDIA SM100.
+- **GPU**: NVIDIA SM100 (B200) or SM103 (B300); the Q8KV4 NVFP4 decode kernel also builds for SM107.
 - **Toolchain**: CUDA Toolkit with `nvcc` on `PATH` (or `CUDA_HOME` / `CUDA_PATH` set).
 - **Python**: ≥ 3.10.
 - **OS**: Linux x86_64 (aarch64 untested; JIT builds may need small Makefile edits on WSL).
@@ -34,7 +34,7 @@ Quick sanity check before installing:
 
 ```bash
 nvcc --version                # expect ≥ 12.x
-nvidia-smi --query-gpu=compute_cap --format=csv | grep "10.0"  # confirm SM100
+nvidia-smi --query-gpu=compute_cap --format=csv | grep -E "10.[037]"  # confirm SM100/SM103/SM107
 python -c "import sys; print(sys.version_info[:2])"              # ≥ (3, 10)
 ```
 
@@ -114,6 +114,14 @@ decode wrapper, see the **CuTe-DSL deep dive**:
 
 - [`python/fmha_sm100/cute/README.md`](python/fmha_sm100/cute/README.md)
 
+Sparse decode on an NVFP4 KV cache (uint8 `[pages, Hkv, 128, 72]` K/V with fp32
+global scales) runs on the Q8KV4 kernel when the batch fits it; `fmha_sm100_plan`
+takes `decode_backend`, `kv_dtype` and `block_scale_shift` to steer that. QMUL4
+dequantization needs CUDA 13.4 or newer, older toolkits build an FP16 fallback.
+See:
+
+- [`python/fmha_sm100/decode_q8kv4/README.md`](python/fmha_sm100/decode_q8kv4/README.md)
+
 ## Test
 
 ```bash
@@ -127,6 +135,11 @@ python tests/integration/test_proxy_kv_e2e.py
 # Large regression suites.
 python tests/regression/test_correctness.py
 python tests/regression/test_sparse_attn.py
+
+# Q8KV4 NVFP4 sparse decode: smoke set, full matrices, FP16 dequant fallback.
+python -m pytest tests/q8kv4 -q -m "not full"
+python -m pytest tests/q8kv4 -q
+FMHA_SM100_DECODE_Q8KV4_DISABLE_QMUL4=1 python -m pytest tests/q8kv4 -q
 
 # CuTe-DSL forward-only sparse attention.
 cd python/fmha_sm100/cute
@@ -153,6 +166,15 @@ Common invocations (output is TSV):
 | Quick CI smoke | `python benchmarks/bench_sparse_attention_ops.py --dtype fp8 --sections prefill,decode,sparse_decode --seqs 8192,16384 --tp 1,4 --decode-k 8192,131072 --decode-b 32 --dry-run-ms 50 --repeat-ms 200 -o /tmp/msa_smoke.tsv` |
 | Output-mode checks (dense/paged) | `--output_mode maxscore` or `--output_mode full` |
 
+`benchmarks/bench_q8kv4_decode.py` times NVFP4 sparse decode through the
+`fmha_sm100` API on the Q8KV4 kernel and on the kv_mode 3 kernel, replaying CUDA
+graphs over page regions larger than twice the L2 (exclusive GPU required):
+
+```bash
+python benchmarks/bench_q8kv4_decode.py --suite mtp --backends q8kv4,kv_mode3
+python benchmarks/bench_q8kv4_decode.py --suite full --gqa 16 --shift 3 --output /tmp/q8kv4_full.json
+```
+
 ## Layout
 
 ```
@@ -162,14 +184,16 @@ python/fmha_sm100/                  Python package
   jit.py                            Runtime JIT (nvcc + ninja) for the csrc stack
   sparse.py                         Lazy shim that loads the cute/ stack
   sparse_fmha_adapter.py            Bridge: fmha_sm100 API → sparse_atten_func
+  q8kv4_decode_adapter.py           Bridge: fmha_sm100 API → decode_q8kv4 (NVFP4 sparse decode)
+  decode_q8kv4/                     Q8KV4 paged sparse decode (own csrc + JIT, see its README)
   csrc/                             CUDA kernels + Jinja templates (JIT-compiled)
     include/                        Vendored FlashInfer / CUTLASS-derived / TRT-LLM headers
   cutlass/                          NVIDIA CUTLASS git submodule (include/ + tools/util/include/)
   cute/                             CuTe-DSL sparse attention (loaded via sys.path)
 tests/                              Correctness tests
-  smoke/  integration/  regression/
+  smoke/  integration/  regression/  q8kv4/
 scripts/                            Warmup + cache-management helpers
-benchmarks/                         bench_sparse_attention_ops.py
+benchmarks/                         bench_sparse_attention_ops.py, bench_q8kv4_decode.py
 ```
 
 ## Stacks
@@ -181,6 +205,9 @@ benchmarks/                         bench_sparse_attention_ops.py
   FP8 decode (`SparseDecodePagedAttentionWrapper`), FP4 block-score indexer.
   Public entry: `fmha_sm100.sparse_atten_func`,
   `fmha_sm100.sparse_decode_atten_func`, `fmha_sm100.fp4_indexer_block_scores`.
+- **Q8KV4 decode** — CUTLASS C++ paged sparse decode on the NVFP4 cache
+  (`fmha_sm100.decode_q8kv4`), reached through `fmha_sm100` for uint8 caches
+  or directly via `plan_decode` / `run_decode`.
 - **Bridge** — `sparse_fmha_plan` / `sparse_fmha` adapt the dense-API call
   site to the sparse backend for prefill paths; useful when you already
   drive the dense kernel and want a one-line swap to sparse.
@@ -195,8 +222,8 @@ Authoritative text is shipped with each component.
 
 | Component | License | Where |
 |---|---|---|
-| **NVIDIA CUTLASS** | BSD-3-Clause | Git submodule at `python/fmha_sm100/cutlass/` (provides `include/` + `tools/util/include/`), plus BSD-3-tagged headers under `python/fmha_sm100/csrc/include/`. The SM100 MMA descriptor encodings in `python/fmha_sm100/cute/src/common/mma_sm100_desc.py` mirror CUTLASS hardware descriptors. Copyright (c) 2017–2025 NVIDIA CORPORATION & AFFILIATES. |
-| **FlashInfer** | Apache-2.0 | Headers and sources under `python/fmha_sm100/csrc/` and `python/fmha_sm100/csrc/include/` that carry a `Copyright (c) <year> by FlashInfer team` line (e.g. `allocator.h`, `exception.h`, `utils.cuh`, `cutlass_utils.cuh`, `fmha_cutlass_sm100.cuh`, `sparse_topk_select.cuh`, `plan.cuh`, `sm100_fmha_reduction.hpp`, `tvm_ffi_utils.h`). Project: <https://github.com/flashinfer-ai/flashinfer>. |
+| **NVIDIA CUTLASS** | BSD-3-Clause | Git submodule at `python/fmha_sm100/cutlass/` (provides `include/` + `tools/util/include/`), plus BSD-3-tagged headers under `python/fmha_sm100/csrc/include/` and `python/fmha_sm100/decode_q8kv4/csrc/include/` (e.g. `fmha_fusion.hpp`). The SM100 MMA descriptor encodings in `python/fmha_sm100/cute/src/common/mma_sm100_desc.py` mirror CUTLASS hardware descriptors. Copyright (c) 2017–2025 NVIDIA CORPORATION & AFFILIATES. |
+| **FlashInfer** | Apache-2.0 | Headers and sources under `python/fmha_sm100/csrc/`, `python/fmha_sm100/csrc/include/` and `python/fmha_sm100/decode_q8kv4/csrc/` that carry a `Copyright (c) <year> by FlashInfer team` line (e.g. `allocator.h`, `exception.h`, `utils.cuh`, `cutlass_utils.cuh`, `fmha_cutlass_sm100.cuh`, `sparse_topk_select.cuh`, `plan.cuh`, `sm100_fmha_reduction.hpp`, `tvm_ffi_utils.h`). Project: <https://github.com/flashinfer-ai/flashinfer>. |
 | **NVIDIA TensorRT-LLM + NAVER Corp (CLOVA)** | Apache-2.0 | Portions of `python/fmha_sm100/csrc/include/sparse_topk_select.cuh` — `indexerTopK` histogram-step + insertion-sort derived from `tensorrt_llm/cpp/tensorrt_llm/kernels/indexerTopK.cu`. Copyright (c) 2019–2026 NVIDIA CORPORATION; Copyright (c) 2021 NAVER Corp. The per-file header in `sparse_topk_select.cuh` includes a function-level provenance map. |
 
 ### Runtime dependencies (installed via pip)

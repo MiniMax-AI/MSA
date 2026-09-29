@@ -21,6 +21,7 @@ import torch
 
 from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduction_module, get_plan_fn, get_sparse_topk_module
 from .sparse_fmha_adapter import sparse_fmha, sparse_fmha_plan
+from . import q8kv4_decode_adapter
 
 
 _np_staging = np.empty(4096 * 1024, dtype=np.int32)
@@ -785,6 +786,22 @@ def _fmha_sm100(
         v = v.as_strided((pages, heads, 128, 64), (v.stride(0), 8192, 64, 1))
         k_global_scale, v_global_scale = k_scale, v_scale
         k_scale = v_scale = 1.0
+        # Sparse NVFP4 decode runs on the Q8KV4 kernel when the plan carries one and the call
+        # fits it; otherwise the kv_mode 3 kernel below serves it.
+        q8kv4 = plan_info.get(q8kv4_decode_adapter.PLAN_KEY)
+        if q8kv4 is not None:
+            blocker = q8kv4_decode_adapter.run_blocker(
+                q8kv4, q=q, kv_indices=kv_indices, kv_block_indexes=kv_block_indexes,
+                max_score=max_score, output_o=output_o, q_offset_override=q_offset_override,
+                o_scale=o_scale, k_global_scale=k_global_scale, v_global_scale=v_global_scale)
+            if blocker is None:
+                out = q8kv4_decode_adapter.run(
+                    q8kv4, q, k, v, k_sf, v_sf, kv_indices=kv_indices,
+                    kv_block_indexes=kv_block_indexes, k_global_scale=k_global_scale,
+                    v_global_scale=v_global_scale, sm_scale=sm_scale, q_scale=q_scale, out=out)
+                return out, None
+            if q8kv4["backend"] == "q8kv4":
+                raise ValueError(f"decode_backend='q8kv4' cannot serve this call: {blocker}")
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape
     if kv_indices is None:
@@ -1028,6 +1045,19 @@ def fmha_sm100_plan(
         Per-request causal offset.  If omitted, defaults to
         ``kv_segment_lens - qo_segment_lens`` for bottom-right causal masking.
         A tensor must have shape ``[batch_size]``.
+    decode_backend : str, optional
+        ``"auto"`` (default) plans sparse NVFP4 decode on the Q8KV4 kernel when the batch fits
+        it (page size 128, 8 or 16 Q heads per KV head, uniform query lengths, at most 64
+        blocks, causal, no max-score output) and keeps the kv_mode 3 kernel otherwise;
+        ``"q8kv4"`` requires the Q8KV4 kernel and raises when the batch or a later call does
+        not fit; ``"kv_mode3"`` never plans it.
+    kv_dtype : str, optional
+        ``"fp8"`` skips the Q8KV4 plan (its workspace is only useful for NVFP4 caches);
+        ``"nvfp4"`` or ``None`` allows it.
+    block_scale_shift : int, optional
+        Block-scale staging of the Q8KV4 kernel; 3 (default) for caches whose E4M3 block
+        scales use the full range next to a global scale (TransformerEngine convention), 0 for
+        caches whose ``code * block_scale`` products already fit E4M3.
     split_prefill_decode : bool, optional
         If True, a mixed batch ordered as decode requests followed by prefill
         requests is split into two sub-plans.  The original order must already
@@ -1049,6 +1079,18 @@ def fmha_sm100_plan(
     #         and kv_segment_lens.device.type == 'cpu'
     # assert qo_offset is None or isinstance(qo_offset, int) or qo_offset.device.type == 'cpu'
 
+    decode_backend, kv_dtype, block_scale_shift = q8kv4_decode_adapter.plan_options(kwargs)
+
+    def attach_q8kv4(plan, decode_qo_lens, decode_kv_lens):
+        q8kv4_decode_adapter.attach_plan(
+            plan, qo_segment_lens=decode_qo_lens, kv_segment_lens=decode_kv_lens,
+            num_qo_heads=args[0] if args else kwargs["num_qo_heads"],
+            num_kv_heads=args[1] if len(args) > 1 else kwargs.get("num_kv_heads", -1),
+            page_size=kwargs.get("page_size", -1), kv_block_num=kwargs.get("kv_block_num", -1),
+            causal=kwargs.get("causal", True), output_maxscore=kwargs.get("output_maxscore", False),
+            usable_sm_count=kwargs.get("usable_SM_count", -1), device=kwargs.get("device"),
+            backend=decode_backend, kv_dtype=kv_dtype, block_scale_shift=block_scale_shift)
+
     if qo_offset is None:
         qo_offset = kv_segment_lens - qo_segment_lens
     elif isinstance(qo_offset, int):
@@ -1069,6 +1111,7 @@ def fmha_sm100_plan(
         decode_qo_offset = qo_offset[:split]
         decode = _fmha_sm100_plan(decode_qo_segment_lens, decode_kv_segment_lens, *args,
                                     qo_offset=decode_qo_offset, **kwargs)
+        attach_q8kv4(decode, decode_qo_segment_lens, decode_kv_segment_lens)
         decode = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in decode.items()}
         prefill_qo_segment_lens = qo_segment_lens[split:]
         prefill_kv_segment_lens = kv_segment_lens[split:]
@@ -1079,6 +1122,7 @@ def fmha_sm100_plan(
     else:
         plan = _fmha_sm100_plan(qo_segment_lens, kv_segment_lens, *args, 
                                     qo_offset=qo_offset, **kwargs)
+        attach_q8kv4(plan, qo_segment_lens, kv_segment_lens)
         return (False, 0, batch_size, plan, None)
 
 def fmha_sm100(
@@ -1148,6 +1192,10 @@ def fmha_sm100(
     ``k_scale`` and ``v_scale`` are CUDA float32 scalar tensors for NVFP4:
     ``value = E2M1(code) * E4M3(block_scale) * global_scale``.
     Use BF16 Q for prefill and E4M3 Q for decode. No cache conversion is needed.
+    Sparse NVFP4 decode runs on the Q8KV4 kernel when ``fmha_sm100_plan`` planned it
+    (``decode_backend``); calls it cannot serve (max-score output, ``q_offset_override``,
+    ``o_scale`` other than 1, BF16 Q) fall back to the kv_mode 3 kernel unless the backend
+    was forced.
 
     Returns
     -------

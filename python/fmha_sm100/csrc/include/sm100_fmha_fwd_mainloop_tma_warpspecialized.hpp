@@ -1772,7 +1772,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       bool is_lower = (tidx < 64);
       int partner = is_lower ? tidx : (tidx - 64);
       // Correction warpgroup barrier (not CTA-wide — softmax warps may have exited)
-      constexpr int kCorrBarrierId = 8;
+      // NamedBarrier::sync offsets user ids by ReservedNamedBarrierCount (8); ids 8 and 9
+      // would land on hardware barriers 16 and 17, past the 16 the CTA has. Use 1 and 2
+      // (hardware 9 and 10); the kernel's only other named barrier is the raw `bar.sync 8`.
+      constexpr int kCorrBarrierId = 1;
       constexpr int kCorrThreads = 4 * cutlass::NumThreadsPerWarp;
       auto corr_sync = [&]() { cutlass::arch::NamedBarrier::sync(kCorrThreads, kCorrBarrierId); };
       // smem_scratch layout: [0..63] lower's V0 max, [64..127] lower's V0 sum,
@@ -1860,7 +1863,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         bool is_lower = (thread_idx_corr < 64);
         int partner = is_lower ? thread_idx_corr : (thread_idx_corr - 64);
         float* smem_o_xchg = smem_scratch + 256;
-        constexpr int kCorrBarrierId2 = 9;
+        constexpr int kCorrBarrierId2 = 2;
         constexpr int kCorrThreads = 4 * cutlass::NumThreadsPerWarp;
         auto corr_sync = [&]() { cutlass::arch::NamedBarrier::sync(kCorrThreads, kCorrBarrierId2); };
 

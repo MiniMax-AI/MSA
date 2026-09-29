@@ -1,0 +1,29 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
+// SPDX-License-Identifier: MIT
+
+// Auto-generated FMHA variant: {{ variant_name }}
+// Tile={{ tile_q }}x{{ tile_kv }}, Sparse={{ sparse_mode }}, SplitKV={{ is_split_kv }}
+#include "fmha_cutlass_sm100.cuh"
+
+using namespace flashinfer;
+using namespace cute;
+
+cudaError_t {{ func_name }}(const FMHACutlassSM100Params &p) {
+  using Element = cutlass::bfloat16_t;
+  using ElementOut = cutlass::bfloat16_t;
+  using TileShapeQK = Shape<cute::Int<{{ tile_q }}>, cute::Int<{{ tile_kv }}>, cute::Int<128>>;
+  using TileShapePV = Shape<cute::Int<{{ tile_q }}>, cute::Int<128>, cute::Int<{{ tile_kv }}>>;
+  using FmhaThreadShape = Shape<{{ thread_shape }}>;
+  using ActiveMaskType = {% if pack_factor > 1 %}PackedCausalMask<{{ pack_factor }}>{% else %}CausalMask{% endif %};
+
+  // Split-KV variants write partials to the workspace and leave the direct output unset.
+  FMHACutlassSM100Params params = p;
+  params.o_ptr = {{ "nullptr" if is_split_kv == "true" else "p.o_ptr" }};
+  params.workspace_o_ptr = {{ "p.workspace_o_ptr" if is_split_kv == "true" else "nullptr" }};
+
+  return run_fmha_fwd<
+      Element, ElementOut, int32_t, TileShapeQK, TileShapePV, ActiveMaskType, FmhaThreadShape,
+      /*IsSplitKV=*/{{ is_split_kv }},
+      /*SingleSoftmaxWarpGroup=*/{{ single_wg }}, {{ page_size }}, cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }},
+      /*IsQ8KV4=*/true, {{ sparse_topk }}, {{ fixed_q_tokens_per_batch }}>(params);
+}
