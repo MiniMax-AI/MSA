@@ -633,6 +633,8 @@ def sparse_atten_func(
     pv_dtype: Optional[torch.dtype] = None,
     output_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    enable_fp16_softmax: Optional[bool] = None,
+    enable_2x_fp8: Optional[bool] = None,
 ):
     """Run SM100 CSR block-sparse varlen attention.
 
@@ -708,6 +710,17 @@ def sparse_atten_func(
     out : torch.Tensor, optional
         Optional BF16 output buffer with shape ``[total_q, Hq, 128]``.  When
         provided, the combine stage writes directly into this tensor.
+    enable_fp16_softmax : bool, optional
+        Rubin (SM107) only: run the softmax exponential in packed FP16 with an
+        FP32 row sum and load S from TMEM with a fused row-max reduction.
+        Requires native FP8 (E4M3) Q/K/V.  ``None`` (default) enables it
+        automatically on SM107 with FP8 Q/K/V and leaves it off otherwise;
+        ``False`` forces the FP32 softmax; ``True`` on any other configuration
+        raises ``NotImplementedError``.
+    enable_2x_fp8 : bool, optional
+        Rubin (SM107) only: issue the FP8 QK^T and PV MMAs with K=64 instead of
+        K=32.  Same requirements and ``None``/``False``/``True`` semantics as
+        ``enable_fp16_softmax``.
 
     Returns
     -------
@@ -781,6 +794,8 @@ def sparse_atten_func(
         pv_dtype,
         output_scale,
         out,
+        enable_fp16_softmax=enable_fp16_softmax,
+        enable_2x_fp8=enable_2x_fp8,
     )
 
 
@@ -1493,6 +1508,9 @@ def _sparse_atten_csr_varlen_forward(
     pv_dtype: torch.dtype,
     output_scale: Optional[torch.Tensor],
     out: Optional[torch.Tensor],
+    *,
+    enable_fp16_softmax: Optional[bool] = None,
+    enable_2x_fp8: Optional[bool] = None,
 ):
     total_q, head_q, dim = q.shape
     if head_q % head_kv != 0:
@@ -1574,6 +1592,8 @@ def _sparse_atten_csr_varlen_forward(
         schedule=schedule,
         qk_dtype=qk_dtype,
         pv_dtype=pv_dtype,
+        enable_fp16_softmax=enable_fp16_softmax,
+        enable_2x_fp8=enable_2x_fp8,
     )
     # Sparse Attention and Sparse Page Attention both use the varlen-Q
     # combine path; the kernel-written LSE_out is the final contract.
@@ -1666,6 +1686,44 @@ def _call_sparse_decode_forward_sm100_paged_fp8(
     )
 
 
+_RUBIN_CAPABILITY = (10, 7)
+
+
+def _resolve_rubin_options(
+    device: torch.device,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
+    enable_fp16_softmax: Optional[bool],
+    enable_2x_fp8: Optional[bool],
+) -> tuple[bool, bool]:
+    """Resolve the optional Rubin fast-path flags before any cache lookup.
+
+    Both optimizations need native FP8 (E4M3) MMA operands for QK and PV on
+    SM107.  ``None`` selects them automatically in that case and disables them
+    otherwise; ``False`` disables; ``True`` on an unsupported configuration
+    raises so silent fallbacks cannot hide a misconfiguration.
+    """
+    capability = torch.cuda.get_device_capability(device)
+    supported = (
+        capability == _RUBIN_CAPABILITY
+        and qk_dtype == torch.float8_e4m3fn
+        and pv_dtype == torch.float8_e4m3fn
+    )
+    resolved = []
+    for name, value in (
+        ("enable_fp16_softmax", enable_fp16_softmax),
+        ("enable_2x_fp8", enable_2x_fp8),
+    ):
+        if value is not None and not isinstance(value, bool):
+            raise TypeError(f"{name} must be bool or None")
+        if value is True and not supported:
+            raise NotImplementedError(
+                f"{name} requires Rubin SM107 and FP8 (E4M3) QK/PV MMA operands"
+            )
+        resolved.append(supported if value is None else value)
+    return resolved[0], resolved[1]
+
+
 def _call_sparse_forward_sm100_csr_varlen(
     q,
     k,
@@ -1695,12 +1753,17 @@ def _call_sparse_forward_sm100_csr_varlen(
     schedule: Optional[SparseAttentionSchedule] = None,
     qk_dtype: torch.dtype,
     pv_dtype: torch.dtype,
+    enable_fp16_softmax: Optional[bool] = None,
+    enable_2x_fp8: Optional[bool] = None,
 ):
     """Compile and launch the SM100 sparse forward K1 kernel on CSR metadata."""
     head_dim = q.shape[-1]
     dtype = q.dtype
     qk_dtype = _normalize_forward_mma_dtype(qk_dtype, q.dtype, "qk_dtype")
     pv_dtype = _normalize_forward_mma_dtype(pv_dtype, v.dtype, "pv_dtype")
+    use_fp16_softmax, use_2x_fp8 = _resolve_rubin_options(
+        q.device, qk_dtype, pv_dtype, enable_fp16_softmax, enable_2x_fp8
+    )
     partial_dtype = O_partial.dtype
     return_temperature_lse = bool(return_temperature_lse)
     if return_temperature_lse != (LSE_temperature_partial is not None):
@@ -1777,6 +1840,8 @@ def _call_sparse_forward_sm100_csr_varlen(
         page_size,
         bool(seqused_k is not None),
         bool(return_temperature_lse),
+        bool(use_fp16_softmax),
+        bool(use_2x_fp8),
     )
     if key not in _compile_cache:
         from src.common.aot_cache import try_load_aot, save_aot
@@ -1796,6 +1861,8 @@ def _call_sparse_forward_sm100_csr_varlen(
                 use_prepare_scheduler=use_prepare_scheduler,
                 qk_dtype=_torch_dtype_to_cutlass_dtype(qk_dtype),
                 pv_dtype=_torch_dtype_to_cutlass_dtype(pv_dtype),
+                enable_fp16_softmax=use_fp16_softmax,
+                enable_2x_fp8=use_2x_fp8,
             )
             _compile_cache[key] = cute.compile(
                 kernel,

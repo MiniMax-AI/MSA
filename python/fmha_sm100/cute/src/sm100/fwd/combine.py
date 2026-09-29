@@ -1335,9 +1335,15 @@ def combine(
     has_split_counts = split_counts is not None
     has_output_scale = output_scale is not None
     min_blocks_per_mp = 3 if has_output_scale and use_pdl else 0
+    # Rubin (SM107) has the SMEM headroom for the deeper 4-stage O_partial
+    # ring; Blackwell keeps stages=2 (see the occupancy note below).
+    capability = torch.cuda.get_device_capability(o_out.device)
+    stages = 4 if capability == (10, 7) else 2
 
     key = (
         "combine",
+        capability,
+        stages,
         D,
         k_block_size,
         tile_m,
@@ -1371,12 +1377,13 @@ def combine(
                 topk=num_splits,
                 use_pdl=use_pdl,
                 min_blocks_per_mp=min_blocks_per_mp,
-                # stages=2 halves per-block SMEM (168 KB -> 103 KB) -> 2 blocks/SM,
-                # theoretical occupancy 12.5% -> 25%. NCU DRAM throughput 76.35%
-                # -> 88.64%. Runtime latency within noise (kernel already at HBM
-                # bandwidth ceiling in practice) but the cleaner SOL profile
-                # matters for downstream NCU comparison.
-                stages=2,
+                # Blackwell: stages=2 halves per-block SMEM (168 KB -> 103 KB)
+                # -> 2 blocks/SM, theoretical occupancy 12.5% -> 25%. NCU DRAM
+                # throughput 76.35% -> 88.64%. Runtime latency within noise
+                # (kernel already at HBM bandwidth ceiling in practice) but the
+                # cleaner SOL profile matters for downstream NCU comparison.
+                # Rubin: stages=4 (selected above).
+                stages=stages,
             )
             div = 128 // partial_dtype.width
             if has_cu_seqlens:

@@ -18,12 +18,19 @@ from typing import Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32
+from cutlass import Float16, Float32
 
 from quack import layout_utils
 from quack.cute_dsl_utils import ParamsBase
 
 from . import utils
+from .rubin_softmax_helpers import (
+    add_packed_f32x2_f16x2_f32x2,
+    cvt_f16x4_to_f8x4,
+    cvt_packed_f16x2_f32x2,
+    ex2_packed_f16x2,
+    mul_packed_f16x2,
+)
 
 
 @dataclass
@@ -397,6 +404,93 @@ class SoftmaxSm100(Softmax):
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
+
+    @cute.jit
+    def apply_exp2_convert_fp16_mixed(
+        self,
+        acc_S_row: cute.Tensor,
+        row_max: Float32,
+        acc_S_row_converted: cute.Tensor,
+        fp8_probability_scale: cutlass.Constexpr[float] = 0.0,
+    ) -> Float32:
+        """Rubin packed-FP16 exp/CVT for FP8 Q -> FP8 P, summing in FP32.
+
+        Computation steps:
+
+        * ``t = fma_f32x2(score, scale_log2, -row_max * scale_log2)`` in FP32
+          (``cute.arch.fma_packed_f32x2``).
+        * ``x = FP16(t)`` via ``cvt.rn.f16x2.f32`` -- the only rounding before
+          the exponential, on the near-zero scaled difference.
+        * ``p = exp2(x)`` via ``ex2.approx.f16x2``.
+        * optionally ``p = p * fp8_probability_scale`` via ``mul.f16x2``.
+        * ``P = E4M3(p)`` via ``cvt.rn.satfinite.e4m3x2.f16x2``, four at a time.
+        * Row sum: each FP16 ``p`` pair is widened and accumulated in FP32 with
+          ``add.f32x2.f16x2.f32x2`` into two independent accumulators combined
+          with ``cute.arch.add_packed_f32x2``.
+
+        ``fp8_probability_scale == 0.0`` (the default) disables the scale so P
+        and the row sum match the FP32 ``apply_exp2_convert`` path of this
+        kernel, which quantizes the unnormalized probability in ``[0, 1]`` to
+        E4M3 directly and derives the LSE from the unscaled row sum. Passing a
+        non-zero scale (for example 448 for the FlashInfer P448 convention)
+        multiplies both P and the returned row sum by that factor; the caller
+        then owns the matching LSE correction. Scaling after the exponential
+        keeps the FP16 exponent argument near zero, where FP16 spacing is
+        ``2^-11`` instead of ``2^-7``.
+
+        Only FP8 (E4M3) P is supported.
+        """
+        assert cute.size(acc_S_row.shape) % 4 == 0
+        assert cute.size(acc_S_row.shape) == cute.size(acc_S_row_converted.shape)
+        assert acc_S_row_converted.element_type == cutlass.Float8E4M3FN, (
+            "packed FP16 softmax requires FP8 (E4M3) P"
+        )
+        num_scores = cute.size(acc_S_row.shape)
+        num_quads = num_scores // 4
+        num_row_sum_accumulators = 2
+
+        scale_log2_pair = (self.scale_log2, self.scale_log2)
+        minus_row_max_scale = (Float32(0.0) - row_max) * self.scale_log2
+        minus_row_max_scale_pair = (minus_row_max_scale, minus_row_max_scale)
+        if cutlass.const_expr(fp8_probability_scale != 0.0):
+            fp8_scale_f16 = Float16(fp8_probability_scale)
+            fp8_scale_pair = (fp8_scale_f16, fp8_scale_f16)
+
+        # FP16 exp results and the FP8 P fragment, both viewed 4 at a time for
+        # the E4M3 convert. The P view goes through the fragment's own layout
+        # rather than recasting the whole fragment to Int32 and indexing
+        # linearly, so no assumption is made about its contiguity.
+        exp_buf = cute.make_rmem_tensor(cute.make_layout(num_scores), Float16)
+        exp_buf_cvt = cute.logical_divide(exp_buf, cute.make_layout(4))
+        p_cvt = cute.logical_divide(acc_S_row_converted, cute.make_layout(4))
+
+        row_sums = [(Float32(0.0), Float32(0.0)) for _ in range(num_row_sum_accumulators)]
+
+        for i in cutlass.range_constexpr(0, num_scores, 2):
+            # Stage 1: full FP32 affine transform.
+            scaled_pair = cute.arch.fma_packed_f32x2(
+                (acc_S_row[i], acc_S_row[i + 1]),
+                scale_log2_pair,
+                minus_row_max_scale_pair,
+            )
+            # Stage 2: round the pair to packed FP16.
+            packed_pair = cvt_packed_f16x2_f32x2(scaled_pair)
+            # Stage 3: packed exponential, optionally followed by the FP8 scale.
+            exp_pair = ex2_packed_f16x2(packed_pair)
+            if cutlass.const_expr(fp8_probability_scale != 0.0):
+                exp_pair = mul_packed_f16x2(exp_pair, fp8_scale_pair)
+            exp_buf[i] = exp_pair[0]
+            exp_buf[i + 1] = exp_pair[1]
+            # FP32 row sum, widening the FP16 pair on the fly.
+            sum_slot = (i // 2) % num_row_sum_accumulators
+            row_sums[sum_slot] = add_packed_f32x2_f16x2_f32x2(exp_pair, row_sums[sum_slot])
+
+        # E4M3 convert, four FP16 values -> four FP8 P values, per quad slice.
+        for q in cutlass.range_constexpr(num_quads):
+            cvt_f16x4_to_f8x4(exp_buf_cvt[None, q], p_cvt[None, q])
+
+        local_row_sum = cute.arch.add_packed_f32x2(row_sums[0], row_sums[1])
+        return local_row_sum[0] + local_row_sum[1]
 
     @cute.jit
     def scale_apply_exp2_convert(
