@@ -6,9 +6,10 @@
 import pytest
 import torch
 
+from fmha_sm100.api import nvfp4_head_slot_views
 from fmha_sm100.decode_q8kv4 import BatchDecodeWithPagedKVCacheWrapper
 
-from .cases import KV_HEADS, SMOKE_CASES, flat_page_table, make_inputs, pack_vllm_pages, unpack_views
+from .cases import KV_HEADS, SMOKE_CASES, flat_page_table, make_inputs, pack_head_slot_pages, pack_vllm_pages, unpack_views
 from .conftest import run_timed
 from .runners import run_wrapper
 
@@ -37,3 +38,7 @@ def test_flat_list_and_packed_pages_match_the_contiguous_run(device, case):
         v_data, v_sf = unpack_views(v_packed)
         out = _run_views(inputs, k_data, v_data, k_sf, v_sf, kv_indices, kv_indptr, f"{case.name} {label}")
         assert torch.equal(out, baseline), f"vLLM packed pages, {label}"
+    k_data, k_sf, v_data, v_sf = nvfp4_head_slot_views(*pack_head_slot_pages(inputs))
+    out = _run_views(inputs, k_data, v_data, k_sf.view(torch.float8_e4m3fn), v_sf.view(torch.float8_e4m3fn),
+                     kv_indices, kv_indptr, f"{case.name} head slots")
+    assert torch.equal(out, baseline), "per-head K/V slot pages (head stride of two slots)"

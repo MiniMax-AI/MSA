@@ -114,8 +114,9 @@ decode wrapper, see the **CuTe-DSL deep dive**:
 
 - [`python/fmha_sm100/cute/README.md`](python/fmha_sm100/cute/README.md)
 
-Sparse decode on an NVFP4 KV cache (uint8 `[pages, Hkv, 128, 72]` K/V with fp32
-global scales) runs on the Q8KV4 kernel when the batch fits it; `fmha_sm100_plan`
+Sparse decode on an NVFP4 KV cache (uint8 `[pages, 2 * Hkv, 128, 72]` per-head K/V
+slots, passed as `cache[:, 0::2]` / `cache[:, 1::2]`, with fp32 global scales) runs on
+the Q8KV4 kernel when the batch fits it; `fmha_sm100_plan`
 takes `decode_backend`, `kv_dtype` and `block_scale_shift` to steer that. QMUL4
 dequantization needs CUDA 13.4 or newer, older toolkits build an FP16 fallback.
 See:

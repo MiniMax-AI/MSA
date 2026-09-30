@@ -185,8 +185,26 @@ def pack_vllm_pages(
     return packed[0], packed[1]
 
 
+def pack_head_slot_pages(inputs: DecodeInputs) -> tuple[torch.Tensor, torch.Tensor]:
+    """The NVFP4 cache ``fmha_sm100`` reads: one ``[P, 2 * H, 128, 72]`` uint8 buffer where slot
+    ``2 * h`` is head ``h``'s K (its data block, then its scale block) and slot ``2 * h + 1`` its
+    V. Returns the K and V slot views ``cache[:, 0::2]`` and ``cache[:, 1::2]``.
+    """
+    total_pages, heads = inputs.k_codes.shape[:2]
+    cache = torch.zeros(total_pages, 2 * heads, PAGE_SIZE, 72, dtype=torch.uint8,
+                        device=inputs.k_codes.device)
+    k, v = cache[:, 0::2], cache[:, 1::2]
+    for slots, codes, scale in ((k, inputs.k_codes, inputs.k_scale),
+                                (v, inputs.v_codes, inputs.v_scale_kernel)):
+        slot_bytes = slots.flatten(2)
+        slot_bytes[..., :PAGE_SIZE * 64].copy_(codes.flatten(2))
+        slot_bytes[..., PAGE_SIZE * 64:].copy_(scale.view(torch.uint8).flatten(2))
+    return k, v
+
+
 def unpack_views(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``fmha_sm100``'s data and scale views over a packed ``[P, H, 128, 72]`` tensor."""
+    """Data and scale views over a ``pack_vllm_pages`` ``[P, H, 128, 72]`` tensor, for the
+    direct Q8KV4 API."""
     total_pages, heads = packed.shape[:2]
     data = packed.as_strided((total_pages, heads, PAGE_SIZE, 64), (packed.stride(0), 8192, 64, 1))
     scale = packed.as_strided((total_pages, heads, PAGE_SIZE, 8), (packed.stride(0), 1024, 8, 1),

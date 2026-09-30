@@ -31,7 +31,8 @@ out, _ = fmha_sm100(q, k_cache, v_cache, plan, kv_indices=kv_indices,
                     kv_block_indexes=kv_block_indexes, k_scale=k_global, v_scale=v_global)
 ```
 
-`k_cache` / `v_cache` are the vLLM NVFP4 tensors, uint8 `[pages, Hkv, 128, 72]`; `k_scale` /
+`k_cache` / `v_cache` are the K and V slot views `cache[:, 0::2]` / `cache[:, 1::2]` of a
+uint8 `[pages, 2 * Hkv, 128, 72]` NVFP4 cache of per-head K/V slots; `k_scale` /
 `v_scale` are one-element fp32 CUDA tensors. The plan carries a Q8KV4 schedule when the batch
 fits this kernel (page size 128, 8 or 16 Q heads per KV head, uniform query lengths, 1 to 64
 blocks, causal, no max-score output) and `fmha_sm100` uses it for uint8 caches when the call fits
@@ -62,8 +63,8 @@ callers that keep them together; its `run` accepts a `topk_indices` override.
 - `q`: `[B * q_len_per_req, Hq, 128]` E4M3, the `q_len_per_req` tokens of a request last in its
   KV sequence, in order.
 - `k_data` / `v_data`: `[pages, Hkv, 128, 64]` uint8, two E2M1 values per byte; token rows
-  contiguous, page and head strides free (multiples of 16 bytes), so vLLM's packed pages are
-  read in place.
+  contiguous, page and head strides free (multiples of 16 bytes, data heads at least 8192 bytes
+  apart), so packed pages are read in place.
 - `k_scale` / `v_scale`: `[pages, Hkv, 128, 8]` E4M3 block scales (one per 16 values), same
   stride rules. K blocks are linear (`token * 8 + group`); V blocks are in token-quad order
   (`(token // 4) * 32 + group * 4 + token % 4`, vLLM's layout); `interleave_v_scales` converts a

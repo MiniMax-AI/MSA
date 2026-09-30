@@ -7,11 +7,11 @@ for everything else."""
 import pytest
 import torch
 
-from fmha_sm100.api import fmha_sm100, fmha_sm100_plan
+from fmha_sm100.api import fmha_sm100, fmha_sm100_plan, nvfp4_head_slot_views
 from fmha_sm100.decode_q8kv4 import BatchDecodeWithPagedKVCacheWrapper, plan_decode, run_decode
 from fmha_sm100.q8kv4_decode_adapter import PLAN_KEY
 
-from .cases import HEAD_DIM, KV_HEADS, PAGE_SIZE, SM_SCALE, SMOKE_CASES, flat_page_table, global_scale, make_inputs, pack_vllm_pages, unpack_views
+from .cases import HEAD_DIM, KV_HEADS, PAGE_SIZE, SM_SCALE, SMOKE_CASES, flat_page_table, global_scale, make_inputs, pack_head_slot_pages, pack_vllm_pages
 from .conftest import run_timed
 from .reference import PageDequantizer, assert_close_to_reference, sparse_decode_reference
 
@@ -32,7 +32,7 @@ class ApiHarness:
     def __init__(self, device):
         self.inputs = make_inputs(CASE, device)
         self.inputs.topk_indices = _ascending(self.inputs.topk_indices)
-        self.k_packed, self.v_packed = pack_vllm_pages(self.inputs)
+        self.k_packed, self.v_packed = pack_head_slot_pages(self.inputs)
         self.kv_indices, self.kv_indptr = flat_page_table(self.inputs.page_table, CASE.seq_lens)
         self.unit = global_scale(1.0, device)
         self.reference = sparse_decode_reference(
@@ -56,12 +56,16 @@ class ApiHarness:
             return o
         return run_timed(label, call).clone()
 
+    def views(self):
+        """The data and E4M3 scale views of the head-slot pages, for the direct Q8KV4 API."""
+        k_data, k_sf, v_data, v_sf = nvfp4_head_slot_views(self.k_packed, self.v_packed)
+        return k_data, v_data, k_sf.view(torch.float8_e4m3fn), v_sf.view(torch.float8_e4m3fn)
+
     def direct(self, shift, topk=None):
         inputs = self.inputs
         plan = plan_decode(batch_size=CASE.batch_size, q_len_per_req=CASE.q_len, topk=CASE.topk, device=inputs.q.device,
                            num_q_heads=inputs.num_q_heads, num_kv_heads=KV_HEADS, block_scale_shift=shift)
-        k_data, k_sf = unpack_views(self.k_packed)
-        v_data, v_sf = unpack_views(self.v_packed)
+        k_data, v_data, k_sf, v_sf = self.views()
         return run_timed(f"run_decode shift{shift}", lambda: run_decode(
             plan, inputs.q, (k_data, v_data), kv_cache_sf=(k_sf, v_sf), seq_lens=inputs.seq_lens,
             kv_indices=self.kv_indices, kv_indptr=self.kv_indptr,
@@ -139,7 +143,20 @@ def test_shift_zero_through_the_api_matches_the_wrapper(harness):
     wrapper = BatchDecodeWithPagedKVCacheWrapper()
     wrapper.plan(inputs.topk_indices, harness.kv_indices, inputs.seq_lens, q_len_per_req=CASE.q_len,
                  num_q_heads=inputs.num_q_heads, num_kv_heads=KV_HEADS, kv_indptr=harness.kv_indptr)
-    k_data, k_sf = unpack_views(harness.k_packed)
-    v_data, v_sf = unpack_views(harness.v_packed)
+    k_data, v_data, k_sf, v_sf = harness.views()
     expected = run_timed("wrapper shift0", lambda: wrapper.run(inputs.q, (k_data, v_data), kv_cache_sf=(k_sf, v_sf)).clone())
     assert torch.equal(harness.run(plan, label="api shift0"), expected)
+
+
+def test_nvfp4_cache_must_be_per_head_kv_slots(harness):
+    """fmha_sm100 reads only per-head K/V slot pages; the side-packed layout (every head's data,
+    then every head's scales) is rejected instead of misread."""
+    k_side, v_side = pack_vllm_pages(harness.inputs)
+    with pytest.raises(ValueError, match="per-head K/V slots"):
+        fmha_sm100(harness.inputs.q, k_side, v_side, harness.plan(), kv_indices=harness.kv_indices,
+                   kv_block_indexes=harness.inputs.topk_indices, sm_scale=SM_SCALE,
+                   k_scale=harness.unit, v_scale=harness.unit)
+    cache = harness.k_packed.as_strided((harness.k_packed.shape[0], 2 * KV_HEADS, PAGE_SIZE, 72),
+                                        (harness.k_packed.stride(0), PAGE_SIZE * 72, 72, 1))
+    with pytest.raises(ValueError, match="per-head K/V slots"):
+        nvfp4_head_slot_views(cache[:, :KV_HEADS], cache[:, KV_HEADS:])

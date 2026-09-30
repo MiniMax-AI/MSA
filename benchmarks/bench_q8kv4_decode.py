@@ -40,7 +40,7 @@ from fmha_sm100.api import fmha_sm100, fmha_sm100_plan  # noqa: E402
 from fmha_sm100.decode_q8kv4 import BatchDecodeWithPagedKVCacheWrapper  # noqa: E402
 from q8kv4.cases import (  # noqa: E402
     KV_HEADS, PAGE_SIZE, SM_SCALE, DecodeCase, flat_page_table, global_scale, make_inputs,
-    pack_vllm_pages, page_counts,
+    pack_head_slot_pages, page_counts,
 )
 from q8kv4.reference import PageDequantizer, sparse_decode_reference  # noqa: E402
 
@@ -116,7 +116,7 @@ class Slot:
             scales = (inputs.k_scale, inputs.v_scale_kernel)
             self.call = lambda: wrapper.run(inputs.q, (inputs.k_codes, inputs.v_codes), kv_cache_sf=scales, out=self.out)
             return
-        k_packed, v_packed = pack_vllm_pages(inputs)
+        k_packed, v_packed = pack_head_slot_pages(inputs)
         kv_indices, _ = flat_page_table(inputs.page_table, inputs.case.seq_lens)
         unit = global_scale(1.0, device)
         kv = inputs.seq_lens.cpu()

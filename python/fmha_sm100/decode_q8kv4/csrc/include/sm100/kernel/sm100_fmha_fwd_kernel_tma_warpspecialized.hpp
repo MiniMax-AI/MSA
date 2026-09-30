@@ -226,8 +226,11 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
     if (params.total_page_num <= 0 || params.batch_size <= 0) {
       return cudaErrorInvalidValue;
     }
-    if (params.k_stride_h != Traits::kPageSize * (Traits::kHeadDim / 2) ||
-        params.v_stride_h != Traits::kPageSize * (Traits::kHeadDim / 2)) {
+    // The TMA descriptors take the head strides, which only need to keep each head's packed
+    // rows apart and stay 16-byte aligned (e.g. a head's K and V slots interleaved per head).
+    constexpr int kHeadDataBytes = Traits::kPageSize * (Traits::kHeadDim / 2);
+    if (params.k_stride_h < kHeadDataBytes || params.k_stride_h % 16 != 0 ||
+        params.v_stride_h < kHeadDataBytes || params.v_stride_h % 16 != 0) {
       return cudaErrorInvalidValue;
     }
 

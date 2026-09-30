@@ -12,7 +12,7 @@ import math
 from typing import Optional, Tuple, Union
 
 __all__ = [
-    "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select",
+    "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select", "nvfp4_head_slot_views",
     "_fmha_sm100_plan", "_fmha_sm100",
 ]
 
@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduction_module, get_plan_fn, get_sparse_topk_module
+from .nvfp4_kv import nvfp4_head_slot_views
 from .sparse_fmha_adapter import sparse_fmha, sparse_fmha_plan
 from . import q8kv4_decode_adapter
 
@@ -775,15 +776,7 @@ def _fmha_sm100(
 
     is_nvfp4 = k.dtype == torch.uint8
     if is_nvfp4:
-        pages, heads = k.shape[:2]
-        k_sf = k.as_strided((pages, heads, 128, 8),
-                           (k.stride(0), 1024, 8, 1),
-                           k.storage_offset() + heads * 8192)
-        v_sf = v.as_strided((pages, heads, 128, 8),
-                           (v.stride(0), 1024, 8, 1),
-                           v.storage_offset() + heads * 8192)
-        k = k.as_strided((pages, heads, 128, 64), (k.stride(0), 8192, 64, 1))
-        v = v.as_strided((pages, heads, 128, 64), (v.stride(0), 8192, 64, 1))
+        k, k_sf, v, v_sf = nvfp4_head_slot_views(k, v)
         k_global_scale, v_global_scale = k_scale, v_scale
         k_scale = v_scale = 1.0
         # Sparse NVFP4 decode runs on the Q8KV4 kernel when the plan carries one and the call
@@ -1181,14 +1174,16 @@ def fmha_sm100(
 
     NVFP4 cache layout
     ------------------
-    Pass K and V as uint8 tensors of shape ``[pages, Hkv, 128, 72]``.
-    Each side stores all packed data first (8192 bytes per head), followed
-    by E4M3 block scales (1024 bytes per head). The last dimension describes
-    storage size, not interleaved token rows. Each byte packs two E2M1 values,
-    and each block scale covers 16 values. K scales use ``token*8+group``;
-    V scales use ``(token//4)*32+group*4+token%4`` within each head.
-    K and V have the same page stride; views into a shared
-    ``[pages, 2*Hkv, 128, 72]`` allocation preserve that stride and offset.
+    The cache is one uint8 ``[pages, 2*Hkv, 128, 72]`` allocation of per-head
+    K/V slots: slot ``2*h`` is head ``h``'s K and slot ``2*h+1`` its V, so every
+    head is one contiguous run of the page. A slot stores the head's packed
+    data first (8192 bytes), followed by its E4M3 block scales (1024 bytes);
+    the last dimension describes storage size, not interleaved token rows.
+    Pass K and V as the slot views ``cache[:, 0::2]`` and ``cache[:, 1::2]``
+    (see ``nvfp4_head_slot_views``); other layouts are rejected. Each byte
+    packs two E2M1 values, and each block scale covers 16 values. K scales use
+    ``token*8+group``; V scales use ``(token//4)*32+group*4+token%4`` within
+    each head.
     ``k_scale`` and ``v_scale`` are CUDA float32 scalar tensors for NVFP4:
     ``value = E2M1(code) * E4M3(block_scale) * global_scale``.
     Use BF16 Q for prefill and E4M3 Q for decode. No cache conversion is needed.

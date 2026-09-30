@@ -20,6 +20,8 @@ from typing import Optional, Tuple
 
 import torch
 
+from .nvfp4_kv import nvfp4_head_slot_views
+
 _MM_SPARSE_DIR = os.path.join(
     os.path.dirname(__file__), ".", "cute"
 )
@@ -317,15 +319,7 @@ def sparse_fmha(
 
     is_nvfp4 = k.dtype == torch.uint8
     if is_nvfp4:
-        pages, heads = k.shape[:2]
-        k_sf = k.as_strided((pages, heads, 128, 8),
-                           (k.stride(0), 1024, 8, 1),
-                           k.storage_offset() + heads * 8192)
-        v_sf = v.as_strided((pages, heads, 128, 8),
-                           (v.stride(0), 1024, 8, 1),
-                           v.storage_offset() + heads * 8192)
-        k = k.as_strided((pages, heads, 128, 64), (k.stride(0), 8192, 64, 1))
-        v = v.as_strided((pages, heads, 128, 64), (v.stride(0), 8192, 64, 1))
+        k, k_sf, v, v_sf = nvfp4_head_slot_views(k, v)
     qo_segment_lens = plan_info["qo_segment_lens"]
     cu_seqlens_q = plan_info["cu_seqlens_q"]
     cu_seqlens_k = plan_info["cu_seqlens_k"]
