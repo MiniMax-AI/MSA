@@ -17,6 +17,8 @@ __global__ __launch_bounds__(WarpSpecialization::kThreads, 1)
 void prefill_attention_kernel(
     __grid_constant__ const KernelParams<TmaQ, QGmemShape> params) {
   PrefillArguments const& arguments = params.arguments;
+  // PDL may start this kernel before the schedule producer has published its metadata.
+  cutlass::arch::wait_on_dependent_grids();
   TiledMmaQK tiled_mma_qk;
   TiledMmaPV tiled_mma_pv;
   extern __shared__ char shared_memory[];

@@ -155,6 +155,7 @@ class JitSpec:
                     "--expt-extended-lambda",
                     "-static-global-template-stub=false",
                     "-Xptxas=-O3",
+                    "-DCUTLASS_ENABLE_GDC_FOR_SM100",
                 ],
                 extra_ldflags=[
                     "-lcuda",
