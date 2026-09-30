@@ -80,7 +80,7 @@ plan 与 wrapper 必须在相关 Graph 的生命周期内保持存活。Graph �
 
 `num_index_heads` 只接受 1/2/4；默认 1。各 head 独立选择历史 page，共享单 head K。H=1 也必须传入四维 Q，并返回三维输出。输出 `out` 必须为相同设备上 contiguous int32，shape 为 `[H,B*Q,16]`。
 
-## 验收命令
+## 验证命令
 
 ```bash
 MINIMAX_INFERENCE_TEST_SUITE=smoke python -m pytest tests/inference/msa_v1/indexer/decode/q8kv4

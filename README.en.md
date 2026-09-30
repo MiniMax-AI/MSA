@@ -91,8 +91,7 @@ export CUTLASS_ROOT="$PWD/third_party/cutlass"
 python -m pip install .
 ```
 
-MSA v1 compatibility acceptance covers the minimum version and the latest stable
-release. Rebuild AOT artifacts after upgrading DSL; do not reuse compiled
+Rebuild AOT artifacts after upgrading DSL; do not reuse compiled
 caches across DSL or CUDA backend versions. This project installs the cu13 backend
 by default, including for CuTe DSL 4.5.2. Install and verify the loaded versions with:
 
@@ -287,7 +286,7 @@ for full training usage.
 
 ### 5.3 Timing protocol
 
-Input construction, compilation, planning, and warmup are excluded from formal
+Input construction, compilation, planning, and warmup are excluded from benchmark
 metrics. Inference measures the complete public `run()` E2E path inside CUDA
 Graph; Indexer timing includes score computation and TopK. Prefill rotates
 disjoint tensor sets with a reuse distance greater than twice L2 capacity.
@@ -296,10 +295,10 @@ Defaults are 5 warmup replays and 20 timed replays, reporting median latency per
 call and CV. Prefill calls per Graph depend on tensor slots and are not fixed
 at 120.
 
-Use `smoke` for quick checks and unfiltered `full` for formal aggregate
-comparisons. The inference Indexer entry points above accept
+Use `smoke` for quick checks and unfiltered `full` to compare results across the
+complete suite. The inference Indexer entry points above accept
 `--baseline <baseline.json>` to compare E2E performance on the same workload.
-Write logs and results to the Git-ignored `agent/` directory.
+The examples save results to the Git-ignored `agent/` directory; `--out` selects the output path.
 
 ## 6. Third-party licenses
 

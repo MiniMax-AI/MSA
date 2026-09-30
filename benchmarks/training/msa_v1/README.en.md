@@ -17,7 +17,7 @@ python benchmarks/training/msa_v1/benchmark.py --kernel indexer --use-fp16-score
 python benchmarks/training/msa_v1/benchmark.py --kernel kl
 ```
 
-The default is `--case-suite smoke`. Use `--case-suite full` for the formal
+The default is `--case-suite smoke`. Use `--case-suite full` for the fixed
 32-case selection, `--benchmark-case-id` for one fixed case, or
 `--case-suite all` for every rank-local case. Legacy synthetic workloads are
 available only through explicit arguments, for example:

@@ -55,10 +55,10 @@ the public `replan()` outside CUDA Graph capture.
   Set this environment variable when using an installed wheel.
 - The default AOT cache directory is `~/.cache/minfer/msa_v1`; override it with
   `MSA_V1_AOT_CACHE`. Set `MSA_V1_AOT_DISABLE=1` to disable the AOT cache. JIT is disabled by
-  default on a cache miss. For development-time JIT, explicitly set
+  default on a cache miss. To enable JIT, explicitly set
   `FMHA_SM100_ALLOW_JIT=1` and finish compilation before CUDA Graph capture.
 
-## Acceptance commands
+## Validation commands
 
 Run from the repository root; correctness covers H=1/2/4 automatically.
 

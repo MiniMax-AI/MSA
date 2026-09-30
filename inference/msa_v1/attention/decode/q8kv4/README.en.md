@@ -78,12 +78,12 @@ and `seq_lens` use `torch.int32`; Q, K/V, scales, and output require 16-byte ali
 
 ## Validation commands
 
-Run from the repository root in the required CuTe DSL 4.5.2 environment:
+Run from the repository root with the dependencies listed above installed:
 
 ```bash
 MINIMAX_INFERENCE_TEST_SUITE=full python -m pytest tests/inference/msa_v1/attention/decode/q8kv4
 python -m benchmarks.inference.msa_v1.attention.decode.q8kv4.benchmark --suite full --num-q-heads 32 --num-kv-heads 4
 ```
 
-Full correctness covers GQA=8 and GQA=16. The benchmark requires an exclusive GPU and measures
+Full correctness covers GQA=8 and GQA=16. The benchmark measures
 the public `run()` CUDA Graph E2E latency. Use `--num-q-heads 64` to measure GQA=16.

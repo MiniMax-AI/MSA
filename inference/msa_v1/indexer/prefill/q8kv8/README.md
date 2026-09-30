@@ -54,10 +54,10 @@ topk_indices = wrapper.run(q, paged_k_cache)
   安装 wheel 后应设置此环境变量。
 - 默认 AOT cache 目录为 `~/.cache/minfer/msa_v1`，可通过 `MSA_V1_AOT_CACHE`
   覆盖。设置 `MSA_V1_AOT_DISABLE=1` 可禁用 AOT cache。Cache miss 时默认禁止 JIT；
-  开发环境需要 JIT 时，显式设置 `FMHA_SM100_ALLOW_JIT=1`，并在 CUDA Graph capture
+  需要 JIT 时，显式设置 `FMHA_SM100_ALLOW_JIT=1`，并在 CUDA Graph capture
   前完成编译。
 
-## 验收命令
+## 验证命令
 
 在仓库根目录运行；正确性自动覆盖 H=1/2/4。
 

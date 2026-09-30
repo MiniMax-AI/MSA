@@ -84,7 +84,7 @@ export CUTLASS_ROOT="$PWD/third_party/cutlass"
 python -m pip install .
 ```
 
-MSA v1 的兼容性验收覆盖最低版本和最新稳定版。升级 DSL 后需要重新构建 AOT 产物，
+升级 DSL 后需要重新构建 AOT 产物，
 不得跨 DSL 或 CUDA backend 版本复用编译缓存。本项目默认安装 cu13 backend，
 包括 CuTe DSL 4.5.2。可用以下命令安装并核验实际加载版本：
 
@@ -262,15 +262,15 @@ python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark \
 
 ### 5.3 计时口径
 
-输入构造、编译、plan 和 warmup 不计入正式指标。推理计时覆盖 CUDA Graph 内公开
+输入构造、编译、plan 和 warmup 不计入 benchmark 指标。推理计时覆盖 CUDA Graph 内公开
 `run()` 的完整 E2E 路径；Indexer 包含评分计算与 TopK。Prefill 通过不相交 tensor
 轮换建立超过 2 倍 L2 的复用距离；Decode 默认每张 Graph 调用 120 次，并轮换输入
 实现 cold-cache。默认 5 次 warmup、20 次 replay，报告每次调用的 median latency 和 CV。
 Prefill 的每张 Graph 调用次数由 tensor slots 决定，不固定为 120。
 
-`smoke` 用于快速检查；正式聚合比较应使用不带 case 筛选的 `full`。
+`smoke` 用于快速检查；比较完整测试集的聚合结果时，使用不带 case 筛选的 `full`。
 上述推理 Indexer 入口支持 `--baseline <baseline.json>`，用于比较相同 workload 的
-E2E 性能。日志和结果统一写入 Git 忽略的 `agent/` 目录。
+E2E 性能。示例将结果保存至 Git 忽略的 `agent/` 目录；可通过 `--out` 选择输出路径。
 
 ## 6. 第三方许可证
 

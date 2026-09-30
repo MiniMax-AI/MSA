@@ -79,7 +79,7 @@ All input tensors must be contiguous and on the same CUDA device. A historical p
 
 `num_index_heads` accepts only 1/2/4; the default is 1. Heads independently select historical pages and share the single-head K cache. H=1 also requires four-dimensional Q and returns a three-dimensional output. Preallocated `out` must be contiguous int32 on the same device with shape `[H,B*Q,16]`.
 
-## Acceptance commands
+## Validation commands
 
 ```bash
 MINIMAX_INFERENCE_TEST_SUITE=smoke python -m pytest tests/inference/msa_v1/indexer/decode/q8kv8

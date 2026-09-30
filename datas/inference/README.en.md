@@ -58,9 +58,8 @@ metrics.
 
 - `static_all`: schema, lengths, FLOPs, uniqueness, and selection-reference
   checks for all 10,562 cases.
-- `msa_v1_smoke`: 32 deterministic real cases for MSA v1 development checks.
-- `msa_v1_full`: 512 real cases for full-output MSA v1 correctness before
-  commit.
+- `msa_v1_smoke`: 32 deterministic real cases for quick MSA v1 correctness checks.
+- `msa_v1_full`: 512 real cases for full-output MSA v1 correctness checks.
 - `smoke`: the existing 96 deterministic real cases used by additional paths.
 - `full`: the existing 1,024 real cases used by additional
   paths.
@@ -79,10 +78,10 @@ anchor, and stress cases. The production-weighted approximation uses only
 representative cases, whose `representative_weight` values sum exactly to
 14,805.
 
-Formal MSA v1 benchmarks run all 128 cases. The aggregate score uses the
-production-weighted representative cases, while the 5% per-case regression
-gate applies to every case. The complete set of 10,562 shapes is reserved for
-explicit exhaustive audits and is not part of the routine performance gate:
+The `full` suite contains all 128 cases. Its aggregate score uses only the
+production-weighted representative cases; individual results are reported for
+all cases. The `exhaustive` test tier covers all 10,562 shapes. Weighted metrics
+are calculated as follows:
 
 ```text
 weighted_mean_latency =
@@ -123,11 +122,10 @@ python3 datas/inference/generate_cases.py --check
 
 Tests and benchmarks read data through `datas.inference.cases`.
 
-Formal benchmarks measure the complete public `run()` E2E path under CUDA
-Graph replay. They do not report `plan()` latency or substitute a component
-timing for E2E. Prefill uses disjoint multi-tensor rotation with a reuse
-distance greater than twice L2, 5 warmups, 20 replays, and a per-case
-`CV <= 3%` requirement.
+The prefill benchmark measures the complete public `run()` E2E path under CUDA
+Graph replay, excluding `plan()`. It uses disjoint multi-tensor rotation with a
+reuse distance greater than twice L2, 5 warmups, and 20 replays. Results include
+per-case latency and CV to describe timing variability.
 
 ```bash
 python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
@@ -137,5 +135,5 @@ python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
   --suite full --baseline /path/to/baseline.json --out /path/to/candidate.json
 ```
 
-Use the smoke suite during development. Formal weighted conclusions require
-the fixed 128-case full selection.
+Use `smoke` for a quick check and `full` for the fixed 128-case selection with
+production-weighted results.

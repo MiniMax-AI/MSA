@@ -78,5 +78,3 @@ python -m pytest tests/inference/msa_v1/attention/decode/q8kv8 -q -s --msa-infer
 python -m pytest tests/inference/dequant/nvfp4_to_fp8/test_sparse_flashinfer.py -q -s
 python -m benchmarks.inference.msa_v1.attention.decode.q8kv8.benchmark --suite full --num-q-heads 32 --num-kv-heads 4
 ```
-
-Record the actual GPU used for validation. Report B200 and B300 results separately; measurements on one do not validate the other.

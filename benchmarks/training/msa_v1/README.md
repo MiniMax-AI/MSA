@@ -16,7 +16,7 @@ python benchmarks/training/msa_v1/benchmark.py --kernel indexer --use-fp16-score
 python benchmarks/training/msa_v1/benchmark.py --kernel kl
 ```
 
-默认 `--case-suite smoke`；`--case-suite full` 运行正式 32-case selection，
+默认 `--case-suite smoke`；`--case-suite full` 运行固定 32-case selection，
 `--benchmark-case-id` 运行一个固定 case，`--case-suite all` 运行所有 rank-local case。
 旧人工 workload 只能通过显式参数运行，例如：
 

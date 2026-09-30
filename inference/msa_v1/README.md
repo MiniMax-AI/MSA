@@ -57,9 +57,9 @@ cubin；通过 `python -m pip install -e '.[flashinfer]'` 安装固定的
 
 - Decode correctness：96-case smoke suite 和 256-case full suite。
 - Prefill correctness：32-case smoke suite 和 512-case full suite。
-- 正式 correctness 对公开输出和必要辅助输出做全量 reference 比较。
-- Decode 正式 benchmark 使用 28 个 RL rollout case；Prefill 使用固定 128 个生产 case。
-- 正式性能指标是 CUDA Graph 中公开 `run()` 全路径的 E2E latency。
+- 正确性测试对公开输出和必要辅助输出做全量 reference 比较。
+- Decode full benchmark 使用 28 个 RL rollout case；Prefill 使用固定 128 个生产 case。
+- Benchmark 报告 CUDA Graph 中公开 `run()` 全路径的 E2E latency。
 
 共享 case、运行命令和统计方法见仓库根目录 [README](../../README.md)、
 [inference data manifests](../../datas/inference/README.md)。

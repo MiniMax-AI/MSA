@@ -61,10 +61,10 @@ FlashInfer source code or cubins. Install the pinned `flashinfer-python==0.6.17`
 
 - Decode correctness: a 96-case smoke suite and a 256-case full suite.
 - Prefill correctness: a 32-case smoke suite and a 512-case full suite.
-- Formal correctness compares every element of public outputs and required auxiliary outputs
+- Correctness tests compare every element of public outputs and required auxiliary outputs
   against an independent reference.
-- Formal decode benchmarks use 28 RL-rollout cases; prefill uses 128 fixed production cases.
-- The formal performance metric is end-to-end latency of the public `run()` path inside a CUDA
+- The full decode benchmarks use 28 RL-rollout cases; prefill uses 128 fixed production cases.
+- Benchmarks report end-to-end latency of the public `run()` path inside a CUDA
   Graph.
 
 See the repository [README](../../README.en.md),

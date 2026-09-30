@@ -65,7 +65,7 @@ python -m pip install -e '.[flashinfer]'
 该 extra 固定 `flashinfer-python==0.6.17`。首次使用可能下载或构建官方 kernel；缺少兼容 backend/cubin 时会报错。
 仓库不分发 FlashInfer 源码或 cubin。
 
-## 验收命令
+## 验证命令
 
 在仓库根目录执行；测试自动覆盖 `32/4` 和 `64/4`，benchmark 通过实际 head 数选择配置。
 
@@ -75,5 +75,3 @@ python -m pytest tests/inference/msa_v1/attention/decode/q8kv8 -q -s --msa-infer
 python -m pytest tests/inference/dequant/nvfp4_to_fp8/test_sparse_flashinfer.py -q -s
 python -m benchmarks.inference.msa_v1.attention.decode.q8kv8.benchmark --suite full --num-q-heads 32 --num-kv-heads 4
 ```
-
-验收记录注明实际 GPU；B200 与 B300 的结果分别记录，不将一方的实测外推到另一方。

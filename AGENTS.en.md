@@ -35,7 +35,10 @@ file is its English companion and must be updated with it.
 - Temporary development commits are allowed, but merge each final objective
   into the target worktree as exactly one squashed commit containing only scoped
   files. Preserve unrelated user changes.
-- Push only after the user explicitly chooses whether and where to push.
+- Before every push, present the final diff or commit for user review and obtain
+  explicit authorization for the push and its remote branch. Passing validation
+  or authorization for an earlier push does not authorize subsequent changes.
+  Write review explanations and user-facing reports in Simplified Chinese.
 
 ## Toolchain and reproducibility
 
@@ -305,11 +308,11 @@ changes also require cache-reuse checks and an E2E benchmark.
   any change to a public interface, data contract, dependency, supported
   configuration, invocation, or user-visible behavior updates the nearest
   operator README and any affected parent README in the same commit.
-- Every tracked user-facing `README.md` is the normative Simplified-Chinese
-  version and has a same-directory `README.en.md` companion. Both files link to
-  each other at the top. Their heading structure, tables, examples, commands,
-  public contracts, and limitations remain semantically aligned. Updating
-  either language requires updating the other in the same commit.
+- MSA user-facing documentation defaults to English. `README.md` is the default
+  English entry point and normative version. Retained translations link to the
+  English version and vice versa; keep headings, tables, examples, commands,
+  public contracts, and limitations semantically aligned and update them together.
+  Write explanations provided for user review in Simplified Chinese.
 - README files are for operator users. They document purpose, installation and
   dependencies, public APIs, input/output contracts, supported configurations,
   invocation examples, user-visible errors, and validation commands. They do

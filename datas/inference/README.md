@@ -48,8 +48,8 @@ workspace、FLOPs 和 shape 相关的审计指标。
 `prefill_test_cases_v1.json` 定义以下通用 tier：
 
 - `static_all`：全部 10,562 case 的 schema、长度、FLOPs、唯一性和 selection 引用检查。
-- `msa_v1_smoke`：32 个确定性真实 case，用于 MSA v1 开发阶段快速检查。
-- `msa_v1_full`：512 个真实 case，用于 MSA v1 提交前全量输出数值正确性检查。
+- `msa_v1_smoke`：32 个确定性真实 case，用于 MSA v1 快速正确性检查。
+- `msa_v1_full`：512 个真实 case，用于 MSA v1 全量输出数值正确性检查。
 - `smoke`：原有 96 个确定性真实 case，用于扩展覆盖。
 - `full`：原有 1,024 个真实 case，用于扩展覆盖。
 - `gemm_topk_e2e`：1,024 个 Indexer 端到端 case。
@@ -62,12 +62,12 @@ tensor payload。
 ## Benchmark 选择
 
 默认 benchmark 固定为 128 个 case，包含 representative、hot、batch anchor 和多类 stress
-shape。快速迭代的 production-weighted 近似聚合只使用 representative case；其
+shape。production-weighted 近似聚合只使用 representative case；其
 `representative_weight` 总和严格等于 14,805。
 
-正式 MSA v1 benchmark 必须运行固定 128 个 case；总分只对其中带
-`representative_weight` 的生产代表 case 做加权，所有 128 个 case 都受 5% 单 case
-回退门禁。全部 10,562 个 shape 仅作为显式 exhaustive audit，不属于日常正式性能门禁：
+`full` 包含固定的 128 个 case。聚合结果只对其中带 `representative_weight` 的生产代表
+case 做加权，同时报告所有 case 的单项结果。`exhaustive` 测试层覆盖全部 10,562 个
+shape。加权指标计算如下：
 
 ```text
 weighted_mean_latency =
@@ -106,10 +106,9 @@ python3 datas/inference/generate_cases.py --check
 
 测试和 benchmark 统一从 `datas.inference.cases` 读取数据。
 
-正式 benchmark 只计时 CUDA Graph 中公开 `run()` 的完整 E2E 路径，不报告 `plan()`
-latency，也不以 GEMM-only 或内部 stage 替代 E2E。Prefill 使用 disjoint multi-tensor
-rotation 建立超过 2 倍 L2 的 reuse distance；5 次 warmup、20 次 replay，每个 case
-`CV <= 3%`。
+Prefill benchmark 计时 CUDA Graph 中公开 `run()` 的完整 E2E 路径，不包含 `plan()`。
+通过 disjoint multi-tensor rotation 建立超过 2 倍 L2 的 reuse distance，使用 5 次 warmup
+和 20 次 replay。结果包含各 case 的 latency 和 CV，用于描述计时波动。
 
 ```bash
 python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
@@ -119,4 +118,4 @@ python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
   --suite full --baseline /path/to/baseline.json --out /path/to/candidate.json
 ```
 
-开发阶段默认运行 smoke；正式加权结论必须来自固定的 128-case full selection。
+`smoke` 用于快速检查；`full` 运行固定的 128 个 case，并提供生产权重加权结果。

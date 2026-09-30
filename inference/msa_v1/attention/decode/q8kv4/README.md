@@ -72,14 +72,14 @@ out = wrapper.run(
   支持 QMUL4 的工具链会自动使用该路径，否则自动使用精确的 FP16 dequant fallback；
   调用方不需要选择后端。
 
-## 验收命令
+## 验证命令
 
-在仓库根目录、项目规定的 CuTe DSL 4.5.2 环境中执行：
+安装上述依赖后，在仓库根目录执行：
 
 ```bash
 MINIMAX_INFERENCE_TEST_SUITE=full python -m pytest tests/inference/msa_v1/attention/decode/q8kv4
 python -m benchmarks.inference.msa_v1.attention.decode.q8kv4.benchmark --suite full --num-q-heads 32 --num-kv-heads 4
 ```
 
-完整正确性测试包含 GQA=8 和 GQA=16。benchmark 使用独占 GPU，测量公开 `run()` 的
+完整正确性测试包含 GQA=8 和 GQA=16。benchmark 测量公开 `run()` 的
 CUDA Graph E2E 延迟；将 `--num-q-heads` 改为 64 可测 GQA=16。
