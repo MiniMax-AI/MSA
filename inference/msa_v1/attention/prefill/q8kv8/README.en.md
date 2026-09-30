@@ -4,7 +4,7 @@
 
 ## Purpose
 
-Paged sparse causal prefill attention for SM100 and SM103. Q/K/V use E4M3, the output uses
+Paged sparse causal prefill attention for SM100, SM103, and SM107. Q/K/V use E4M3, the output uses
 BF16, varlen chunk prefill is supported, and no K/V scales are used.
 
 Attention probabilities use `E4M3(P * 448)` with compensation during normalization.
@@ -38,6 +38,11 @@ out, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
 
 Callers may pass preallocated `out` and `lse` tensors to `run()`.
 
+The wrapper constructor optionally accepts `enable_fp16_softmax` and `enable_2x_fp8`.
+The default `None` enables these only for Rubin FP8 inputs on the actual device;
+`False` disables the corresponding optimization. Explicit `True` raises an error
+on unsupported architectures or input types.
+
 ## Data contract
 
 - `q`: `[total_q, Hq, 128]`, E4M3.
@@ -50,6 +55,11 @@ Callers may pass preallocated `out` and `lse` tensors to `run()`.
 - `out`: `[total_q, Hq, 128]`, BF16; `lse`: `[total_q, Hq]`, FP32.
 
 ## Runtime requirements
+
+- The input tensor device selects the implementation; SM107 uses the Rubin path.
+  The FP8 Rubin path requires a CuTe DSL version providing `cutlass.utils.rubin_helpers`
+  and a CUDA toolchain supporting SM107.
+
 
 - Only paged KV and causal attention are supported; chunk prefill uses bottom-right causal
   alignment.

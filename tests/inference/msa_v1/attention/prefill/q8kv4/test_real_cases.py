@@ -11,6 +11,10 @@ import torch
 from inference.msa_v1.attention.prefill.q8kv4 import (
     BatchPrefillWithPagedKVCacheWrapper,
 )
+from tests.inference.cases import (
+    active_inference_suite,
+    selected_msa_v1_prefill_test_cases,
+)
 from tests.inference.msa_v1.attention.prefill.q8kv4.real_cases import (
     make_real_prefill_attention_inputs,
 )
@@ -18,11 +22,6 @@ from tests.inference.msa_v1.attention.prefill.q8kv4.reference import (
     assert_attention_topk_contract,
     paged_sparse_attention_reference,
 )
-from tests.inference.cases import (
-    active_inference_suite,
-    selected_msa_v1_prefill_test_cases,
-)
-
 
 pytestmark = pytest.mark.gpu
 _CASES = selected_msa_v1_prefill_test_cases()
@@ -120,7 +119,7 @@ def _run_case(case, device: torch.device, num_kv_heads: int) -> None:
 
 
 @pytest.mark.parametrize("case", _CASES, ids=lambda case: case.case_id)
-@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("tp1", "tp4"))
+@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("heads4", "heads1"))
 def test_real_varlen_attention_cases(case, num_kv_heads: int) -> None:
     """Check every selected real shape as an independently timed test case."""
 

@@ -20,15 +20,19 @@ operator follows a `plan()` / `run()` lifecycle: `plan()` accepts request-level 
 Available formats and constraints:
 
 - Attention: BF16 prefill, Q8KV4 decode/prefill, and Q8KV8 decode/prefill.
-- Indexer: BF16 prefill, TP4 Q8KV4 decode, and TP4 Q8KV8 decode/prefill.
+- Indexer: BF16 prefill, H=1/2/4 Q8KV4/Q8KV8 decode, and H=1/2/4 Q8KV8 prefill.
+- Q8KV4/Q8KV8 decode indexers support Q=1–16 and return `[H,B*Q,16]`;
+  `inference.msa_v1.indexer.decode.BatchDecodeIndexerPlan` supports sharing across layers and updates inside Graphs.
 - BF16 paged prefill attention accepts contiguous and SGLang-style strided K/V views.
 - BF16 paged prefill indexer supports one or four local index heads and returns
   `[num_index_heads, total_q, 16]`.
 - Q8KV4 and Q8KV8 decode attention support GQA=8/16 on B200/SM100 and B300/SM103,
-  dispatch by the actual `Hq/Hkv`, and return BF16. QLen=8 represents one main token and seven
-  predicted tokens. Q8KV4 uses native CUTLASS C++ and retains SM107 GQA=16 support with
+  dispatch by the actual `Hq/Hkv`, and return BF16. Query length is configured through the public
+  interface. Q8KV4 uses native CUTLASS C++ and retains SM107 GQA=16 support with
   CUDA 13.5 or newer.
 - Q8KV8 prefill attention supports GQA group sizes 1, 2, 4, 8, and 16.
+
+BF16/Q8KV8 prefill attention also retains SM107 Rubin paths selected by the actual device architecture.
 
 See the README in each operator directory for exact tensor shapes, dtypes, and usage examples.
 
@@ -64,5 +68,5 @@ FlashInfer source code or cubins. Install the pinned `flashinfer-python==0.6.17`
   Graph.
 
 See the repository [README](../../README.en.md),
-[inference data manifests](../../datas/inference/README.en.md), and
-[inference rules](../AGENTS.en.md) for shared cases, commands, and acceptance rules.
+[inference data manifests](../../datas/inference/README.en.md) for shared cases, commands,
+and statistical methods.

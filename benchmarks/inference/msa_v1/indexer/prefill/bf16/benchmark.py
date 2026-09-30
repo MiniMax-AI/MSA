@@ -37,7 +37,7 @@ from inference.msa_v1.indexer.prefill.bf16.indexer_gemm import (
 PAGE_SIZE = 128
 HEAD_DIM = 128
 TOPK = 16
-TP1_NUM_INDEX_HEADS = 4
+DEFAULT_NUM_INDEX_HEADS = 4
 MAX_CV = 0.03
 MAX_TIMING_ATTEMPTS = 3
 
@@ -308,8 +308,8 @@ def main() -> None:
         "--num-index-heads",
         type=int,
         choices=M3_PAGED_DIRECT_SCORE_NUM_HEADS,
-        default=TP1_NUM_INDEX_HEADS,
-        help="Local index heads: 4 for TP1 and 1 for TP4",
+        default=DEFAULT_NUM_INDEX_HEADS,
+        help="Number of local index heads: 1 or 4",
     )
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--out", type=Path)
@@ -378,7 +378,6 @@ def main() -> None:
             "nvidia_cutlass_dsl": importlib_metadata.version("nvidia-cutlass-dsl"),
             "formal_full_selection": is_formal,
             "e2e_scope": "public wrapper.run: proxy GEMM + TopK",
-            "tp_degree": TP1_NUM_INDEX_HEADS // args.num_index_heads,
             "num_index_heads": args.num_index_heads,
             "compile_plan_allocate_capture_in_timing": False,
             "cuda_graph": True,

@@ -7,7 +7,7 @@
 Paged sparse causal decode attention for SM100, SM103, and SM107. Q uses E4M3, K/V use packed E2M1
 with E4M3 scales, and the output uses BF16.
 GQA=8 and GQA=16 are supported on B200/B300; SM107 retains GQA=16 support.
-Dispatch uses the actual `Hq/Hkv` ratio and does not accept a TP degree.
+Dispatch uses the actual `Hq/Hkv` ratio.
 
 ## Public API
 

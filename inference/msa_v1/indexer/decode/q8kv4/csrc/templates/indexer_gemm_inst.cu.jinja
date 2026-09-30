@@ -1,0 +1,25 @@
+#include "sm100/device/indexer_gemm.hpp"
+
+namespace minimax::msa_v1::indexer::decode::q8kv4 {
+
+static_assert(IndexerGemmTraits::kMaxQueryLength == {{ max_query_length }});
+static_assert(IndexerGemmTraits::kQueryColumns == {{ query_columns }});
+static_assert(IndexerGemmTraits::kHeadDim == {{ head_dim }});
+static_assert(IndexerGemmTraits::kPageTokens == {{ page_tokens }});
+static_assert(IndexerGemmTraits::kScaleGroupSize == {{ scale_group_size }});
+static_assert(IndexerGemmTraits::kMaximumPages == {{ maximum_pages }});
+
+cudaError_t launch_indexer_gemm(IndexerGemmArguments const &arguments, cudaStream_t stream) {
+  using Runner = IndexerGemmRunner<IndexerGemmTraits>;
+  if (!Runner::can_run(arguments)) {
+    return cudaErrorNotSupported;
+  }
+  IndexerGemmParams params{};
+  cudaError_t status = Runner::to_underlying_arguments(arguments, params);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return Runner::run(params, stream);
+}
+
+} // namespace minimax::msa_v1::indexer::decode::q8kv4

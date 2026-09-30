@@ -51,9 +51,8 @@ datas = [
     "csrc/include/sm100/device/*",
     "csrc/include/sm100/kernel/*",
 ]
-"inference.msa_v1.indexer.decode.tp4_q8kv4" = [
+"inference.msa_v1.indexer.decode.q8kv4" = [
     "csrc/api/*",
-    "csrc/src/*",
     "csrc/templates/*",
     "csrc/include/sm100/common/*",
     "csrc/include/sm100/collective/*",

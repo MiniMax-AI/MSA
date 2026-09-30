@@ -33,8 +33,8 @@ block size=128、TopK=16。调用入口见[训练接口](#31-msa-v1-训练)。
 | --- | --- | --- | --- |
 | Prefill Attention | BF16 Q/K/V；Q8KV8；Q8KV4 | BF16 O，可选 FP32 LSE | Paged sparse causal attention，支持变长 chunk prefill |
 | Decode Attention | Q8KV8；Q8KV4 | BF16 O | Paged sparse decode / MTP；Q8KV8 需安装可选 FlashInfer 依赖 |
-| Prefill Indexer（含 TopK） | BF16 Q/K；FP8 E4M3 Q/K | INT32 logical page indices | BF16 支持 1 或 4 个本地 index heads；FP8 为 TP4 路径 |
-| Decode Indexer（含 TopK） | FP8 E4M3 Q/K；FP8 E4M3 Q + NVFP4 K | INT32 logical page indices | TP4 路径，8 个 query（1 个主 token + 7 个 draft token） |
+| Prefill Indexer（含 TopK） | BF16 Q/K；FP8 E4M3 Q/K | INT32 logical page indices | BF16 支持 1 或 4 个本地 index heads；FP8 支持 1/2/4 个本地 index heads |
+| Decode Indexer（含 TopK） | FP8 E4M3 Q/K；FP8 E4M3 Q + NVFP4 K | INT32 logical page indices | 1/2/4 个本地 index heads，每请求 1–16 个 query |
 | NVFP4 → FP8 转换 | Packed E2M1 数据 + E4M3 scale | FP8 E4M3 数据 | Dense 转换或仅转换 TopK 选中的 paged K/V |
 
 各算子的 package 路径见[推理接口](#32-msa-v1-推理)，shape、scale、分页和
@@ -57,8 +57,8 @@ CUDA Graph 契约见[推理算子文档](inference/msa_v1/README.md)及其链接
 
 | GPU | Architecture | 状态 |
 | --- | --- | --- |
-| NVIDIA B200 | SM100 | 支持 |
-| NVIDIA GB300 | SM103 | 支持 |
+| NVIDIA GB200/B200 | SM100 | 支持 |
+| NVIDIA GB300/B300 | SM103 | 支持 |
 
 仓库的 Blackwell kernel 覆盖 B200/SM100 与 B300/SM103，包括 inference 和 training。
 运行时按设备架构选择兼容实现；各算子既有的 dtype、shape 和数据契约仍适用。
@@ -74,6 +74,14 @@ nvidia-cutlass-dsl[cu13]>=4.5.2
 ```bash
 git submodule update --init --recursive
 python -m pip install -e ".[test]"
+```
+
+作为普通安装包使用时，C++ 算子和 Q8KV8 prefill indexer 仍需要公开 CUTLASS headers。
+保留 CUTLASS checkout，并通过 `CUTLASS_ROOT` 指定位置。例如在仓库根目录执行：
+
+```bash
+export CUTLASS_ROOT="$PWD/third_party/cutlass"
+python -m pip install .
 ```
 
 MSA v1 的兼容性验收覆盖最低版本和最新稳定版。升级 DSL 后需要重新构建 AOT 产物，
@@ -103,8 +111,11 @@ fallback。Q8KV4 Prefill Attention 要求 CUDA Toolkit 13.4 或更高版本。
 Q8K8 sparse decode 通过可选的外部 FlashInfer TRTLLM-GEN backend 提供。本仓库不包含
 FlashInfer 源码或 cubin；使用 `python -m pip install -e '.[flashinfer]'` 安装
 `flashinfer-python==0.6.17`。Q8KV4 decode 使用原生 CUTLASS C++；两种 decode attention
-均支持 B200/B300 上的 GQA=8/16 和 BF16 输出，按实际 `Hq/Hkv` 选择实现，不接收 TP 数。
+均支持 B200/B300 上的 GQA=8/16 和 BF16 输出，按实际 `Hq/Hkv` 选择实现。
 Q8KV4 decode 另保留 SM107 的 GQA=16 支持，需要 CUDA Toolkit 13.5 或更新版本。
+
+Rubin（SM107）保留 BF16/Q8KV8 prefill attention 和 Q8KV4 decode attention 路径，
+通过输入 tensor 所在设备自动选择；具体依赖和限制见各算子 README。其余算子不据此声明 Rubin 支持。
 
 ## 3. 主要接口
 
@@ -145,7 +156,8 @@ Tree Indexer 的用法见
 
 MSA v1 推理算子统一使用 `plan()` / `run()` 生命周期。`plan()` 接收请求级 metadata，
 `run()` 接收逐层数据。进入 CUDA Graph capture 前必须完成 `plan()` 和所需 warmup；
-capture 期间应使用预分配输出。
+capture 期间应使用预分配输出。Decode indexer 另提供显式 `BatchDecodeIndexerPlan`：
+在 capture 外构造和绑定，`update()` 可在 Graph 内更新同一 step 各层共享的长度 metadata。
 
 | 算子 | Package | 输入格式 |
 | --- | --- | --- |
@@ -154,10 +166,10 @@ capture 期间应使用预分配输出。
 | Prefill Attention | `inference.msa_v1.attention.prefill.bf16` | BF16 Q/K/V |
 | Prefill Attention | `inference.msa_v1.attention.prefill.q8kv4` | E4M3 Q + NVFP4 K/V |
 | Prefill Attention | `inference.msa_v1.attention.prefill.q8kv8` | E4M3 Q/K/V |
-| Decode Indexer | `inference.msa_v1.indexer.decode.tp4_q8kv4` | E4M3 Q + NVFP4 K |
-| Decode Indexer | `inference.msa_v1.indexer.decode.tp4_q8kv8` | E4M3 Q/K |
+| Decode Indexer | `inference.msa_v1.indexer.decode.q8kv4` | E4M3 Q + NVFP4 K |
+| Decode Indexer | `inference.msa_v1.indexer.decode.q8kv8` | E4M3 Q/K |
 | Prefill Indexer | `inference.msa_v1.indexer.prefill.bf16` | BF16 Q/K |
-| Prefill Indexer | `inference.msa_v1.indexer.prefill.tp4_q8kv8` | E4M3 Q/K |
+| Prefill Indexer | `inference.msa_v1.indexer.prefill.q8kv8` | E4M3 Q/K |
 
 Q8KV4 Decode Attention 示例：
 
@@ -213,6 +225,9 @@ Decode 配置使用 batch=8/32/64/128，标称序列长度为
 1,000/4,000/5,000/10,000/50,000/100,000/200,000，每个请求包含 8 个 query
 （1 个主 token + 7 个 draft token）。以 1701 为基础 seed，在 batch 内生成围绕标称
 长度变化的真实 seqlen，并保持平均长度等于标称值；它是一套固定合成 workload。
+Indexer 可通过 `--query-length` 选择 Q=1–16，通过 `--num-index-heads` 选择 H=1/2/4。
+独立的 `--suite low-latency` 覆盖 batch=1/2/4 × KV length=1,000/4,000/8,000/32,000，
+共 12 个 case，单独报告延迟。
 这些数据不包含 tensor payload 或原始业务数据。
 
 ### 5.2 运行示例
@@ -235,7 +250,7 @@ python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark \
 推理 Decode Indexer：完整 28-case benchmark：
 
 ```bash
-python -m benchmarks.inference.msa_v1.indexer.decode.tp4_q8kv8.benchmark \
+python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark \
   --suite full --graph-calls 120 --warmup 5 --replays 20 \
   --out agent/agent_benchmark/decode_q8kv8_full.json
 ```

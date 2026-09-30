@@ -112,10 +112,10 @@ rotation 建立超过 2 倍 L2 的 reuse distance；5 次 warmup、20 次 replay
 `CV <= 3%`。
 
 ```bash
-python3 -m benchmarks.inference.msa_v1.indexer.prefill.tp4_q8kv8.benchmark \
+python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
   --suite full --out /path/to/baseline.json
 
-python3 -m benchmarks.inference.msa_v1.indexer.prefill.tp4_q8kv8.benchmark \
+python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
   --suite full --baseline /path/to/baseline.json --out /path/to/candidate.json
 ```
 

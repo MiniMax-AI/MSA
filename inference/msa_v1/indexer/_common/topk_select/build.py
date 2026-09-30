@@ -15,7 +15,7 @@ from inference.msa_v1._build_utils import cuda_home
 _LOGGER = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parent
 _CSRC = _ROOT / "csrc"
-_CACHE_ABI = "msa_v1_indexer_topk_pr23_grid_rows_v1"
+_CACHE_ABI = "msa_v1_indexer_topk_decode_compact_v2"
 
 
 @lru_cache(maxsize=1)
@@ -63,7 +63,9 @@ def load_extension():
                 f"-Wl,-rpath,{selected_cuda_home / 'lib64'}",
             ],
             build_directory=str(build_root),
-            verbose=(os.environ.get("MINIMAX_MSA_V1_INDEXER_TOPK_VERBOSE_BUILD") == "1"),
+            verbose=(
+                os.environ.get("MINIMAX_MSA_V1_INDEXER_TOPK_VERBOSE_BUILD") == "1"
+            ),
         )
     finally:
         cpp_extension.CUDA_HOME = previous_cuda_home

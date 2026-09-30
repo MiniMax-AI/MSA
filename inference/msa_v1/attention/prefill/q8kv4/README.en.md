@@ -56,7 +56,7 @@ Callers may pass preallocated `out` and `lse` tensors to `run()`.
 
 - Only paged KV and causal attention are supported; chunk prefill uses bottom-right causal
   alignment.
-- Head counts are inferred from TopK's leading dimension. TP1's local 64/4 and TP4's 16/1
+- Head counts are inferred from TopK's leading dimension. Local 64/4 and 16/1
   heads are supported without head replication.
 - `cu_seqlens_k` is the only source of KV lengths.
 - Call `plan()` outside CUDA Graph capture and preallocate `out` and `lse` during capture.

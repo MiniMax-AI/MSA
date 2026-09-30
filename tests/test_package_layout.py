@@ -24,10 +24,10 @@ MSA_V1_OPERATOR_ROOTS = (
     MSA_V1_INFERENCE_ROOT / "attention/prefill/bf16",
     MSA_V1_INFERENCE_ROOT / "attention/prefill/q8kv4",
     MSA_V1_INFERENCE_ROOT / "attention/prefill/q8kv8",
-    MSA_V1_INFERENCE_ROOT / "indexer/decode/tp4_q8kv4",
-    MSA_V1_INFERENCE_ROOT / "indexer/decode/tp4_q8kv8",
+    MSA_V1_INFERENCE_ROOT / "indexer/decode/q8kv4",
+    MSA_V1_INFERENCE_ROOT / "indexer/decode/q8kv8",
     MSA_V1_INFERENCE_ROOT / "indexer/prefill/bf16",
-    MSA_V1_INFERENCE_ROOT / "indexer/prefill/tp4_q8kv8",
+    MSA_V1_INFERENCE_ROOT / "indexer/prefill/q8kv8",
 )
 
 
@@ -174,8 +174,8 @@ def test_msa_v1_inference_layout_is_canonical() -> None:
     assert (msa_v1_root / "attention/prefill/_common/atten_fwd_sm100.py").is_file()
     assert not (msa_v1_root / "attention/prefill/q8kv8/atten_fwd.py").exists()
     assert (msa_v1_root / "attention/prefill/bf16/interface.py").is_file()
-    assert (msa_v1_root / "indexer/decode/tp4_q8kv8/indexer_gemm.py").is_file()
-    assert (msa_v1_root / "indexer/prefill/tp4_q8kv8/indexer_gemm.py").is_file()
+    assert (msa_v1_root / "indexer/decode/q8kv8/indexer_gemm.py").is_file()
+    assert (msa_v1_root / "indexer/prefill/q8kv8/indexer_gemm.py").is_file()
     assert (msa_v1_root / "indexer/prefill/bf16/indexer_gemm.py").is_file()
 
 
@@ -194,6 +194,7 @@ def test_msa_v1_legacy_inference_packages_are_absent() -> None:
         package for package in legacy_packages if (msa_v1_root / package).exists()
     ]
     assert not [path for path in msa_v1_root.rglob("_vendor") if path.is_dir()]
+    assert not [path for path in msa_v1_root.rglob("tp*") if path.is_dir()]
 
 
 def test_decode_attention_q8kv4_csrc_uses_op_local_flashinfer_layout() -> None:
@@ -240,16 +241,17 @@ def test_prefill_attention_q8kv4_csrc_uses_op_local_flashinfer_layout() -> None:
 
 
 def test_decode_indexer_q8kv4_csrc_uses_op_local_flashinfer_layout() -> None:
-    csrc = INFERENCE_ROOT / "msa_v1/indexer/decode/tp4_q8kv4/csrc"
+    csrc = INFERENCE_ROOT / "msa_v1/indexer/decode/q8kv4/csrc"
     assert {path.name for path in csrc.iterdir() if path.is_dir()} == {
         "api",
         "include",
-        "src",
         "templates",
     }
     assert (csrc / "api/indexer_gemm_api.cpp").is_file()
     assert (csrc / "api/indexer_gemm_binding.cpp").is_file()
-    assert (csrc / "src/indexer_gemm_scheduler.cu").is_file()
+    shared_plan = INFERENCE_ROOT / "msa_v1/indexer/decode"
+    assert (shared_plan / "plan.py").is_file()
+    assert (shared_plan / "plan_kernel.py").is_file()
     assert (csrc / "templates/indexer_gemm_inst.cu.jinja").is_file()
     assert (csrc / "include/sm100/common/nvfp4_to_e4m3.cuh").is_file()
     for layer in ("common", "collective", "device", "kernel"):

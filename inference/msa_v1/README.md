@@ -20,14 +20,18 @@ MSA v1 提供 paged sparse attention 和 indexer 的 decode/prefill 接口。所
 可用数据格式与约束：
 
 - Attention：BF16 prefill、Q8KV4 decode/prefill 和 Q8KV8 decode/prefill。
-- Indexer：BF16 prefill、TP4 Q8KV4 decode、TP4 Q8KV8 decode/prefill。
+- Indexer：BF16 prefill、H=1/2/4 Q8KV4/Q8KV8 decode，以及 H=1/2/4 Q8KV8 prefill。
+- Q8KV4/Q8KV8 decode indexer 支持 Q=1–16，输出 `[H,B*Q,16]`；
+  `inference.msa_v1.indexer.decode.BatchDecodeIndexerPlan` 支持跨层共享及 Graph 内更新。
 - BF16 paged prefill attention 支持 contiguous 和 SGLang-style strided K/V view。
 - BF16 paged prefill indexer 支持 1 或 4 个本地 index head，输出为
   `[num_index_heads, total_q, 16]`。
 - Q8KV4 与 Q8KV8 decode attention 在 B200/SM100、B300/SM103 上支持 GQA=8/16，
-  按实际 `Hq/Hkv` dispatch，输出 BF16；QLen=8 对应 1 个主 token 和 7 个预测 token。
+  按实际 `Hq/Hkv` dispatch，输出 BF16；query length 由公开接口指定。
   Q8KV4 使用原生 CUTLASS C++，并保留 CUDA 13.5 或更新版本上的 SM107 GQA=16 支持。
 - Q8KV8 prefill attention 支持 GQA group size 1、2、4、8 或 16。
+
+BF16/Q8KV8 prefill attention 还保留 SM107 Rubin 路径，由实际设备架构选择。
 
 具体张量 shape、dtype 和调用示例见各算子目录中的 README。
 
@@ -57,5 +61,5 @@ cubin；通过 `python -m pip install -e '.[flashinfer]'` 安装固定的
 - Decode 正式 benchmark 使用 28 个 RL rollout case；Prefill 使用固定 128 个生产 case。
 - 正式性能指标是 CUDA Graph 中公开 `run()` 全路径的 E2E latency。
 
-共享 case、运行命令和验收规则见仓库根目录 [README](../../README.md)、
-[inference data manifests](../../datas/inference/README.md) 和 [inference rules](../AGENTS.md)。
+共享 case、运行命令和统计方法见仓库根目录 [README](../../README.md)、
+[inference data manifests](../../datas/inference/README.md)。

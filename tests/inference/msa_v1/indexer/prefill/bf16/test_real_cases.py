@@ -16,10 +16,10 @@ from tests.inference.cases import (
 from tests.inference.msa_v1.indexer.prefill.bf16.real_cases import (
     make_real_prefill_inputs,
 )
-from tests.inference.msa_v1.indexer.prefill.tp4_q8kv8.cases import (
+from tests.inference.msa_v1.indexer.prefill.q8kv8.cases import (
     RealPrefillInputs as ReferenceInputs,
 )
-from tests.inference.msa_v1.indexer.prefill.tp4_q8kv8.reference import (
+from tests.inference.msa_v1.indexer.prefill.q8kv8.reference import (
     assert_full_topk_quality,
     assert_topk_structure,
     expected_lengths,

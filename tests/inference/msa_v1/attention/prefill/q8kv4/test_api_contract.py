@@ -105,7 +105,7 @@ def test_plan_rejects_noncausal_mode() -> None:
         )
 
 
-@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("tp1", "tp4"))
+@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("heads4", "heads1"))
 def test_run_uses_preallocated_output_and_lse(num_kv_heads: int) -> None:
     topk, cu_seqlens, page_table, q, packed_k, packed_v, scale = (
         _make_single_page_inputs(num_kv_heads)
@@ -129,7 +129,7 @@ def test_run_uses_preallocated_output_and_lse(num_kv_heads: int) -> None:
     assert torch.all(lse == 0)
 
 
-@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("tp1", "tp4"))
+@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("heads4", "heads1"))
 def test_cuda_graph_capture_and_replay(num_kv_heads: int) -> None:
     topk, cu_seqlens, page_table, q, packed_k, packed_v, scale = (
         _make_single_page_inputs(num_kv_heads)
@@ -229,7 +229,7 @@ def test_runtime_heads_and_shapes_reuse_extension() -> None:
     assert jit._load_extension_for_arch.cache_info().misses == cache_before.misses
 
 
-def test_tp4_plan_rejects_mismatched_heads() -> None:
+def test_single_head_plan_rejects_mismatched_heads() -> None:
     topk, cu_seqlens, page_table, q, packed_k, packed_v, scale = (
         _make_single_page_inputs(1)
     )

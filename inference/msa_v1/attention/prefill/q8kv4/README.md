@@ -52,7 +52,7 @@ out, lse = wrapper.run(
 ## 运行约束
 
 - 仅支持 paged KV 和 causal attention；chunk prefill 使用 bottom-right causal 对齐。
-- head 数由 TopK 的首维确定，支持 TP1 的 64/4 和 TP4 的 16/1 本地 heads，无需复制 heads。
+- head 数由 TopK 的首维确定，支持 64/4 和 16/1 本地 query/KV heads，无需复制 heads。
 - `cu_seqlens_k` 是 KV 长度的唯一来源。
 - `plan()` 必须在 CUDA Graph capture 外调用；capture 时应预分配 `out` 和 `lse`。
 - NVFP4 dequant 要求 CUDA Toolkit 13.4 或更高版本。

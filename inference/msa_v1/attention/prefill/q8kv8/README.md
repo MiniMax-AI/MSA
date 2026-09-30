@@ -4,7 +4,7 @@
 
 ## 功能
 
-面向 SM100/SM103 的 paged sparse causal prefill attention。Q/K/V 均使用 E4M3，输出为
+面向 SM100/SM103/SM107 的 paged sparse causal prefill attention。Q/K/V 均使用 E4M3，输出为
 BF16，支持 varlen chunk prefill，且不使用 K/V scale。
 
 Attention 概率按 `E4M3(P × 448)` 量化，并在归一化时补偿该缩放；返回的 LSE
@@ -36,6 +36,10 @@ out, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
 
 调用方可以向 `run()` 传入预分配的 `out` 和 `lse`。
 
+构造 wrapper 时可选传入 `enable_fp16_softmax` 和 `enable_2x_fp8`。
+默认 `None` 按实际设备选择：仅在 Rubin FP8 路径启用；`False` 关闭对应优化。
+在不支持的架构或输入类型上显式设置 `True` 会报错。
+
 ## 数据契约
 
 - `q`：`[total_q, Hq, 128]`，E4M3。
@@ -47,6 +51,10 @@ out, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
 - `out`：`[total_q, Hq, 128]`，BF16；`lse`：`[total_q, Hq]`，FP32。
 
 ## 运行约束
+
+- 实现按输入 tensor 所在设备选择；SM107 使用 Rubin 路径。FP8 Rubin 路径需要提供
+  `cutlass.utils.rubin_helpers` 的 CuTe DSL 版本及支持 SM107 的 CUDA 工具链。
+
 
 - 仅支持 paged KV 和 causal attention；chunk prefill 使用 bottom-right causal 对齐。
 - `Hq / Hkv` 支持 1、2、4、8 或 16；默认 `Hq=64`、`Hkv=4`。

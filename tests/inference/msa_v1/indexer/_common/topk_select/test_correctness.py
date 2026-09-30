@@ -20,10 +20,11 @@ pytestmark = pytest.mark.gpu
 def _run_and_check(scores: np.ndarray, lengths: np.ndarray) -> np.ndarray:
     device_scores = torch.from_numpy(scores).to("cuda")
     device_lengths = torch.from_numpy(lengths).to("cuda")
-    actual = _topk_select(device_scores, device_lengths)
-    torch.cuda.synchronize()
-    actual_cpu = actual.cpu().numpy()
-    assert_quantized_topk_contract(scores, lengths, actual_cpu)
+    for compact_grid in (False, True):
+        actual = _topk_select(device_scores, device_lengths, compact_grid=compact_grid)
+        torch.cuda.synchronize()
+        actual_cpu = actual.cpu().numpy()
+        assert_quantized_topk_contract(scores, lengths, actual_cpu)
     return actual_cpu
 
 
@@ -104,7 +105,8 @@ def test_replay_and_row_permutation_are_deterministic() -> None:
     torch.testing.assert_close(permuted, baseline[permutation], atol=0, rtol=0)
 
 
-def test_cuda_graph_capture_and_replay() -> None:
+@pytest.mark.parametrize("compact_grid", (False, True))
+def test_cuda_graph_capture_and_replay(compact_grid: bool) -> None:
     num_rows = 29
     max_cols = 1025
     lengths = focused_lengths(max_cols, num_rows, seed=101)
@@ -117,7 +119,9 @@ def test_cuda_graph_capture_and_replay() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        result = _topk_select(device_scores, device_lengths, out=output)
+        result = _topk_select(
+            device_scores, device_lengths, out=output, compact_grid=compact_grid
+        )
     assert result.data_ptr() == output.data_ptr()
     graph.replay()
     torch.cuda.synchronize()

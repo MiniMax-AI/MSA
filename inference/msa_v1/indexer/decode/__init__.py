@@ -1,3 +1,5 @@
 """Decode indexer kernels."""
 
-__all__ = ["tp4_q8kv4", "tp4_q8kv8"]
+from .plan import BatchDecodeIndexerPlan
+
+__all__ = ["BatchDecodeIndexerPlan", "q8kv4", "q8kv8"]

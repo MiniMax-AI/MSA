@@ -36,8 +36,8 @@ See the [training interfaces](#31-msa-v1-training) for entry points.
 | --- | --- | --- | --- |
 | Prefill Attention | BF16 Q/K/V; Q8KV8; Q8KV4 | BF16 O, optional FP32 LSE | Paged sparse causal attention with variable-length chunk prefill |
 | Decode Attention | Q8KV8; Q8KV4 | BF16 O | Paged sparse decode / MTP; Q8KV8 requires the optional FlashInfer dependency |
-| Prefill Indexer (including TopK) | BF16 Q/K; FP8 E4M3 Q/K | INT32 logical page indices | BF16 supports 1 or 4 local index heads; FP8 uses the TP4 path |
-| Decode Indexer (including TopK) | FP8 E4M3 Q/K; FP8 E4M3 Q + NVFP4 K | INT32 logical page indices | TP4 path with 8 queries (1 main token + 7 draft tokens) |
+| Prefill Indexer (including TopK) | BF16 Q/K; FP8 E4M3 Q/K | INT32 logical page indices | BF16 supports 1 or 4 local index heads; FP8 supports 1/2/4 local index heads |
+| Decode Indexer (including TopK) | FP8 E4M3 Q/K; FP8 E4M3 Q + NVFP4 K | INT32 logical page indices | 1/2/4 local index heads and 1–16 queries per request |
 | NVFP4 → FP8 conversion | Packed E2M1 data + E4M3 scales | FP8 E4M3 data | Dense conversion or conversion of only TopK-selected paged K/V |
 
 See the [inference interfaces](#32-msa-v1-inference) for package paths and the
@@ -62,8 +62,8 @@ unordered semantics, with the local block in the last valid position.
 
 | GPU | Architecture | Status |
 | --- | --- | --- |
-| NVIDIA B200 | SM100 | Supported |
-| NVIDIA GB300 | SM103 | Supported |
+| NVIDIA GB200/B200 | SM100 | Supported |
+| NVIDIA GB300/B300 | SM103 | Supported |
 
 The repository's Blackwell kernels cover B200/SM100 and B300/SM103, including
 inference and training. Runtime dispatch selects a compatible implementation;
@@ -80,6 +80,15 @@ Install the project with:
 ```bash
 git submodule update --init --recursive
 python -m pip install -e ".[test]"
+```
+
+When using a regular package installation, the C++ operators and Q8KV8 prefill indexer
+still require public CUTLASS headers. Keep a CUTLASS checkout and set `CUTLASS_ROOT`.
+For example, run from the repository root:
+
+```bash
+export CUTLASS_ROOT="$PWD/third_party/cutlass"
+python -m pip install .
 ```
 
 MSA v1 compatibility acceptance covers the minimum version and the latest stable
@@ -114,8 +123,12 @@ Q8K8 sparse decode is provided through an optional external FlashInfer
 TRTLLM-GEN backend. This repository does not include FlashInfer source code or
 cubins. Install `flashinfer-python==0.6.17` with `python -m pip install -e '.[flashinfer]'`.
 Q8KV4 decode uses native CUTLASS C++. Both decode attention formats support GQA=8/16 and BF16
-output on B200/B300, selecting the implementation by the actual `Hq/Hkv` without a TP parameter.
+output on B200/B300, selecting the implementation by the actual `Hq/Hkv`.
 Q8KV4 decode also retains SM107 GQA=16 support, requiring CUDA Toolkit 13.5 or newer.
+
+Rubin (SM107) retains BF16/Q8KV8 prefill attention and Q8KV4 decode attention paths,
+selected from the input tensor device. See the operator READMEs for dependencies and restrictions.
+This does not imply Rubin support for the other operators.
 
 ## 3. Main interfaces
 
@@ -158,6 +171,9 @@ for Tree Indexer usage.
 
 ### 3.2 MSA v1 inference
 
+Decode indexers also expose `BatchDecodeIndexerPlan`: construct and bind it outside capture.
+Its `update()` can run inside a Graph to refresh length metadata shared by layers in the same step.
+
 MSA v1 inference operators use a common `plan()` / `run()` lifecycle.
 `plan()` accepts request-level metadata, while `run()` accepts per-layer data.
 Complete `plan()` and any required warmup before CUDA Graph capture, and use
@@ -170,10 +186,10 @@ preallocated outputs during capture.
 | Prefill Attention | `inference.msa_v1.attention.prefill.bf16` | BF16 Q/K/V |
 | Prefill Attention | `inference.msa_v1.attention.prefill.q8kv4` | E4M3 Q + NVFP4 K/V |
 | Prefill Attention | `inference.msa_v1.attention.prefill.q8kv8` | E4M3 Q/K/V |
-| Decode Indexer | `inference.msa_v1.indexer.decode.tp4_q8kv4` | E4M3 Q + NVFP4 K |
-| Decode Indexer | `inference.msa_v1.indexer.decode.tp4_q8kv8` | E4M3 Q/K |
+| Decode Indexer | `inference.msa_v1.indexer.decode.q8kv4` | E4M3 Q + NVFP4 K |
+| Decode Indexer | `inference.msa_v1.indexer.decode.q8kv8` | E4M3 Q/K |
 | Prefill Indexer | `inference.msa_v1.indexer.prefill.bf16` | BF16 Q/K |
-| Prefill Indexer | `inference.msa_v1.indexer.prefill.tp4_q8kv8` | E4M3 Q/K |
+| Prefill Indexer | `inference.msa_v1.indexer.prefill.q8kv8` | E4M3 Q/K |
 
 Q8KV4 Decode Attention example:
 
@@ -233,6 +249,10 @@ actual sequence lengths vary within each batch around the nominal length while
 preserving that exact mean. Decode is a fixed synthetic workload suite.
 These data contain no tensor payloads or raw business data.
 
+Indexers accept Q=1–16 through `--query-length` and H=1/2/4 through `--num-index-heads`.
+The separate `--suite low-latency` covers batch=1/2/4 × KV length=1,000/4,000/8,000/32,000
+and reports latency for these 12 cases independently.
+
 ### 5.2 Examples
 
 Run from the repository root and enable initial JIT compilation as described
@@ -254,7 +274,7 @@ python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark \
 Inference Decode Indexer: complete 28-case benchmark:
 
 ```bash
-python -m benchmarks.inference.msa_v1.indexer.decode.tp4_q8kv8.benchmark \
+python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark \
   --suite full --graph-calls 120 --warmup 5 --replays 20 \
   --out agent/agent_benchmark/decode_q8kv8_full.json
 ```

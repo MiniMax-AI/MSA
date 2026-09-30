@@ -143,17 +143,30 @@ TopK indices, LSE, and `cu_seqlens` metadata need not use tiled copies.
 Compile keys contain only stable properties that change code generation:
 architecture, dtype, head dimension, GQA ratio, tile/stage/thread/cluster
 configuration, algorithm switches, optional tensor presence, and static
-layout/broadcast patterns. Never include runtime batch size, total Q/KV,
-sequence lengths, number or content of sequences, `cu_seqlens` values, TopK
-values, tensor identity/pointer, or stream. Runtime tensor values must not
-cause D2H synchronization or recompilation. Cache tests vary runtime sizes and
-metadata while requiring reuse, and vary a real static configuration when a
-new artifact is expected. Varlen metadata enters keys only through static
-signature properties such as presence, never through tensors or values. New
-specializations require evidence of different generated code and a bounded,
-stable host-side enumeration, never a runtime size.
+layout/broadcast patterns. Except for the decode Q specialization below, never
+include runtime batch size, total Q/KV, sequence lengths, sequence count or
+contents, page capacity, `cu_seqlens` values, TopK values, tensor identity/pointer,
+or stream.
+
+Decode query length Q per request may be a compile-time value. When Q or the
+local head count H changes MMA tile shape, layout, loop unrolling, or resource
+configuration, Q/H or the corresponding finite tile configuration may enter the
+compile key. Obtain Q from a host-known parameter or tensor shape metadata,
+never by reading device tensor contents or introducing D2H synchronization.
+This exception does not permit runtime workload sizes or benchmark-case-specific
+specializations that do not change code generation.
+
+Cache/AOT tests hold static Q/H or tile configuration fixed while varying batch,
+KV length, `cu_seqlens` contents, and varlen distributions to verify reuse.
+Changing static Q/H may produce a new artifact when it changes generated code;
+runtime sizes mapped to the same static configuration must reuse artifacts.
 
 ## Runtime state and workspace lifetime
+
+- An explicit decode `BatchDecodeIndexerPlan` may share read-only metadata across layers
+  within one step. Update after lengths change and order consumers and later updates with
+  streams/events. Never reuse stale metadata across steps. This exception does not apply
+  to attention schedules derived from layer-specific TopK.
 
 - Process-global caches may contain only compiled artifacts and immutable host
   metadata that does not retain runtime CUDA tensors, device pointers, or

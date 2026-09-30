@@ -130,10 +130,10 @@ distance greater than twice L2, 5 warmups, 20 replays, and a per-case
 `CV <= 3%` requirement.
 
 ```bash
-python3 -m benchmarks.inference.msa_v1.indexer.prefill.tp4_q8kv8.benchmark \
+python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
   --suite full --out /path/to/baseline.json
 
-python3 -m benchmarks.inference.msa_v1.indexer.prefill.tp4_q8kv8.benchmark \
+python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
   --suite full --baseline /path/to/baseline.json --out /path/to/candidate.json
 ```
 

@@ -9,6 +9,8 @@ import torch
 DEFAULT_SEED = 1701
 BATCH_SIZES = (8, 32, 64, 128)
 SEQ_LENGTHS = (1_000, 4_000, 5_000, 10_000, 50_000, 100_000, 200_000)
+LOW_LATENCY_BATCH_SIZES = (1, 2, 4)
+LOW_LATENCY_SEQ_LENGTHS = (1_000, 4_000, 8_000, 32_000)
 Q_LEN_PER_REQ = 8
 
 _WEIGHTS = {
@@ -54,6 +56,12 @@ FULL_CASES = tuple(
     for seq_len in SEQ_LENGTHS
     for batch_index, batch_size in enumerate(BATCH_SIZES)
 )
+# Zero weight keeps this independent latency suite out of production aggregates.
+LOW_LATENCY_CASES = tuple(
+    DecodeBenchmarkCase(batch_size=batch_size, nominal_seq_len=seq_len, weight=0)
+    for seq_len in LOW_LATENCY_SEQ_LENGTHS
+    for batch_size in LOW_LATENCY_BATCH_SIZES
+)
 SMOKE_CASES = tuple(
     case
     for case in FULL_CASES
@@ -66,11 +74,13 @@ def benchmark_cases(suite: str) -> tuple[DecodeBenchmarkCase, ...]:
         return SMOKE_CASES
     if suite == "full":
         return FULL_CASES
-    raise ValueError("suite must be 'smoke' or 'full'")
+    if suite == "low-latency":
+        return LOW_LATENCY_CASES
+    raise ValueError("suite must be 'smoke', 'full', or 'low-latency'")
 
 
 def make_seq_lens(case: DecodeBenchmarkCase) -> torch.Tensor:
-    """Return deterministic true-varlen lengths with the exact nominal mean."""
+    """Return deterministic lengths; a singleton uses the exact nominal length."""
 
     generator = torch.Generator().manual_seed(
         case.seed + case.batch_size * 1009 + case.nominal_seq_len
@@ -105,6 +115,9 @@ __all__ = [
     "BATCH_SIZES",
     "DEFAULT_SEED",
     "FULL_CASES",
+    "LOW_LATENCY_BATCH_SIZES",
+    "LOW_LATENCY_CASES",
+    "LOW_LATENCY_SEQ_LENGTHS",
     "Q_LEN_PER_REQ",
     "SEQ_LENGTHS",
     "SMOKE_CASES",

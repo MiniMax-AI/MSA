@@ -193,6 +193,45 @@
         "destination": "                                )\n                    cute.arch.sync_warp()\n                q_base += Int32(2)\n            if const_expr(head_idx + 1 < self.head_kv):\n                cute.arch.sync_threads()\n\n\n",
         "reason": "推理 CSR kernel 将 KV head 数作为稳定 codegen 配置。"
       }
+    ],
+    "_common/softmax.py": [
+      {
+        "source": "\nimport cutlass\nimport cutlass.cute as cute\nfrom cutlass import Float32\n\nfrom inference.msa_v1.attention.prefill._common.dsl import layout_utils\nfrom inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import ParamsBase\n\nfrom . import utils\n\nLOG2_FP8_PROBABILITY_SCALE = math.log2(448.0)\n\n\n@dataclass\n",
+        "destination": "\nimport cutlass\nimport cutlass.cute as cute\nfrom cutlass import Float16, Float32\n\nfrom inference.msa_v1.attention.prefill._common.dsl import layout_utils\nfrom inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import ParamsBase\n\nfrom . import utils\nfrom .rubin_softmax_helpers import (\n    add_packed_f32x2_f16x2_f32x2,\n    cvt_f16x4_to_f8x4,\n    cvt_packed_f16x2_f32x2,\n    ex2_packed_f16x2,\n    mul_packed_f16x2,\n)\n\n# FP8 P is stored as 448 * p so it spans the full E4M3 range (max 448). The\n# row sum then also carries the 448 factor, so O = (P V) / row_sum is\n# unchanged and only the LSE needs a -log2(448) correction. Matches the\n# FlashInfer P448 convention and the MSA main branch.\nFP8_PROBABILITY_SCALE = 448.0\nLOG2_FP8_PROBABILITY_SCALE = math.log2(FP8_PROBABILITY_SCALE)\n\n\n@dataclass\n",
+        "reason": "保留 nv_dev 已有 SM107 Rubin 架构分支，Blackwell 路径不变。"
+      },
+      {
+        "source": "                )\n\n    @cute.jit\n    def scale_apply_exp2_convert(\n        self,\n        acc_S_row: cute.Tensor,\n",
+        "destination": "                )\n\n    @cute.jit\n    def apply_exp2_convert_fp16_mixed(\n        self,\n        acc_S_row: cute.Tensor,\n        row_max: Float32,\n        acc_S_row_converted: cute.Tensor,\n    ) -> Float32:\n        \"\"\"Rubin packed-FP16 exp/CVT for FP8 Q -> FP8 P, summing in FP32.\n\n        Computation steps:\n\n        * ``t = fma_f32x2(score, scale_log2, -row_max * scale_log2)`` in FP32\n          (``cute.arch.fma_packed_f32x2``).\n        * ``x = FP16(t)`` via ``cvt.rn.f16x2.f32`` -- the only rounding before\n          the exponential, on the near-zero scaled difference.\n        * ``p = exp2(x)`` via ``ex2.approx.f16x2``.\n        * ``p = p * 448`` via ``mul.f16x2`` -- the FP8 probability scale, applied\n          after the exponential (see below).\n        * ``P = E4M3(p)`` via ``cvt.rn.satfinite.e4m3x2.f16x2``, four at a time.\n        * Row sum: each scaled FP16 ``p`` pair is widened and accumulated in\n          FP32 with ``add.f32x2.f16x2.f32x2`` into two independent accumulators\n          combined with ``cute.arch.add_packed_f32x2``.\n\n        The FP32 path folds ``log2(448)`` into the bias instead. Doing that here\n        would push the exponent argument from ~0 to ~8.8, where FP16 spacing is\n        ``2^-7`` rather than ``2^-11``: ``exp2(FP16(8.80735)) = 447.2``, not 448,\n        which biases every ``p`` by ~0.2% and makes the single-token LSE\n        ``ln(447.25/448) ~= -0.0017`` instead of exactly zero. Scaling after the\n        exponential keeps the argument near zero, and ``exp2(0) * 448 == 448``\n        exactly (448 = 1.75 * 2^8 is FP16-representable), so the row sum and\n        LSE match the FP32 path in that case. Costs one ``HMUL2`` per pair.\n\n        Only FP8 (E4M3) P is supported.\n        \"\"\"\n        assert cute.size(acc_S_row.shape) % 4 == 0\n        assert cute.size(acc_S_row.shape) == cute.size(acc_S_row_converted.shape)\n        assert acc_S_row_converted.element_type == cutlass.Float8E4M3FN, (\n            \"packed FP16 softmax requires FP8 (E4M3) P\"\n        )\n        num_scores = cute.size(acc_S_row.shape)\n        num_quads = num_scores // 4\n        num_row_sum_accumulators = 2\n\n        scale_log2_pair = (self.scale_log2, self.scale_log2)\n        # No log2(448) in the bias: keep the FP16 exponent argument near zero\n        # and apply the FP8 probability scale after the exponential instead.\n        minus_row_max_scale = (Float32(0.0) - row_max) * self.scale_log2\n        minus_row_max_scale_pair = (minus_row_max_scale, minus_row_max_scale)\n        fp8_probability_scale = Float16(FP8_PROBABILITY_SCALE)  # 448 = 1.75 * 2^8, exact in FP16\n        fp8_probability_scale_pair = (fp8_probability_scale, fp8_probability_scale)\n\n        # FP16 exp results and the FP8 P fragment, both viewed 4 at a time for\n        # the E4M3 convert. The P view goes through the fragment's own layout\n        # rather than recasting the whole fragment to Int32 and\n        # indexing linearly, so no assumption is made about its contiguity.\n        exp_buf = cute.make_rmem_tensor(cute.make_layout(num_scores), Float16)\n        exp_buf_cvt = cute.logical_divide(exp_buf, cute.make_layout(4))\n        p_cvt = cute.logical_divide(acc_S_row_converted, cute.make_layout(4))\n\n        row_sums = [(Float32(0.0), Float32(0.0)) for _ in range(num_row_sum_accumulators)]\n\n        for i in cutlass.range_constexpr(0, num_scores, 2):\n            # Stage 1: full FP32 affine transform.\n            scaled_pair = cute.arch.fma_packed_f32x2(\n                (acc_S_row[i], acc_S_row[i + 1]),\n                scale_log2_pair,\n                minus_row_max_scale_pair,\n            )\n            # Stage 2: round the pair to packed FP16.\n            packed_pair = cvt_packed_f16x2_f32x2(scaled_pair)\n            # Stage 3: packed exponential, then the FP8 probability scale.\n            exp_pair = mul_packed_f16x2(\n                ex2_packed_f16x2(packed_pair), fp8_probability_scale_pair\n            )\n            exp_buf[i] = exp_pair[0]\n            exp_buf[i + 1] = exp_pair[1]\n            # FP32 row sum of the scaled values, widening the FP16 pair on the fly.\n            sum_slot = (i // 2) % num_row_sum_accumulators\n            row_sums[sum_slot] = add_packed_f32x2_f16x2_f32x2(exp_pair, row_sums[sum_slot])\n\n        # E4M3 convert, four FP16 values -> four FP8 P values, per quad slice.\n        for q in cutlass.range_constexpr(num_quads):\n            cvt_f16x4_to_f8x4(exp_buf_cvt[None, q], p_cvt[None, q])\n\n        local_row_sum = cute.arch.add_packed_f32x2(row_sums[0], row_sums[1])\n        return local_row_sum[0] + local_row_sum[1]\n\n    @cute.jit\n    def scale_apply_exp2_convert(\n        self,\n        acc_S_row: cute.Tensor,\n",
+        "reason": "保留 nv_dev 已有 SM107 Rubin 架构分支，Blackwell 路径不变。"
+      }
+    ],
+    "attention/fwd/combine.py": [
+      {
+        "source": "import cutlass\nfrom cutlass import Boolean, Float32, Int32, Int64, const_expr\nimport cutlass.cute as cute\nfrom cutlass.cute import FastDivmodDivisor\nfrom cutlass.cute.nvgpu import cpasync\nimport cuda.bindings.driver as cuda\n",
+        "destination": "import cutlass\nfrom cutlass import Boolean, Float32, Int32, Int64, const_expr\nimport cutlass.cute as cute\nfrom cutlass.cutlass_dsl import BaseDSL\nfrom cutlass.cute import FastDivmodDivisor\nfrom cutlass.cute.nvgpu import cpasync\nimport cuda.bindings.driver as cuda\n",
+        "reason": "保留 nv_dev 已有 SM107 Rubin 架构分支，Blackwell 路径不变。"
+      },
+      {
+        "source": "        self.num_threads = num_threads\n        self.is_even_k = head_dim % k_block_size == 0\n        self.stages = stages\n        self.use_pdl = use_pdl\n        self.min_blocks_per_mp = min_blocks_per_mp\n        self.raw_partial_stats = raw_partial_stats\n",
+        "destination": "        self.num_threads = num_threads\n        self.is_even_k = head_dim % k_block_size == 0\n        self.stages = stages\n        arch = BaseDSL._get_dsl().get_arch_enum()\n        rubin_arch = getattr(arch.__class__, \"sm_107\", None)\n        self.is_rubin = rubin_arch is not None and arch.is_family_of(rubin_arch)\n        self.use_pdl = use_pdl\n        self.min_blocks_per_mp = min_blocks_per_mp\n        self.raw_partial_stats = raw_partial_stats\n",
+        "reason": "保留 nv_dev 已有 SM107 Rubin 架构分支，Blackwell 路径不变。"
+      },
+      {
+        "source": "                # Get scales for this split\n                scale = cute.make_rmem_tensor(num_rows, Float32)\n                for m in cutlass.range(num_rows, unroll_full=True):\n                    scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem\n\n                if const_expr(self.use_tma_partial):\n                    cute.autovec_copy(\n",
+        "destination": "                # Get scales for this split\n                scale = cute.make_rmem_tensor(num_rows, Float32)\n                for m in cutlass.range(num_rows, unroll_full=True):\n                    scale[m] = sLSE[s, tOcO[0, m, 0][0]]\n\n                if const_expr(self.use_tma_partial):\n                    cute.autovec_copy(\n",
+        "reason": "保留 nv_dev 已有 SM107 Rubin 架构分支，Blackwell 路径不变。"
+      },
+      {
+        "source": "    has_output_scale = output_scale is not None\n    min_blocks_per_mp = 3 if has_output_scale and use_pdl else 0\n\n    key = (\n        \"combine\",\n        D,\n        k_block_size,\n        tile_m,\n",
+        "destination": "    has_output_scale = output_scale is not None\n    min_blocks_per_mp = 3 if has_output_scale and use_pdl else 0\n\n    capability = torch.cuda.get_device_capability(o_out.device)\n    stages = 4 if capability == (10, 7) else 2\n    key = (\n        \"combine\",\n        capability,\n        stages,\n        D,\n        k_block_size,\n        tile_m,\n",
+        "reason": "保留 nv_dev 已有 SM107 Rubin 架构分支，Blackwell 路径不变。"
+      },
+      {
+        "source": "                num_threads=num_threads,\n                use_pdl=use_pdl,\n                min_blocks_per_mp=min_blocks_per_mp,\n                stages=2,\n                raw_partial_stats=raw_partial_stats,\n            )\n            div = 128 // partial_dtype.width\n",
+        "destination": "                num_threads=num_threads,\n                use_pdl=use_pdl,\n                min_blocks_per_mp=min_blocks_per_mp,\n                stages=stages,\n                raw_partial_stats=raw_partial_stats,\n            )\n            div = 128 // partial_dtype.width\n",
+        "reason": "保留 nv_dev 已有 SM107 Rubin 架构分支，Blackwell 路径不变。"
+      }
     ]
   },
   "organization_files": [
@@ -200,29 +239,94 @@
   ],
   "local_implementation_files": [
     "atten_fwd_sm100.py",
-    "paged_interface.py"
+    "paged_interface.py",
+    "dsl/rubin_helpers.py",
+    "dsl/rubin_softmax_helpers.py"
   ],
   "files": [
-    {"source": "_common/__init__.py", "destination": "dsl/__init__.py"},
-    {"source": "_common/blackwell_helpers.py", "destination": "dsl/blackwell_helpers.py"},
-    {"source": "_common/compile_utils.py", "destination": "dsl/compile_utils.py"},
-    {"source": "_common/copy_utils.py", "destination": "dsl/copy_utils.py"},
-    {"source": "_common/cute_dsl_utils.py", "destination": "dsl/cute_dsl_utils.py"},
-    {"source": "_common/layout_utils.py", "destination": "dsl/layout_utils.py"},
-    {"source": "_common/mask.py", "destination": "dsl/mask.py"},
-    {"source": "_common/mma_sm100_desc.py", "destination": "dsl/mma_sm100_desc.py"},
-    {"source": "_common/named_barrier.py", "destination": "dsl/named_barrier.py"},
-    {"source": "_common/pack_gqa.py", "destination": "dsl/pack_gqa.py"},
-    {"source": "_common/paged_kv.py", "destination": "dsl/paged_kv.py"},
-    {"source": "_common/pipeline.py", "destination": "dsl/pipeline.py"},
-    {"source": "_common/seqlen_info.py", "destination": "dsl/seqlen_info.py"},
-    {"source": "_common/softmax.py", "destination": "dsl/softmax.py"},
-    {"source": "_common/tma_utils.py", "destination": "dsl/tma_utils.py"},
-    {"source": "_common/utils.py", "destination": "dsl/utils.py"},
-    {"source": "attention/fwd/combine.py", "destination": "combine.py"},
-    {"source": "attention/metadata.py", "destination": "metadata.py"},
-    {"source": "attention/prepare_k2q_csr.py", "destination": "prepare_k2q_csr.py"},
-    {"source": "attention/prepare_k2q_csr_cutedsl.py", "destination": "prepare_k2q_csr_cutedsl.py"},
-    {"source": "attention/prepare_scheduler.py", "destination": "prepare_scheduler.py"}
+    {
+      "source": "_common/__init__.py",
+      "destination": "dsl/__init__.py"
+    },
+    {
+      "source": "_common/blackwell_helpers.py",
+      "destination": "dsl/blackwell_helpers.py"
+    },
+    {
+      "source": "_common/compile_utils.py",
+      "destination": "dsl/compile_utils.py"
+    },
+    {
+      "source": "_common/copy_utils.py",
+      "destination": "dsl/copy_utils.py"
+    },
+    {
+      "source": "_common/cute_dsl_utils.py",
+      "destination": "dsl/cute_dsl_utils.py"
+    },
+    {
+      "source": "_common/layout_utils.py",
+      "destination": "dsl/layout_utils.py"
+    },
+    {
+      "source": "_common/mask.py",
+      "destination": "dsl/mask.py"
+    },
+    {
+      "source": "_common/mma_sm100_desc.py",
+      "destination": "dsl/mma_sm100_desc.py"
+    },
+    {
+      "source": "_common/named_barrier.py",
+      "destination": "dsl/named_barrier.py"
+    },
+    {
+      "source": "_common/pack_gqa.py",
+      "destination": "dsl/pack_gqa.py"
+    },
+    {
+      "source": "_common/paged_kv.py",
+      "destination": "dsl/paged_kv.py"
+    },
+    {
+      "source": "_common/pipeline.py",
+      "destination": "dsl/pipeline.py"
+    },
+    {
+      "source": "_common/seqlen_info.py",
+      "destination": "dsl/seqlen_info.py"
+    },
+    {
+      "source": "_common/softmax.py",
+      "destination": "dsl/softmax.py"
+    },
+    {
+      "source": "_common/tma_utils.py",
+      "destination": "dsl/tma_utils.py"
+    },
+    {
+      "source": "_common/utils.py",
+      "destination": "dsl/utils.py"
+    },
+    {
+      "source": "attention/fwd/combine.py",
+      "destination": "combine.py"
+    },
+    {
+      "source": "attention/metadata.py",
+      "destination": "metadata.py"
+    },
+    {
+      "source": "attention/prepare_k2q_csr.py",
+      "destination": "prepare_k2q_csr.py"
+    },
+    {
+      "source": "attention/prepare_k2q_csr_cutedsl.py",
+      "destination": "prepare_k2q_csr_cutedsl.py"
+    },
+    {
+      "source": "attention/prepare_scheduler.py",
+      "destination": "prepare_scheduler.py"
+    }
   ]
 }

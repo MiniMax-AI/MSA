@@ -7,7 +7,7 @@
 面向 SM100/SM103/SM107 的 paged sparse causal decode attention。Q 使用 E4M3，K/V 使用
 packed E2M1 和 E4M3 scale，输出为 BF16。
 支持 B200/B300 上的 GQA=8 和 GQA=16；SM107 保留 GQA=16 支持。
-后端按实际 `Hq/Hkv` 选择，不接收 TP 数。
+后端按实际 `Hq/Hkv` 选择。
 
 ## 公开接口
 

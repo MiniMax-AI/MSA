@@ -4,8 +4,7 @@
 
 ## Purpose
 
-BF16 paged sparse causal prefill attention for SM100 and SM103. It supports TP1 and TP4 GQA
-configurations and can optionally return FP32 LSE.
+BF16 paged sparse causal prefill attention for SM100, SM103, and SM107. It configures GQA through local query/KV head counts and can optionally return FP32 LSE.
 
 ## Public API
 
@@ -44,6 +43,11 @@ Callers may pass preallocated `out` and `lse` tensors to `run()`.
 - `cu_seqlens_q` / `cu_seqlens_k` are CUDA `torch.int32` varlen metadata.
 
 ## Runtime requirements
+
+- The input tensor device selects the implementation; SM107 uses the Rubin path.
+  The FP8 Rubin path requires a CuTe DSL version providing `cutlass.utils.rubin_helpers`
+  and a CUDA toolchain supporting SM107.
+
 
 - Only paged KV and causal attention are supported; chunk prefill uses bottom-right causal
   alignment.

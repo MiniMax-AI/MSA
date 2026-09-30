@@ -4,8 +4,7 @@
 
 ## 功能
 
-面向 SM100/SM103 的 BF16 paged sparse causal prefill attention，支持 TP1 和 TP4
-下的 GQA 配置，并可选输出 FP32 LSE。
+面向 SM100/SM103/SM107 的 BF16 paged sparse causal prefill attention，通过本地 query/KV head 数配置 GQA，并可选输出 FP32 LSE。
 
 ## 公开接口
 
@@ -44,6 +43,10 @@ out, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
 - `cu_seqlens_q` / `cu_seqlens_k` 为 CUDA `torch.int32` varlen metadata。
 
 ## 运行约束
+
+- 实现按输入 tensor 所在设备选择；SM107 使用 Rubin 路径。FP8 Rubin 路径需要提供
+  `cutlass.utils.rubin_helpers` 的 CuTe DSL 版本及支持 SM107 的 CUDA 工具链。
+
 
 - 仅支持 paged KV 和 causal attention；chunk prefill 使用 bottom-right causal 对齐。
 - `cu_seqlens_k` 是 KV 长度的唯一来源。

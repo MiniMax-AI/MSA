@@ -240,9 +240,16 @@ local_block = query_position // 128
 - `sm_scale` 遵循 FlashInfer 命名；底层 backend 的 `fmha_fwd_*` 名称不属于公开 Python API。
 - page table、TopK、长度或 query shape 变化时必须重新 `plan()`；同一 plan 可以跨层复用。
 
-## Q8KV4 Decode Indexer 重构契约
+## 多 Head Decode Indexer 契约
 
-`inference/msa_v1/indexer/decode/tp4_q8kv4` 重构后采用以下公开 wrapper 契约：
+`plan()` 的 keyword-only `num_index_heads=1` 仅接受 H=1/2/4；Q 为
+`[B, Q, H, 128]` contiguous E4M3，各 head 独立计算并共享 K cache。
+`query_length` 是 keyword-only 参数，支持 Q=1..16 的任意整数，同一 batch 内 Q 相同。
+Q 可以为编译期量；若 Q/H 改变 MMA tile shape 或其他实际 codegen 配置，允许相应静态特化。
+不改变 codegen 的维度保持 runtime；固定静态配置时，batch、KV 长度和 metadata 变化应复用
+编译产物。不得为构造 compile key 读取设备 tensor 内容。
+
+`inference/msa_v1/indexer/decode/q8kv4` 和 `q8kv8` 采用以下公开 wrapper 契约：
 
 ```text
 plan:
@@ -252,15 +259,15 @@ plan:
 
 run:
     q
-    packed k_cache
+    k_cache (Q8KV4 packed; Q8KV8 E4M3)
     k_scale (Q8KV4 only)
-    out: [B * 8, 16] int32
+    out: [H, B * Q, 16] contiguous int32
     -> forced-tail TopK logical page indices
 ```
 
 具体约束：
 
-- `seq_lens` 是 `[B]`、CUDA、contiguous、`torch.int32`，表示包含当前 8-token MTP query chunk
+- `seq_lens` 是 `[B]`、CUDA、contiguous、`torch.int32`，表示包含当前 Q-token MTP query chunk
   的最终 KV 长度；它是 decode indexer 中 K 长度的唯一权威来源。
 - 公开 wrapper 不再使用 `kv_lengths` 或 `seqused_k` 表达该语义。底层 kernel ABI 可以暂时
   保留 `kv_lengths_ptr` 等内部名称，但必须在 wrapper 边界完成单向转换，内部名称不得成为
@@ -272,14 +279,19 @@ run:
 - Query 位置和 local block 继续按以下规则计算：
 
 ```text
-query_position = seq_lens[b] - 8 + q_idx
+query_position = seq_lens[b] - Q + q_idx
 local_block = query_position // 128
 ```
 
 - `page_table`、`seq_lens` 和由它们生成的 scheduler state 属于 `plan()`；`q`、当前层的 packed
   K cache、`k_scale` 和 `out` 属于 `run()`。
-- `page_table` 或 `seq_lens` 的内容发生变化时必须重新 `plan()`；同一 plan 应能够跨 transformer
-  layer 复用。
+- 未使用显式共享 plan 时，`page_table` 或 `seq_lens` 内容变化后重新调用 `plan()`。
+  使用 `BatchDecodeIndexerPlan` 时，同一 step 内只读 metadata 可跨 transformer layer 共享；
+  同地址长度变化后调用 `update()`，同地址 page table 可在消费前原地更新。
+  metadata 地址或 shape 改变时，在 capture 外重新绑定；B、Q、H 或 page capacity 改变时，
+  创建匹配的新 plan，并重新 capture 使用旧绑定的 Graph。
+  `update()` 在当前 stream 执行且允许 capture；构造和绑定必须在 capture 外。
+  跨 stream 消费及再次更新需由调用方用 event 排序，不允许跨 step 复用旧 metadata。
 - Q8KV4 与 Q8KV8 的公开入口均为 `BatchDecodeIndexerWithPagedKVCacheWrapper`；Q8KV8 的
   `run()` 不接收 `k_scale`。公开 wrapper 内部顺序执行 proxy score 与 forced-tail TopK，
   不公开 score-only wrapper、模块级 `forward()` 或 GEMM wrapper 名称。
@@ -289,7 +301,7 @@ local_block = query_position // 128
 
 ## 内部 Indexer TopK Select 契约
 
-`inference/msa_v1/indexer/_common/topk_select` 是 Q8KV4、Q8KV8 和不同 TP degree 共用的
+`inference/msa_v1/indexer/_common/topk_select` 是 Q8KV4、Q8KV8 和不同本地 index head 数共用的
 私有 stateless per-row stage，不是 production 公开入口：
 
 ```text
@@ -309,7 +321,7 @@ _topk_select:
   15 个历史候选和 forced tail。
 - `num_valid_pages` 是 producer 生成的逐行候选长度；decode indexer 的 `seq_lens` 是请求级 token
   长度。二者语义不同，不得作为同一接口中的多个权威来源。
-- stage 不接收 page table、page size、query/MTP 布局、KV dtype 或 TP degree，不做
+- stage 不接收 page table、page size、query/MTP 布局、KV dtype 或 head 数，不做
   logical-to-physical page transform，也不返回 TopK values。
 - `out=None` 是易用路径；CUDA Graph capture 中必须传入预分配 `out`。
 - TopK 使用 16-bit 行内量化近似排序，正确性 gate 允许最多 1.5 个量化 step；
@@ -318,8 +330,8 @@ _topk_select:
 Q8KV4 producer 的组合关系为：
 
 ```text
-proxy_scores = proxy_score.run(...).view(batch * 8, max_pages)
-num_valid_pages[b * 8 + q_idx] = (seq_lens[b] - 8 + q_idx) // 128 + 1
+proxy_scores = proxy_score.run(...).view(H * batch * Q, max_pages)
+num_valid_pages[h * batch * Q + b * Q + q_idx] = (seq_lens[b] - Q + q_idx) // 128 + 1
 topk_indices = _topk_select(proxy_scores, num_valid_pages, out=topk_out)
 ```
 

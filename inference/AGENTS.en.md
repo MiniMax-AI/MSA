@@ -174,8 +174,28 @@ output for graph capture. Proxy scores are a private intermediate: they may be
 profiled separately for MBU/MFU diagnosis but are not a public performance
 metric.
 
-The public result has shape `[batch, q_len_per_req, topk]`, dtype `int32`, and
-contiguous last dimension. Valid entries form a prefix; the final valid output
+The public packages are `inference.msa_v1.indexer.decode.q8kv4` and `q8kv8`.
+The keyword-only `plan()` argument `num_index_heads=1` accepts H=1/2/4.
+The keyword-only `query_length` accepts any integer Q=1..16, shared by all
+requests in the batch. Q may be compile-time: Q/H specialization is allowed when
+it changes MMA tile shape or other generated-code configuration. Dimensions that
+do not change code generation remain runtime. With a fixed static configuration,
+changes to batch, KV length, and metadata must reuse compiled artifacts. Never
+read device tensor contents to construct a compile key.
+An explicit `BatchDecodeIndexerPlan` may share read-only metadata within the same
+step. Its `update()` runs on the current stream and supports capture; construction
+and binding happen outside capture. Callers order cross-stream consumers and
+subsequent updates with events. Do not reuse stale metadata across steps.
+Without an explicit shared plan, call `plan()` again when lengths or page mappings change.
+With a shared plan, call `update()` after in-place length changes; bound page tables may be
+updated in place before consumers run. Rebind outside capture when metadata addresses or
+shapes change. Create a matching new plan when B, Q, H, or page capacity changes, and
+recapture Graphs that used the previous bindings.
+The internal TopK stage serves both precisions and all supported local index head counts;
+it does not accept a head-count parameter.
+Q is contiguous E4M3 with shape `[B, Q, H, 128]`; heads compute independently
+and share the K cache. The public result has shape `[H, B * Q, 16]`, dtype
+`int32`, and is contiguous. Valid entries form a prefix; the final valid output
 is the local block and any suffix is `-1`. TopK ordering is score-descending
 apart from the forced local tail contract. Q8KV8 does not expose an unused
 `k_scale` argument. Avoid public aliases, legacy tuples, or historical modes

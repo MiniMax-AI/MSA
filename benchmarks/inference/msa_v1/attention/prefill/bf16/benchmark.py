@@ -340,7 +340,7 @@ def main() -> None:
         type=int,
         choices=(1, 4),
         default=DEFAULT_NUM_KV_HEADS,
-        help="Local KV heads: 4 for TP1 and 1 for TP4",
+        help="Number of local KV heads: 1 or 4",
     )
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--out", type=Path)
@@ -415,7 +415,6 @@ def main() -> None:
             "nvidia_cutlass_dsl": importlib_metadata.version("nvidia-cutlass-dsl"),
             "formal_full_selection": is_formal,
             "e2e_scope": "public wrapper.run: attention K1 + split combine",
-            "tp_degree": DEFAULT_NUM_KV_HEADS // args.num_kv_heads,
             "num_q_heads": args.num_kv_heads * GQA_GROUP_SIZE,
             "num_kv_heads": args.num_kv_heads,
             "compile_plan_allocate_capture_in_timing": False,

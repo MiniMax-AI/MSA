@@ -27,6 +27,7 @@ def test_topk_select_is_the_only_package_entrypoint() -> None:
         "scores",
         "lengths",
         "out",
+        "compact_grid",
     )
     for forbidden in (
         "forward",

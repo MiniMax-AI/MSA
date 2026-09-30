@@ -62,7 +62,7 @@ def test_strided_paged_kv_runs_without_materialization() -> None:
     assert torch.all(lse == 0)
 
 
-def test_plan_supports_tp4_head_configuration() -> None:
+def test_plan_supports_single_kv_head_configuration() -> None:
     topk = torch.full((1, 1, 16), -1, dtype=torch.int32, device="cuda")
     topk[:, :, 0] = 0
     cu_seqlens = torch.tensor((0, 1), dtype=torch.int32, device="cuda")

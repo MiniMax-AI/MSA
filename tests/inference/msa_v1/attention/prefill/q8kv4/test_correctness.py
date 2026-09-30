@@ -48,7 +48,7 @@ def _make_topk(
     return topk
 
 
-@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("tp1", "tp4"))
+@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("heads4", "heads1"))
 def test_paged_chunk_prefill_matches_reference(num_kv_heads: int) -> None:
     """Cover both head counts with varlen, partial, and unordered history pages."""
 

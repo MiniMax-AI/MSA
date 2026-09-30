@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[5]
 PREFILL_ROOT = REPO_ROOT / "inference/msa_v1/attention/prefill"
 COMMON_ROOT = PREFILL_ROOT / "_common"
@@ -35,12 +34,13 @@ def _expected_common_text(entry: dict[str, str]) -> str:
 def test_manifest_covers_every_shared_python_file() -> None:
     manifest = _manifest()
     actual = {
-        path.relative_to(COMMON_ROOT).as_posix()
-        for path in COMMON_ROOT.rglob("*.py")
+        path.relative_to(COMMON_ROOT).as_posix() for path in COMMON_ROOT.rglob("*.py")
     }
-    expected = {
-        entry["destination"] for entry in manifest["files"]
-    } | set(manifest["organization_files"]) | set(manifest["local_implementation_files"])
+    expected = (
+        {entry["destination"] for entry in manifest["files"]}
+        | set(manifest["organization_files"])
+        | set(manifest["local_implementation_files"])
+    )
     assert actual == expected
 
 
@@ -118,3 +118,48 @@ from inference.msa_v1.attention.prefill.q8kv4 import (
 assert Q8KV4Wrapper.__name__ == 'BatchPrefillWithPagedKVCacheWrapper'
 """
     subprocess.run([sys.executable, "-c", script], check=True, cwd=REPO_ROOT)
+
+
+def test_prefill_architecture_dispatch(monkeypatch) -> None:
+    """Select Rubin options from the tensor device without changing Blackwell defaults."""
+    import pytest
+    import torch
+
+    from inference.msa_v1.attention.prefill._common.atten_fwd_sm100 import (
+        _check_architecture,
+        _resolve_rubin_options,
+    )
+    from inference.msa_v1.attention.prefill.q8kv8 import (
+        BatchPrefillWithPagedKVCacheWrapper,
+    )
+
+    device = torch.device("cuda:1")
+    for capability in ((10, 0), (10, 3), (10, 7)):
+
+        def get_capability(actual_device):
+            assert actual_device == device
+            return capability
+
+        monkeypatch.setattr(torch.cuda, "get_device_capability", get_capability)
+        assert _check_architecture(device) == capability
+        for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            supported = capability == (10, 7) and dtype == torch.float8_e4m3fn
+            assert _resolve_rubin_options(capability, dtype, None, None) == (
+                supported,
+                supported,
+            )
+            assert _resolve_rubin_options(capability, dtype, False, False) == (
+                False,
+                False,
+            )
+            if not supported:
+                with pytest.raises(NotImplementedError, match="SM107"):
+                    _resolve_rubin_options(capability, dtype, True, None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+    with pytest.raises(RuntimeError, match="SM90"):
+        _check_architecture(device)
+    wrapper = BatchPrefillWithPagedKVCacheWrapper()
+    assert wrapper.enable_fp16_softmax is None
+    assert wrapper.enable_2x_fp8 is None
+    with pytest.raises(TypeError, match="bool or None"):
+        BatchPrefillWithPagedKVCacheWrapper(enable_2x_fp8=1)

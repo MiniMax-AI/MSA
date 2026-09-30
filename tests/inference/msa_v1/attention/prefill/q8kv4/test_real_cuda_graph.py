@@ -16,13 +16,12 @@ from tests.inference.msa_v1.attention.prefill.q8kv4.reference import (
     paged_sparse_attention_reference,
 )
 
-
 pytestmark = pytest.mark.gpu
 _GRAPH_CASES = load_prefill_test_cases("cuda_graph")
 
 
 @pytest.mark.parametrize("case", _GRAPH_CASES, ids=lambda case: case.case_id)
-@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("tp1", "tp4"))
+@pytest.mark.parametrize("num_kv_heads", (4, 1), ids=("heads4", "heads1"))
 def test_real_case_cuda_graph_replay(case, num_kv_heads: int) -> None:
     """Poison every output stage before replay to prove non-empty execution."""
 

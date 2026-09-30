@@ -7,18 +7,22 @@ import logging
 import time
 
 import cutlass
-import cutlass.cute as cute
+import cutlass.cute as cute  # noqa: PLR0402
 import pytest
-from packaging.version import Version
 import torch
+from packaging.version import Version
 
 logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.gpu
 
 
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
-def test_q8kv8_decode_indexer_compiles_for_blackwell(arch: str) -> None:
-    from inference.msa_v1.indexer.decode.tp4_q8kv8.indexer_gemm import (
+@pytest.mark.parametrize("num_index_heads", (1, 2, 4))
+@pytest.mark.parametrize("query_length", (1, 5, 9, 11, 13, 16))
+def test_q8kv8_decode_indexer_compiles_for_blackwell(
+    arch: str, num_index_heads: int, query_length: int
+) -> None:
+    from inference.msa_v1.indexer.decode.q8kv8.indexer_gemm import (
         DecodeIndexerGemmSm100,
     )
 
@@ -32,14 +36,18 @@ def test_q8kv8_decode_indexer_compiles_for_blackwell(arch: str) -> None:
             assumed_align=alignment,
         )
 
-    kernel = DecodeIndexerGemmSm100(batch_size=2, max_pages=17, sm_count=148)
+    kernel = DecodeIndexerGemmSm100(
+        num_index_heads=num_index_heads,
+        sm_count=148,
+        query_columns=((query_length * num_index_heads + 7) // 8) * 8,
+    )
     args = (
-        tensor(cutlass.Float8E4M3FN, (2, 8, 128)),
+        tensor(cutlass.Float8E4M3FN, (2, query_length * num_index_heads, 128)),
         tensor(cutlass.Float8E4M3FN, (37, 128, 128)),
         tensor(cutlass.Int32, (2, 17), 4),
         tensor(cutlass.Int32, (2,), 4),
-        tensor(cutlass.Float32, (2, 8, 17)),
-        tensor(cutlass.Uint8, (16,)),
+        tensor(cutlass.Float32, (num_index_heads, 2 * query_length, 17)),
+        tensor(cutlass.Uint8, ((2 + 4 * 148 + 2) * 4,)),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
     )
     started_at = time.perf_counter()
@@ -47,6 +55,79 @@ def test_q8kv8_decode_indexer_compiles_for_blackwell(arch: str) -> None:
         kernel, *args, options=f"--enable-tvm-ffi --opt-level 2 --gpu-arch={arch}"
     )
     logger.info("%s indexer compiled in %.3fs", arch, time.perf_counter() - started_at)
+    assert compiled is not None
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+def test_decode_shared_plan_compiles_for_blackwell(arch):
+    from inference.msa_v1.indexer.decode.plan_kernel import DecodeIndexerPlanSm100
+
+    def tensor(size):
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (size,), stride_order=(0,), assumed_align=4
+        )
+
+    started_at = time.perf_counter()
+    compiled = cute.compile(
+        DecodeIndexerPlanSm100(),
+        tensor(513),
+        tensor(513),
+        tensor(513 + 4 * 148 + 2),
+        tensor(4 * 513 * 16),
+        cutlass.Int32(16),
+        cutlass.Int32(4),
+        cutlass.Int32(8192),
+        cutlass.Int32(148),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options=f"--enable-tvm-ffi --opt-level 2 --gpu-arch={arch}",
+    )
+    logger.info(
+        "%s shared plan compiled in %.3fs", arch, time.perf_counter() - started_at
+    )
+    assert compiled is not None
+
+
+@pytest.mark.parametrize("capability", ((10, 0), (10, 3)))
+@pytest.mark.parametrize("num_index_heads", (1, 2, 4))
+def test_q8kv8_prefill_indexer_compiles_for_blackwell(capability, num_index_heads):
+    from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm import (
+        PrefillIndexerGemmSm100,
+    )
+
+    assert Version(cutlass.__version__) >= Version("4.5.2")
+
+    def tensor(dtype, shape):
+        return cute.runtime.make_fake_compact_tensor(
+            dtype,
+            shape,
+            stride_order=tuple(reversed(range(len(shape)))),
+            assumed_align=16,
+        )
+
+    kernel = PrefillIndexerGemmSm100(
+        compute_capability=capability,
+        num_persistent_clusters=74,
+        num_index_heads=num_index_heads,
+    )
+    arch = f"sm_{capability[0]}{capability[1]}a"
+    started = time.perf_counter()
+    compiled = cute.compile(
+        kernel,
+        tensor(cutlass.Float8E4M3FN, (257 * num_index_heads, 128)),
+        tensor(cutlass.Float8E4M3FN, (37, 1, 128, 128)),
+        tensor(cutlass.Int32, (2, 17)),
+        tensor(cutlass.Float32, (num_index_heads, 257, 17)),
+        tensor(cutlass.Int32, (8, 16, 4)),
+        tensor(cutlass.Int32, (8,)),
+        cute.runtime.make_fake_stream(),
+        options=f"--gpu-arch={arch}",
+    )
+    logger.info(
+        "%s H=%d compiled in %.3fs",
+        arch,
+        num_index_heads,
+        time.perf_counter() - started,
+    )
     assert compiled is not None
 
 

@@ -143,21 +143,33 @@
 - 遵循 FA4 interface：compile key 只能包含确实影响 codegen 的稳定静态属性，
   例如 arch、dtype、head dim、GQA ratio、tile/stage/thread/cluster 配置、算法
   开关、可选 tensor 是否存在，以及 codegen 需要的 layout/broadcast pattern。
-- **严禁包含运行时规模或取值**：`batch_size`/`bs`、`total_q`、`total_kv`、
+- 除下述 decode Q 静态特化例外外，**严禁包含运行时规模或取值**：`batch_size`/`bs`、`total_q`、`total_kv`、
   `seqlen_q`、`seqlen_kv`、`max_seqlen_q`、`max_seqlen_kv`、sequence 数量、
   具体 `cu_seqlens`、topK indices/lengths、tensor identity/pointer 或 stream。
-  相同静态配置下改变 bs、seqlen 或 varlen 分布必须复用同一编译产物。
+  相同静态配置下改变 bs、KV 长度或 varlen 分布必须复用同一编译产物。
+- **Decode Q 静态特化例外**：decode 的每请求 query length Q 允许为编译期量。
+  当 Q 或本地 head 数 H 确实改变 MMA tile shape、layout、循环展开或资源配置时，
+  可以将 Q/H 或其对应的有限 tile 配置加入 compile key。Q 应来自 host 已知参数或
+  tensor shape metadata，不得为此读取设备 tensor 内容或引入 D2H 同步。
+  该例外不允许把 batch、total_q、KV 长度、page capacity 或请求内容加入 key；
+  不改变 codegen 的维度仍保持 runtime，不为 benchmark case 单独特化。
 - varlen metadata 只允许以“是否存在”这类影响签名/codegen 的布尔属性进入 key，
   不得把 tensor 本身或 tensor 中的值加入 key。
 - 不得让从 runtime tensor 派生的谓词泄漏进 compile key。尤其不能读取 tensor
   `max_seqlen` 构造 key，否则 tensor identity 或逐 step 数值变化会导致重复编译；
   也不得为构造 key 引入 device-to-host 同步。
 - 若确实需要新增 specialization，必须证明它会生成不同代码，并将其表达为数量
-  有限、稳定的 host-side 静态枚举；不得直接使用 runtime size 作为 specialization。
-- compile-cache/AOT 测试必须改变 bs、seqlen、`cu_seqlens` 内容和 varlen 分布，
-  验证不触发重新编译；改变真正的 codegen 静态配置时才应产生新编译产物。
+  有限、稳定的 host-side 静态枚举；除上述 decode Q 外，不得直接使用 runtime size
+  作为 specialization。
+- compile-cache/AOT 测试在固定静态 Q/H 或 tile 配置时改变 bs、KV 长度、
+  `cu_seqlens` 内容和 varlen 分布，验证编译复用。静态 Q/H 改变且生成不同代码时，
+  允许生成对应产物；映射到相同静态配置的 runtime 尺寸应复用编译产物。
 
 ## 运行时状态与 Workspace 生命周期
+
+- Decode indexer 的显式 `BatchDecodeIndexerPlan` 可在同一 step 的多个层之间共享只读 metadata；
+  长度变化后必须更新。调用方通过 stream/event 排序所有消费者和后续更新，不得跨 step
+  复用过时的 metadata。该例外不适用于依赖逐层 TopK 的 attention schedule。
 
 - 进程级全局缓存只允许保存编译产物，以及不持有运行时 CUDA tensor、设备指针或
   workload 状态的不可变 host metadata。

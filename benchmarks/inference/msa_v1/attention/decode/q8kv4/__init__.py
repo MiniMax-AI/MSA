@@ -1,4 +1,4 @@
-"""TP1 Q8KV4 paged sparse-decode benchmark package."""
+"""Q8KV4 paged sparse-decode benchmark package."""
 
 from .cases import (
     BATCH_SIZES,

@@ -6,17 +6,17 @@ import pytest
 import torch
 
 from inference.dequant import dequantize_nvfp4_to_fp8
-from inference.msa_v1.indexer.prefill.tp4_q8kv8 import (
+from inference.msa_v1.indexer.prefill.q8kv8 import (
     BatchPrefillIndexerWithPagedKVCacheWrapper,
 )
 from tests.inference.cases import selected_msa_v1_prefill_test_cases
-from tests.inference.msa_v1.indexer.prefill.tp4_q8kv8.cases import (
+from tests.inference.msa_v1.indexer.prefill.q8kv8.cases import (
     RealPrefillInputs,
     make_real_prefill_inputs,
 )
-from tests.inference.msa_v1.indexer.prefill.tp4_q8kv8.reference import (
-    assert_sampled_scores,
-    assert_sampled_topk_quality,
+from tests.inference.msa_v1.indexer.prefill.q8kv8.reference import (
+    assert_full_scores,
+    assert_full_topk_quality,
     assert_score_structure,
     assert_topk_structure,
 )
@@ -29,7 +29,7 @@ def test_dequantized_cache_runs_through_q8k8_indexer() -> None:
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
     if torch.cuda.get_device_capability(device) not in {(10, 0), (10, 3)}:
-        pytest.skip("TP4 Q8K8 prefill requires SM100 or SM103")
+        pytest.skip("Q8K8 prefill requires SM100 or SM103")
 
     case = selected_msa_v1_prefill_test_cases()[1]
     baseline_inputs = make_real_prefill_inputs(case, device=device)
@@ -74,11 +74,10 @@ def test_dequantized_cache_runs_through_q8k8_indexer() -> None:
     torch.cuda.synchronize()
 
     assert_score_structure(case, state.proxy_scores, state.num_valid_pages)
-    assert_sampled_scores(case, inputs, state.proxy_scores)
+    expected_scores = assert_full_scores(case, inputs, state.proxy_scores)
     assert_topk_structure(result, state.num_valid_pages)
-    assert_sampled_topk_quality(
-        case,
-        state.proxy_scores,
+    assert_full_topk_quality(
+        expected_scores,
         state.num_valid_pages,
         result,
     )
