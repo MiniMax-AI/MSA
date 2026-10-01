@@ -12,7 +12,7 @@ from datas.inference.tensors import cumulative_lengths, make_disjoint_page_table
 
 PAGE_SIZE = 128
 HEAD_DIM = 128
-SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
 
 
 def require_sm100_device() -> torch.device:
@@ -22,7 +22,7 @@ def require_sm100_device() -> torch.device:
     device = torch.device("cuda")
     capability = torch.cuda.get_device_capability(device)
     if capability not in SUPPORTED_CAPABILITIES:
-        pytest.skip("Q8KV8 prefill requires SM100 or SM103")
+        pytest.skip("Q8KV8 prefill requires SM100, SM103 or SM107")
     return device
 
 

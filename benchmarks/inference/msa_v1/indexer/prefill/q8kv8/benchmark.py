@@ -386,7 +386,7 @@ def main() -> None:
         raise RuntimeError("CUDA is required")
     capability = torch.cuda.get_device_capability()
     if capability not in PrefillIndexerGemmSm100.supported_compute_capabilities:
-        raise RuntimeError("Q8KV8 prefill benchmark requires SM100 or SM103")
+        raise RuntimeError("Q8KV8 prefill benchmark requires SM100, SM103 or SM107")
     try:
         selections = _select_cases(args)
     except ValueError as error:
