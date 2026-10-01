@@ -10,7 +10,6 @@ import hashlib
 import logging
 import os
 import subprocess
-import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -20,6 +19,7 @@ from pathlib import Path
 
 import jinja2
 
+from .. import _jit_cache
 from ._build_utils import cuda_home as _cuda_home
 from ._build_utils import cutlass_root as _cutlass_root
 from ._build_utils import cutlass_version as _cutlass_version
@@ -117,32 +117,6 @@ def _tvm_ffi_include() -> Path:
     raise RuntimeError("Cannot find TVM-FFI headers")
 
 
-@lru_cache(maxsize=1)
-def _source_digest() -> str:
-    import torch
-    import tvm_ffi
-
-    digest = hashlib.sha256()
-    for path in sorted(_CSRC.rglob("*")):
-        # csrc/api is compiled by torch.utils.cpp_extension (host side); it does not feed the
-        # kernel modules, so it must not invalidate their cache.
-        if path.is_file() and "api" not in path.relative_to(_CSRC).parts:
-            digest.update(str(path.relative_to(_ROOT)).encode())
-            digest.update(path.read_bytes())
-    digest.update(Path(__file__).read_bytes())
-    digest.update(sys.version.encode())
-    digest.update(torch.__version__.encode())
-    digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
-    digest.update(getattr(tvm_ffi, "__version__", "unknown").encode())
-    digest.update(str(_cuda_home()).encode())
-    digest.update(str(_cuda_version()).encode())
-    digest.update(str(_cutlass_root()).encode())
-    version_header = _cutlass_root() / "include/cutlass/version.h"
-    if version_header.is_file():
-        digest.update(version_header.read_bytes())
-    return digest.hexdigest()[:16]
-
-
 def _cache_root() -> Path:
     """Share the package JIT cache location; fall back to the torch extension dir."""
     explicit = os.environ.get("MINFER_FMHA_CACHE_DIR") or os.environ.get(
@@ -228,13 +202,42 @@ def _dequant_mode(arch: str) -> str:
     return _QMUL4_DEQUANT
 
 
-def _cache_dir(component: str, arch: str, dequant_mode: str) -> Path:
-    return _cache_root() / f"{component}_{dequant_mode}_{arch}_{_source_digest()}"
+@lru_cache(maxsize=1)
+def _namespace() -> _jit_cache.Namespace:
+    """The cache namespace of the selected toolchain (see ``fmha_sm100._jit_cache``)."""
+    return _jit_cache.Namespace(_cache_root(), _cuda_home())
 
 
-def _nvcc_flags(
-    cache_dir: Path, dequant_mode: str, arch: str, block_scale_shift: int = 0
-) -> str:
+# Compile and link rules of every library; part of each recipe, so changing them rebuilds.
+_NINJA_RULES = """rule nvcc_compile
+  command = $nvcc $nvcc_flags -MMD -MF $out.d -c $in -o $out
+  description = Compiling $in
+  depfile = $out.d
+  deps = gcc
+
+rule nvcc_link
+  command = $nvcc -shared $in -o $out -lcuda
+  description = Linking $out
+"""
+
+
+def _recipe(name: str, nvcc_flags: str, templates=(), **key) -> _jit_cache.Recipe:
+    """One library's cache recipe (compiler, flags, build rules, ``key``); the files it compiles
+    from are checked per record."""
+    return _jit_cache.Recipe(
+        _namespace(),
+        name,
+        {
+            "nvcc": str(_cuda_home() / "bin/nvcc"),
+            "nvcc_flags": nvcc_flags,
+            "rules": _NINJA_RULES,
+            **key,
+        },
+        templates=templates,
+    )
+
+
+def _nvcc_flags(dequant_mode: str, arch: str, block_scale_shift: int = 0) -> str:
     include_dirs = [
         _SM100_INCLUDE,
         _SM100_INCLUDE / "common",
@@ -244,7 +247,6 @@ def _nvcc_flags(
         _cutlass_root() / "include",
         _cutlass_root() / "tools/util/include",
         _tvm_ffi_include(),
-        cache_dir,
     ]
     flags = [
         "-O3",
@@ -313,18 +315,9 @@ def _write_ninja(
     content = f"""ninja_required_version = 1.5
 
 nvcc = {nvcc}
-nvcc_flags = {_nvcc_flags(cache_dir, dequant_mode, arch, block_scale_shift)}
+nvcc_flags = {_nvcc_flags(dequant_mode, arch, block_scale_shift)}
 
-rule nvcc_compile
-  command = $nvcc $nvcc_flags -MMD -MF $out.d -c $in -o $out
-  description = Compiling $in
-  depfile = $out.d
-  deps = gcc
-
-rule nvcc_link
-  command = $nvcc -shared $in -o $out -lcuda
-  description = Linking $out
-
+{_NINJA_RULES}
 {builds}
 build {output}: nvcc_link {" ".join(str(obj) for obj in objects)}
 """
@@ -348,17 +341,11 @@ class JitSpec:
 
     @property
     def uri(self) -> str:
-        return (
-            f"{self._component}_{self.dequant_mode}_{self.target_arch}_{_source_digest()}"
-        )
+        return f"{self._component}_{self.dequant_mode}_{self.target_arch}"
 
-    def build_and_load(self):
-        cache_dir = _cache_dir(self._component, self.target_arch, self.dequant_mode)
-        with _build_lock(cache_dir):
-            return self._build_and_load_locked(cache_dir)
-
-    def _build_and_load_locked(self, cache_dir: Path):
-        params = {
+    @property
+    def _params(self) -> dict:
+        return {
             "variant_name": self.variant_name,
             "func_name": f"decode_attention_{self.variant_name}",
             "tile_q": self.gqa_ratio,
@@ -372,6 +359,29 @@ class JitSpec:
             "sparse_topk": MAX_TOPK,
             "fixed_q_tokens_per_batch": 0,
         }
+
+    def recipe(self) -> _jit_cache.Recipe:
+        return _recipe(
+            self.uri,
+            _nvcc_flags(self.dequant_mode, self.target_arch, self.block_scale_shift),
+            templates=(
+                _TEMPLATES / "decode_attention_inst.cu.jinja",
+                _TEMPLATES / "decode_attention_run.cu.jinja",
+            ),
+            params=self._params,
+        )
+
+    def build(self) -> Path:
+        """Return the library, compiling it when no record matches the current sources."""
+        return self.recipe().build(self._build)
+
+    def build_and_load(self):
+        import tvm_ffi
+
+        return tvm_ffi.load_module(str(self.build()))
+
+    def _build(self, cache_dir: Path) -> Path:
+        params = self._params
         inst_template = jinja2.Template(
             (_TEMPLATES / "decode_attention_inst.cu.jinja").read_text()
         )
@@ -392,10 +402,7 @@ class JitSpec:
             self.block_scale_shift,
         )
         _run_ninja(cache_dir, f"{self.variant_name} JIT module")
-
-        import tvm_ffi
-
-        return tvm_ffi.load_module(str(so_path))
+        return so_path
 
 
 def gen_jit_spec(
@@ -491,18 +498,15 @@ def _build_fixed_module(component: str, source: Path, label: str, arch: str):
     import tvm_ffi
 
     dequant_mode = _dequant_mode(arch)
-    cache_dir = _cache_dir(component, arch, dequant_mode)
-    with _build_lock(cache_dir):
+
+    def build(cache_dir: Path) -> Path:
         so_path = cache_dir / f"{component}.so"
-        _write_ninja(
-            cache_dir,
-            so_path,
-            [source],
-            dequant_mode,
-            arch,
-        )
+        _write_ninja(cache_dir, so_path, [source], dequant_mode, arch)
         _run_ninja(cache_dir, label)
-        return tvm_ffi.load_module(str(so_path))
+        return so_path
+
+    recipe = _recipe(f"{component}_{dequant_mode}_{arch}", _nvcc_flags(dequant_mode, arch))
+    return tvm_ffi.load_module(str(recipe.build(build)))
 
 
 _plan_modules = {}

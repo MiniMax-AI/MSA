@@ -519,7 +519,7 @@ def _get_sparse_prepare_fwd_split_atomic(
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-            save_aot(key, _PREPARE_COMPILE_CACHE[key])
+            save_aot(key, _PREPARE_COMPILE_CACHE[key], sources=[__name__])
     return _PREPARE_COMPILE_CACHE[key]
 
 
@@ -557,7 +557,7 @@ def _get_sparse_prepare_flat_schedule(
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-            save_aot(key, _PREPARE_COMPILE_CACHE[key])
+            save_aot(key, _PREPARE_COMPILE_CACHE[key], sources=[__name__])
     return _PREPARE_COMPILE_CACHE[key]
 
 

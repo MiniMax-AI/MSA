@@ -8,6 +8,11 @@ Tests both TILE_Q=256 (prefill) and TILE_Q=128 (short Q / decode) paths.
 Uses PyTorch SDPA as reference.
 
 Chaos tests are distributed across 8 GPUs via subprocess for faster execution.
+
+The csrc kernel variants this sweep needs are listed in ``fmha_variants.txt`` next to this
+file and compiled in parallel before the first case (``--jit-jobs N`` bounds the builds,
+``--no-prebuild`` keeps lazy JIT); ``--update-variant-manifest`` rewrites the list from the
+variants a run actually requested.
 """
 
 import sys
@@ -24,11 +29,88 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 
 from fmha_sm100 import fmha_sm100 as _fmha_sm100
 from fmha_sm100 import fmha_sm100_plan
+from fmha_sm100 import jit as _fmha_jit
 
 from functools import partial
 fmha_sm100 = None
 
 page_sizes = [128]
+
+VARIANT_MANIFEST = Path(__file__).resolve().with_name("fmha_variants.txt")
+
+
+def _flag_value(name, default=None):
+    if name in sys.argv:
+        index = sys.argv.index(name)
+        if index + 1 < len(sys.argv):
+            return sys.argv[index + 1]
+    return default
+
+
+def _read_variant_manifest():
+    if not VARIANT_MANIFEST.exists():
+        return []
+    lines = VARIANT_MANIFEST.read_text().splitlines()
+    return [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+
+
+def prebuild_variants():
+    """Compile the manifest's variants in parallel instead of one at a time mid-sweep."""
+    if "--no-prebuild" in sys.argv:
+        return
+    import time
+    names = _read_variant_manifest()
+    jobs = _flag_value("--jit-jobs")
+    started = time.time()
+    built = _fmha_jit.prebuild_fmha_variants(names, max_workers=int(jobs) if jobs else None)
+    print(f"Pre-built {len(built)} of {len(names)} FMHA variants in {time.time() - started:.0f}s "
+          f"({len(names) - len(built)} cached)")
+
+
+def check_variant_manifest():
+    """Report variants the sweep compiled lazily; rewrite the manifest when asked."""
+    requested = set(_fmha_jit.requested_fmha_variants())
+    listed = set(_read_variant_manifest())
+    if "--update-variant-manifest" in sys.argv:
+        VARIANT_MANIFEST.write_text(
+            "# csrc FMHA variants tests/regression/test_correctness.py requests; pre-built in\n"
+            "# parallel before the sweep. Regenerate with --update-variant-manifest.\n"
+            + "".join(f"{name}\n" for name in sorted(requested | listed)))
+        print(f"Wrote {len(requested | listed)} variants to {VARIANT_MANIFEST}")
+    elif requested - listed:
+        print(f"Note: {len(requested - listed)} variants were compiled lazily because "
+              f"{VARIANT_MANIFEST.name} does not list them; run with --update-variant-manifest: "
+              f"{sorted(requested - listed)}")
+
+
+class _PlainProgress:
+    """Stand-in for tqdm when it is not installed: iterate, count, ignore the rest."""
+
+    def __init__(self, iterable=None, total=None, **kwargs):
+        self._iterable = iterable if iterable is not None else ()
+        self.n = 0
+
+    def __iter__(self):
+        for item in self._iterable:
+            yield item
+            self.n += 1
+
+    def update(self, delta=1):
+        self.n += delta
+
+    def set_postfix(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+def _progress(*args, **kwargs):
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        return _PlainProgress(*args, **kwargs)
+    return tqdm(*args, **kwargs)
 
 def sdpa_ref(q_bf16, k_bf16, v_bf16, h_q, h_k, causal=True, qo_offset=None):
     """Compute reference attention using PyTorch SDPA.
@@ -1245,8 +1327,7 @@ def run_chaos_single_gpu(num_cases=128):
     oom_count = 0
     cases_run = 0
     early_stop = False
-    from tqdm import tqdm
-    pbar = tqdm(specs, desc="Chaos", unit="case")
+    pbar = _progress(specs, desc="Chaos", unit="case")
     for spec in pbar:
         try:
             passed, fail_msg = _run_chaos_one(spec, device)
@@ -1384,8 +1465,7 @@ def run_chaos_multi_gpu():
         threads.append(t)
 
     import time
-    from tqdm import tqdm
-    pbar = tqdm(total=total_chaos, desc="Chaos", unit="case")
+    pbar = _progress(total=total_chaos, desc="Chaos", unit="case")
     try:
         while any(t.is_alive() for t in threads):
             time.sleep(0.3)
@@ -1421,6 +1501,14 @@ def run_chaos_multi_gpu():
 # ---- Main ----
 
 def main():
+    """Run the sweep; returns whether every case passed."""
+    prebuild_variants()
+    all_pass = run_sweep()
+    check_variant_manifest()
+    return all_pass
+
+
+def run_sweep():
     all_pass = True
 
     if "--chaos_only" not in sys.argv:
@@ -1689,11 +1777,11 @@ def main():
             if num == 8 and len(failed_cases)>num:
                 print(f"..and {len(failed_cases)-num} more")
                 break
-        return
+        return False
     
     if not full_mode:
         print("ALL TESTS PASSED")
-        return
+        return True
 
     all_pass &= run_chaos_multi_gpu()
 
@@ -1708,10 +1796,13 @@ def main():
             if num == 8 and len(failed_cases)>num:
                 print(f"..and {len(failed_cases)-num} more")
                 break
+    check_variant_manifest()
     os._exit(0 if all_pass else 1)
 
 
 if __name__ == "__main__":
+    # Progress stays visible when the output goes to a file or a pipe.
+    sys.stdout.reconfigure(line_buffering=True)
 
     if "--check" in sys.argv:
         fmha_sm100 = partial(_fmha_sm100, check_input_valid=True)
@@ -1721,4 +1812,4 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--chaos-worker-dynamic":
         chaos_worker_main_dynamic(int(sys.argv[2]))
     else:
-        main()
+        sys.exit(0 if main() else 1)

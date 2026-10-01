@@ -136,7 +136,7 @@ def _compile_or_load(key: tuple[object, ...], compile_fn):
         started_at = time.perf_counter()
         compiled = compile_fn()
         logger.info("[%s] Compiled in %.3fs", key[0], time.perf_counter() - started_at)
-        save_aot(key, compiled)
+        save_aot(key, compiled, sources=_CODEGEN_SOURCES)
     _COMPILE_CACHE[key] = compiled
     return compiled
 

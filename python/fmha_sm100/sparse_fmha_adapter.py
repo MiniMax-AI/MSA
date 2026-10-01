@@ -31,7 +31,7 @@ if os.path.isdir(_MM_SPARSE_DIR) and _MM_SPARSE_DIR not in sys.path:
 from interface import sparse_atten_func, sparse_atten_nvfp4_kv_func
 from sparse_index_utils import build_k2q_csr
 from src.sm100.prepare_scheduler import SPARSE_SCHEDULE_MODEL
-from src.common.aot_cache import _key_to_path
+from src.common.aot_cache import aot_object_path
 
 
 def _compute_aot_kernel_paths(head_dim, n_block_size, qhead_per_kv, topk,
@@ -56,11 +56,10 @@ def _compute_aot_kernel_paths(head_dim, n_block_size, qhead_per_kv, topk,
         cutlass_partial, cutlass_out,
         True, False, True, False, True, True,
     )
-    fwd_path = _key_to_path(fwd_key) + ".o"
-    combine_path = _key_to_path(combine_key) + ".o"
     return {
-        "fwd_kernel_path": fwd_path if os.path.isfile(fwd_path) else "",
-        "combine_kernel_path": combine_path if os.path.isfile(combine_path) else "",
+        # Only objects whose cache entry vouches for the current sources.
+        "fwd_kernel_path": aot_object_path(fwd_key),
+        "combine_kernel_path": aot_object_path(combine_key),
         "fwd_func_name": str(fwd_key[0]),
         "combine_func_name": str(combine_key[0]),
     }

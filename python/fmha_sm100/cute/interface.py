@@ -1893,7 +1893,7 @@ def _call_sparse_forward_sm100_csr_varlen(
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-            save_aot(key, _compile_cache[key])
+            save_aot(key, _compile_cache[key], sources=[type(kernel)])
 
     with torch.cuda.nvtx.range("Fwd_SparseAttn_Sm100_CsrVarlen"):
         _compile_cache[key](
@@ -2101,7 +2101,7 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             )
-            save_aot(key, _compile_cache[key])
+            save_aot(key, _compile_cache[key], sources=[type(kernel)])
 
     with torch.cuda.nvtx.range("Fwd_SparseAttn_Sm100_CsrVarlen_KVFP4"):
         _compile_cache[key](

@@ -3,23 +3,24 @@
 
 """Per-variant lazy JIT compilation for FMHA varlen kernels.
 
-Each FMHA variant (dtype x tile x sparse x page x split_kv x pack_factor) is compiled
-independently on first use and cached to ~/.cache/minfer/fmha_sm100/.
-
-To recompile after kernel changes: scripts/clear_fmha_cache.sh
+Each FMHA variant (dtype x tile x sparse x page x split_kv x pack_factor) and each fixed module
+(plan, sparse top-k, reductions, indexers) is compiled independently on first use and cached under
+~/.cache/minfer/fmha_sm100/ (``MINFER_FMHA_CACHE_DIR``). The cache checks every library against
+the content of the files it was compiled from (``_jit_cache``), so a kernel change rebuilds only
+the libraries that include the changed files; nothing needs clearing by hand.
 """
 
-import hashlib
 import itertools
-import fcntl
 import logging
 import os
 import shutil
-import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import jinja2
+
+from . import _jit_cache
 
 logger = logging.getLogger(__name__)
 
@@ -42,18 +43,6 @@ def _compute_cache_base():
 
 
 CACHE_BASE = _compute_cache_base()
-
-
-def _acquire_file_lock(lock_path):
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o666)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    return fd
-
-
-def _release_file_lock(fd):
-    fcntl.flock(fd, fcntl.LOCK_UN)
-    os.close(fd)
 
 
 # Kernel sources and CUTLASS headers are shipped inside the package directory
@@ -186,6 +175,25 @@ def _variant_key_from_runtime(dtype_code, qo_tile_size, single_wg,
     return variant_name, params
 
 
+def _variant_params_from_name(variant_name):
+    """Inverse of ``_variant_key_from_runtime``: the build params of a variant name."""
+    kv_idx = next((i for i, (_, p) in enumerate(_FMHA_SM100_KV_DTYPE)
+                   if p["kv_suffix"] and variant_name.endswith(p["kv_suffix"])), 0)
+    suffix = _FMHA_SM100_KV_DTYPE[kv_idx][1]["kv_suffix"]
+    fields = variant_name[:len(variant_name) - len(suffix)].split("_")
+    if len(fields) != len(_FMHA_SM100_DISPATCH):
+        raise ValueError(f"Not an FMHA variant name: {variant_name!r}")
+    params = {}
+    for (_, dim_values), field in zip(_FMHA_SM100_DISPATCH, fields):
+        params.update(dim_values[int(field)][1])
+    params.update(_FMHA_SM100_KV_DTYPE[kv_idx][1])
+    if _FMHA_SM100_IMPOSSIBLE(params):
+        raise ValueError(f"Impossible FMHA variant: {variant_name!r}")
+    params["func_name"] = "fmha_sm100_" + variant_name
+    params["variant_name"] = variant_name
+    return params
+
+
 def _get_tvm_ffi_include():
     """Find TVM-FFI include directory."""
     try:
@@ -215,9 +223,18 @@ def _get_cuda_home():
     raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
 
 
-_ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
+_namespace_instance = None
 
-def _get_nvcc_flags(cache_dir, fmha=True, kv_mode=0, fast_math=True):
+
+def _namespace():
+    """The cache namespace of the selected toolchain: ``CACHE_BASE/v2/<toolchain>/``."""
+    global _namespace_instance
+    if _namespace_instance is None:
+        _namespace_instance = _jit_cache.Namespace(CACHE_BASE, _get_cuda_home())
+    return _namespace_instance
+
+
+def _get_nvcc_flags(fmha=True, kv_mode=0, fast_math=True):
     tvm_include = _get_tvm_ffi_include()
     fmha_include = str(_FMHA_VARLEN_DIR / "include")
     cutlass_include = str(_CUTLASS_INCLUDE)
@@ -243,7 +260,9 @@ def _get_nvcc_flags(cache_dir, fmha=True, kv_mode=0, fast_math=True):
         f"-I{cutlass_include}",
         f"-I{cutlass_util_include}",
         f"-I{tvm_include}",
-        f"-I{cache_dir}",
+        # csrc/ itself: fmha_sm100_params.h, tvm_ffi_utils.h and gmem_bounds_check.h. Sources
+        # compile from the package, so the cache records the files the compiler really read.
+        f"-I{_FMHA_VARLEN_DIR}",
         "-DNDEBUG", "-Xptxas", "-O1" if fmha else "-O3",
         "-Xcompiler", "-fPIC",
     ]
@@ -263,6 +282,59 @@ def _get_nvcc_flags(cache_dir, fmha=True, kv_mode=0, fast_math=True):
         nvcc_flags += ["-Xcompiler", "-fvisibility=hidden"]
     return " ".join(nvcc_flags)
 
+
+def _nvcc():
+    return os.path.join(_get_cuda_home(), "bin", "nvcc")
+
+
+# Compile and link rules of every library; part of each recipe, so changing them rebuilds.
+_NINJA_RULES = """rule nvcc_compile
+  command = $nvcc $nvcc_flags -MMD -MF $out.d -c $in -o $out
+  description = Compiling $in
+  depfile = $out.d
+  deps = gcc
+
+rule nvcc_link
+  command = $nvcc -shared $in -o $out -lcuda
+  description = Linking $out
+"""
+
+
+def _recipe(name, nvcc_flags, templates=(), **key):
+    """The cache recipe of one library: its name, compiler, flags and build rules, plus ``key``
+    (template parameters). File contents are checked separately, per record."""
+    return _jit_cache.Recipe(_namespace(), name, {"nvcc": _nvcc(), "nvcc_flags": nvcc_flags,
+                                                  "rules": _NINJA_RULES, **key},
+                             templates=templates)
+
+
+def _build_library(recipe, label, nvcc_flags, sources, jobs=1):
+    """Return the library of ``recipe``, compiling it when no record matches the current files.
+
+    ``sources(build_dir)`` returns the translation units, writing generated ones into
+    ``build_dir`` first. Each compiles to its own object with a depfile, so the cache learns
+    every header it read, and the objects link into one shared library.
+    """
+    def builder(build_dir):
+        logger.info("JIT compiling %s", label)
+        library = build_dir / f"{recipe.name}.so"
+        objects = [(build_dir / f"{Path(source).stem}.o", source) for source in sources(build_dir)]
+        compiles = "\n".join(f"build {obj}: nvcc_compile {source}" for obj, source in objects)
+        _jit_cache.write_if_changed(build_dir / "build.ninja", f"""ninja_required_version = 1.5
+
+nvcc = {_nvcc()}
+nvcc_flags = {nvcc_flags}
+
+{_NINJA_RULES}
+{compiles}
+build {library}: nvcc_link {" ".join(str(obj) for obj, _ in objects)}
+""")
+        _jit_cache.run_ninja(build_dir, label, jobs=jobs)
+        return library
+
+    return recipe.build(builder)
+
+
 class _VariantWrapper:
     """Wraps a TVM-FFI function to look like a module with .run()."""
     def __init__(self, fn):
@@ -272,30 +344,30 @@ class _VariantWrapper:
         return self._fn(*args)
 
 
+_FMHA_TEMPLATES = (_FMHA_VARLEN_DIR / "fmha_sm100_inst.jinja",
+                   _FMHA_VARLEN_DIR / "fmha_sm100_variant_run.cu.jinja")
+
+
 class FMHAVariantManager:
-    """Manages FMHA variant kernels. Loads from all_variants.so or per-variant .so."""
+    """Builds and loads the FMHA variant kernels, one cached library per variant."""
 
     def __init__(self):
         self._loaded = {}
         self._lock = threading.Lock()
-        self._all_module = None
-        self._all_module_checked = False
         self._inst_template = None
         self._run_template = None
+        self._requested = set()
 
     def _load_templates(self):
         if self._inst_template is None:
-            with open(_FMHA_VARLEN_DIR / "fmha_sm100_inst.jinja") as f:
-                self._inst_template = jinja2.Template(f.read())
-            with open(_FMHA_VARLEN_DIR / "fmha_sm100_variant_run.cu.jinja") as f:
-                self._run_template = jinja2.Template(f.read())
+            inst_path, run_path = _FMHA_TEMPLATES
+            self._run_template = jinja2.Template(run_path.read_text())
+            self._inst_template = jinja2.Template(inst_path.read_text())
 
-    def _ensure_all_module(self):
-        if not self._all_module_checked:
-            self._all_module_checked = True
-            if _ALL_VARIANTS_SO.exists():
-                import tvm_ffi
-                self._all_module = tvm_ffi.load_module(str(_ALL_VARIANTS_SO))
+    def _recipe(self, variant_name, params):
+        nvcc_flags = _get_nvcc_flags(kv_mode=params.get("kv_mode", 0))
+        return _recipe(f"fmha_{variant_name}", nvcc_flags, templates=_FMHA_TEMPLATES,
+                       params=params), nvcc_flags
 
     def get_variant(self, dtype_code, qo_tile_size, single_wg,
                     sparse_mode, page_size, split_kv, pack_factor,
@@ -303,6 +375,7 @@ class FMHAVariantManager:
         variant_name, params = _variant_key_from_runtime(
             dtype_code, qo_tile_size, single_wg,
             sparse_mode, page_size, split_kv, pack_factor, kv_dtype)
+        self._requested.add(variant_name)
 
         cached = self._loaded.get(variant_name)
         if cached is not None:
@@ -312,109 +385,67 @@ class FMHAVariantManager:
             cached = self._loaded.get(variant_name)
             if cached is not None:
                 return cached
-
-            fn_name = f"run_{variant_name}"
-
-            # Try all_variants.so
-            self._ensure_all_module()
-            if self._all_module is not None:
-                try:
-                    fn = getattr(self._all_module, fn_name)
-                    self._loaded[variant_name] = _VariantWrapper(fn)
-                    return self._loaded[variant_name]
-                except AttributeError:
-                    pass
-
-            # Try per-variant .so
-            cache_dir = CACHE_BASE / variant_name
-            so_path = cache_dir / f"{variant_name}.so"
-            lock_fd = _acquire_file_lock(cache_dir / ".compile.lock")
-            try:
-                if not so_path.exists():
-                    self._compile_only(variant_name, params)
-
-                import tvm_ffi
-                module = tvm_ffi.load_module(str(so_path))
-                fn = getattr(module, fn_name)
-            finally:
-                _release_file_lock(lock_fd)
-            self._loaded[variant_name] = _VariantWrapper(fn)
+            import tvm_ffi
+            module = tvm_ffi.load_module(str(self.compile_locked(variant_name, params)))
+            self._loaded[variant_name] = _VariantWrapper(getattr(module, f"run_{variant_name}"))
             return self._loaded[variant_name]
 
-    def _compile_only(self, variant_name, params):
-        """Compile a variant without loading. Safe to call from subprocesses."""
-        cache_dir = CACHE_BASE / variant_name
-        so_path = cache_dir / f"{variant_name}.so"
+    def is_cached(self, variant_name):
+        """Whether a variant loads without compiling: a record matches the current sources."""
+        recipe, _ = self._recipe(variant_name, _variant_params_from_name(variant_name))
+        return recipe.lookup() is not None
 
-        if so_path.exists():
-            return
+    def compile_locked(self, variant_name, params):
+        """Return the variant's library, compiling it under its cache lock (the lock every
+        process takes) when no record matches. Loads nothing."""
+        recipe, nvcc_flags = self._recipe(variant_name, params)
 
-        logger.info(f"JIT compiling FMHA variant: {variant_name}")
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        def sources(build_dir):
+            self._load_templates()
+            inst_cu = build_dir / f"fmha_sm100_inst_{variant_name}.cu"
+            run_cu = build_dir / f"fmha_sm100_run_{variant_name}.cu"
+            _jit_cache.write_if_changed(inst_cu, self._inst_template.render(**params))
+            _jit_cache.write_if_changed(run_cu, self._run_template.render(**params))
+            return [inst_cu, run_cu]
 
-        self._load_templates()
-
-        inst_cu = cache_dir / f"fmha_sm100_inst_{variant_name}.cu"
-        run_cu = cache_dir / f"fmha_sm100_run_{variant_name}.cu"
-
-        inst_cu.write_text(self._inst_template.render(**params))
-        run_cu.write_text(self._run_template.render(**params))
-
-        for name in ["fmha_sm100_params.h", "tvm_ffi_utils.h", "gmem_bounds_check.h"]:
-            src = _FMHA_VARLEN_DIR / name
-            dst = cache_dir / name
-            if not dst.exists() or dst.read_text() != src.read_text():
-                shutil.copy2(src, dst)
-
-        self._write_ninja(cache_dir, variant_name, inst_cu, run_cu,
-                          kv_mode=params.get("kv_mode", 0))
-        self._run_ninja(cache_dir)
-
-    def _write_ninja(self, cache_dir, variant_name, inst_cu, run_cu, kv_mode=0):
-        cuda_home = _get_cuda_home()
-        nvcc = os.path.join(cuda_home, "bin", "nvcc")
-
-        nvcc_flags = _get_nvcc_flags(cache_dir, kv_mode=kv_mode)
-
-        so_path = cache_dir / f"{variant_name}.so"
-        inst_obj = cache_dir / f"inst_{variant_name}.o"
-        run_obj = cache_dir / f"run_{variant_name}.o"
-
-        ninja_content = f"""ninja_required_version = 1.5
-
-nvcc = {nvcc}
-nvcc_flags = {nvcc_flags}
-
-rule nvcc_compile
-  command = $nvcc $nvcc_flags -c $in -o $out
-  description = Compiling $in
-
-rule nvcc_link
-  command = $nvcc -shared $in -o $out -lcuda
-  description = Linking $out
-
-build {inst_obj}: nvcc_compile {inst_cu}
-build {run_obj}: nvcc_compile {run_cu}
-build {so_path}: nvcc_link {inst_obj} {run_obj}
-"""
-        (cache_dir / "build.ninja").write_text(ninja_content)
-
-    def _run_ninja(self, cache_dir):
-        result = subprocess.run(
-            ["ninja", "-j1"],
-            cwd=str(cache_dir),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"FMHA variant compilation failed:\n"
-                f"stdout: {result.stdout}\n"
-                f"stderr: {result.stderr}"
-            )
+        # The kernel instantiation and the host launcher are independent objects.
+        return _build_library(recipe, f"FMHA variant {variant_name}", nvcc_flags, sources, jobs=2)
 
 
 _variant_manager = FMHAVariantManager()
+
+
+def requested_fmha_variants():
+    """Names of the variants this process has asked ``get_fmha_variant`` for, sorted."""
+    return sorted(_variant_manager._requested)
+
+
+def _build_all(builds, max_workers):
+    """Run independent builds at once; each waits on its own ninja, so threads suffice."""
+    if builds:
+        workers = max_workers or min(len(builds), os.cpu_count() or 8)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(lambda build: build(), builds))
+
+
+def prebuild_fmha_variants(variant_names, max_workers=None):
+    """Compile the named variants that are not cached yet, in parallel.
+
+    Lazy JIT builds one variant at a time when a call first needs it (about a minute each), so
+    a test sweep over a cold cache spends most of its time compiling serially. This builds every
+    missing variant at once, one ninja per variant, into the same cache and under the same locks
+    as ``get_fmha_variant``, so concurrent processes stay safe. Returns the names compiled.
+    """
+    manager = _variant_manager
+    missing = []
+    for name in dict.fromkeys(variant_names):
+        params = _variant_params_from_name(name)
+        if manager._recipe(name, params)[0].lookup() is None:
+            missing.append((name, params))
+    if missing:
+        logger.info("Pre-building %d FMHA variants", len(missing))
+    _build_all([lambda item=item: manager.compile_locked(*item) for item in missing], max_workers)
+    return [name for name, _ in missing]
 
 
 def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
@@ -431,369 +462,80 @@ def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
 
 
 # ============================================================================
-# Plan kernel JIT (also needs sm_100a, can't be statically compiled)
+# Fixed native modules: plan, sparse top-k, split-KV reductions, indexers
 # ============================================================================
 
-_plan_module = None
-_plan_lock = threading.Lock()
+# key: (library name, translation units under csrc/, _get_nvcc_flags options, extra flags)
+_MODULES = {
+    "plan": ("fmha_sm100_plan", ("fmha_sm100_plan.cu",), {}, ""),
+    "sparse_topk": ("sparse_topk_select", ("sparse_topk_select.cu",), {}, ""),
+    "reduction": ("fmha_sm100_reduction", ("fmha_sm100_reduction.cu",), {}, ""),
+    # The device-scale NVFP4 reduction ABI: hidden weak symbols keep it apart from the other.
+    "reduction_nvfp4": ("fmha_sm100_reduction_nvfp4_v1", ("fmha_sm100_reduction.cu",), {},
+                        " -Xcompiler -fvisibility=hidden"),
+    # The ported indexer kernels were validated with IEEE division and denormals.
+    "indexer_topk_select": ("indexer_topk_select", ("indexer_topk_select.cu",),
+                            {"fast_math": False}, ""),
+    "q8kv4_indexer_decode": ("q8kv4_indexer_decode", ("q8kv4_indexer_decode.cu",),
+                             {"fast_math": False}, ""),
+}
+# The modules get_indexer_module loads.
+_INDEXER_MODULE_SOURCES = ("indexer_topk_select", "q8kv4_indexer_decode")
+_modules = {}
+_modules_lock = threading.Lock()
 
 
-def _do_compile_plan():
-    """Generate and compile plan kernel. No TVM loading."""
-    cache_dir = CACHE_BASE / "plan"
-    so_path = cache_dir / "fmha_sm100_plan.so"
-
-    if so_path.exists():
-        return
-
-    logger.info("JIT compiling FMHA plan module")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    plan_cu = _FMHA_VARLEN_DIR / "fmha_sm100_plan.cu"
-    shutil.copy2(plan_cu, cache_dir / "fmha_sm100_plan.cu")
-
-    cuda_home = _get_cuda_home()
-    nvcc = os.path.join(cuda_home, "bin", "nvcc")
-
-    obj = cache_dir / "fmha_sm100_plan.o"
-
-    nvcc_flags = _get_nvcc_flags(cache_dir, False)
-
-    ninja_content = f"""ninja_required_version = 1.5
-
-nvcc = {nvcc}
-nvcc_flags = {nvcc_flags}
-
-rule nvcc_compile
-  command = $nvcc $nvcc_flags -c $in -o $out
-  description = Compiling $in
-
-rule nvcc_link
-  command = $nvcc -shared $in -o $out -lcuda
-  description = Linking $out
-
-build {obj}: nvcc_compile {cache_dir / "fmha_sm100_plan.cu"}
-build {so_path}: nvcc_link {obj}
-"""
-    (cache_dir / "build.ninja").write_text(ninja_content)
-
-    result = subprocess.run(
-        ["ninja", "-j1"],
-        cwd=str(cache_dir),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"FMHA plan compilation failed:\n"
-            f"stdout: {result.stdout}\n"
-            f"stderr: {result.stderr}"
-        )
+def _module_recipe(key):
+    name, sources, options, extra_flags = _MODULES[key]
+    nvcc_flags = _get_nvcc_flags(False, **options) + extra_flags
+    return _recipe(name, nvcc_flags), nvcc_flags, [_FMHA_VARLEN_DIR / s for s in sources]
 
 
-def _compile_plan_only():
-    """Compile plan kernel without loading. Safe for subprocesses."""
-    _do_compile_plan()
+def build_module(key):
+    """Return the library of one of ``_MODULES``, compiling it when no record matches."""
+    recipe, nvcc_flags, sources = _module_recipe(key)
+    return _build_library(recipe, f"{recipe.name} module", nvcc_flags, lambda _: sources)
 
 
-def _compile_plan_module():
-    """Compile and load plan kernel."""
-    lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
-    try:
-        _do_compile_plan()
-        import tvm_ffi
-        so_path = CACHE_BASE / "plan" / "fmha_sm100_plan.so"
-        return tvm_ffi.load_module(str(so_path))
-    finally:
-        _release_file_lock(lock_fd)
+def prebuild_modules(keys=tuple(_MODULES), max_workers=None):
+    """Compile the fixed modules that are not cached yet, in parallel, without loading them
+    (an image build needs no GPU). Returns the keys compiled."""
+    missing = [key for key in keys if _module_recipe(key)[0].lookup() is None]
+    _build_all([lambda key=key: build_module(key) for key in missing], max_workers)
+    return missing
+
+
+def _load_module(key):
+    module = _modules.get(key)
+    if module is None:
+        with _modules_lock:
+            module = _modules.get(key)
+            if module is None:
+                import tvm_ffi
+                module = tvm_ffi.load_module(str(build_module(key)))
+                if key == "sparse_topk":
+                    module.sparse_topk_select_init()
+                _modules[key] = module
+    return module
 
 
 def get_plan_fn():
     """Get the plan function. JIT compiles on first call."""
-    global _plan_module
-    if _plan_module is not None:
-        return _plan_module
-
-    with _plan_lock:
-        if _plan_module is not None:
-            return _plan_module
-        _plan_module = _compile_plan_module()
-        return _plan_module
-
-
-# ============================================================================
-# Sparse TopK Select kernel JIT
-# ============================================================================
-
-_sparse_topk_module = None
-_sparse_topk_lock = threading.Lock()
-
-
-def _do_compile_sparse_topk():
-    cache_dir = CACHE_BASE / "sparse_topk"
-    so_path = cache_dir / "sparse_topk_select.so"
-
-    tracked_sources = [
-        _FMHA_VARLEN_DIR / "sparse_topk_select.cu",
-        _FMHA_VARLEN_DIR / "include" / "sparse_topk_select.cuh",
-        _FMHA_VARLEN_DIR / "tvm_ffi_utils.h",
-    ]
-    needs_rebuild = not so_path.exists()
-    for src in tracked_sources:
-        dst = cache_dir / src.name
-        if not dst.exists() or dst.read_text() != src.read_text():
-            needs_rebuild = True
-
-    if not needs_rebuild:
-        return
-
-    logger.info("JIT compiling sparse_topk_select module")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    src_cu = _FMHA_VARLEN_DIR / "sparse_topk_select.cu"
-    shutil.copy2(src_cu, cache_dir / "sparse_topk_select.cu")
-    shutil.copy2(_FMHA_VARLEN_DIR / "include" / "sparse_topk_select.cuh",
-                 cache_dir / "sparse_topk_select.cuh")
-    shutil.copy2(_FMHA_VARLEN_DIR / "tvm_ffi_utils.h", cache_dir / "tvm_ffi_utils.h")
-
-    cuda_home = _get_cuda_home()
-    nvcc = os.path.join(cuda_home, "bin", "nvcc")
-
-    obj = cache_dir / "sparse_topk_select.o"
-    cached_cu = cache_dir / "sparse_topk_select.cu"
-    cached_cuh = cache_dir / "sparse_topk_select.cuh"
-    cached_ffi_header = cache_dir / "tvm_ffi_utils.h"
-
-    nvcc_flags = _get_nvcc_flags(cache_dir, False)
-
-    ninja_content = f"""ninja_required_version = 1.5
-
-nvcc = {nvcc}
-nvcc_flags = {nvcc_flags}
-
-rule nvcc_compile
-  command = $nvcc $nvcc_flags -c $in -o $out
-  description = Compiling $in
-
-rule nvcc_link
-  command = $nvcc -shared $in -o $out -lcuda
-  description = Linking $out
-
-build {obj}: nvcc_compile {cached_cu} | {cached_cuh} {cached_ffi_header}
-build {so_path}: nvcc_link {obj}
-"""
-    (cache_dir / "build.ninja").write_text(ninja_content)
-
-    result = subprocess.run(
-        ["ninja", "-j1"],
-        cwd=str(cache_dir),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"sparse_topk_select compilation failed:\n"
-            f"stdout: {result.stdout}\n"
-            f"stderr: {result.stderr}"
-        )
+    return _load_module("plan")
 
 
 def get_sparse_topk_module():
     """Get the sparse_topk_select module. JIT compiles on first call."""
-    global _sparse_topk_module
-    if _sparse_topk_module is not None:
-        return _sparse_topk_module
-
-    with _sparse_topk_lock:
-        if _sparse_topk_module is not None:
-            return _sparse_topk_module
-        lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
-        try:
-            _do_compile_sparse_topk()
-            import tvm_ffi
-            so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
-            _sparse_topk_module = tvm_ffi.load_module(str(so_path))
-            _sparse_topk_module.sparse_topk_select_init()
-        finally:
-            _release_file_lock(lock_fd)
-        return _sparse_topk_module
-
-
-# ============================================================================
-# Split-KV reduction kernel JIT
-# ============================================================================
-
-_reduction_modules = {}
-_reduction_lock = threading.Lock()
-
-
-def _do_compile_reduction(nvfp4=False):
-    cache_dir = CACHE_BASE / ("reduction_nvfp4_v1" if nvfp4 else "reduction")
-    so_path = cache_dir / "fmha_sm100_reduction.so"
-
-    if so_path.exists():
-        return
-
-    logger.info("JIT compiling fmha_sm100_reduction module")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    src_cu = _FMHA_VARLEN_DIR / "fmha_sm100_reduction.cu"
-    shutil.copy2(src_cu, cache_dir / "fmha_sm100_reduction.cu")
-    for name in ["gmem_bounds_check.h"]:
-        src = _FMHA_VARLEN_DIR / name
-        dst = cache_dir / name
-        if src.exists() and (not dst.exists() or dst.read_text() != src.read_text()):
-            shutil.copy2(src, dst)
-
-    cuda_home = _get_cuda_home()
-    nvcc = os.path.join(cuda_home, "bin", "nvcc")
-
-    obj = cache_dir / "fmha_sm100_reduction.o"
-
-    nvcc_flags = _get_nvcc_flags(cache_dir, False)
-    if nvfp4:
-        nvcc_flags += " -Xcompiler -fvisibility=hidden"
-
-    ninja_content = f"""ninja_required_version = 1.5
-
-nvcc = {nvcc}
-nvcc_flags = {nvcc_flags}
-
-rule nvcc_compile
-  command = $nvcc $nvcc_flags -c $in -o $out
-  description = Compiling $in
-
-rule nvcc_link
-  command = $nvcc -shared $in -o $out -lcuda
-  description = Linking $out
-
-build {obj}: nvcc_compile {cache_dir / "fmha_sm100_reduction.cu"}
-build {so_path}: nvcc_link {obj}
-"""
-    (cache_dir / "build.ninja").write_text(ninja_content)
-
-    result = subprocess.run(
-        ["ninja", "-j1"],
-        cwd=str(cache_dir),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"fmha_sm100_reduction compilation failed:\n"
-            f"stdout: {result.stdout}\n"
-            f"stderr: {result.stderr}"
-        )
+    return _load_module("sparse_topk")
 
 
 def get_reduction_module(nvfp4=False):
     """Load the ordinary or device-scale NVFP4 split-KV reduction ABI."""
-    key = "reduction_nvfp4_v1" if nvfp4 else "reduction"
-    if key in _reduction_modules:
-        return _reduction_modules[key]
-    with _reduction_lock:
-        if key in _reduction_modules:
-            return _reduction_modules[key]
-        lock_fd = _acquire_file_lock(CACHE_BASE / (key + ".lock"))
-        try:
-            _do_compile_reduction(nvfp4)
-            import tvm_ffi
-            _reduction_modules[key] = tvm_ffi.load_module(
-                str(CACHE_BASE / key / "fmha_sm100_reduction.so"))
-        finally:
-            _release_file_lock(lock_fd)
-        return _reduction_modules[key]
-
-
-# ============================================================================
-# Q8KV4/Q8KV8 paged indexer kernels JIT
-# ============================================================================
-
-# Each module is one TVM-FFI translation unit plus the header directory it owns.
-_INDEXER_MODULE_SOURCES = {
-    "indexer_topk_select": ("indexer_topk_select.cu", "indexer_topk"),
-    "q8kv4_indexer_decode": ("q8kv4_indexer_decode.cu", "q8kv4_indexer"),
-}
-_indexer_modules = {}
-_indexer_lock = threading.Lock()
-
-
-def _indexer_module_build(name):
-    """Return the digest-keyed cache directory, shared library, and build inputs."""
-    source_name, header_dir = _INDEXER_MODULE_SOURCES[name]
-    source = _FMHA_VARLEN_DIR / source_name
-    headers = sorted((_FMHA_VARLEN_DIR / "include" / header_dir).glob("*"))
-    headers.append(_FMHA_VARLEN_DIR / "tvm_ffi_utils.h")
-    nvcc = str(Path(_get_cuda_home(), "bin", "nvcc").resolve())
-    # Sources compile in place, so csrc/ provides tvm_ffi_utils.h. The ported
-    # kernels were validated with IEEE division and denormals.
-    nvcc_flags = _get_nvcc_flags(_FMHA_VARLEN_DIR, False, fast_math=False)
-    digest = hashlib.sha256()
-    for path in [source, *headers, _CUTLASS_INCLUDE / "cutlass" / "version.h"]:
-        digest.update(path.name.encode())
-        digest.update(path.read_bytes())
-    import tvm_ffi
-    digest.update(tvm_ffi.__version__.encode())
-    digest.update(nvcc.encode())
-    digest.update(nvcc_flags.encode())
-    cache_dir = CACHE_BASE / f"{name}_{digest.hexdigest()[:16]}"
-    return cache_dir, cache_dir / f"{name}.so", nvcc, nvcc_flags, source, headers
-
-
-def _do_compile_indexer_module(name):
-    cache_dir, so_path, nvcc, nvcc_flags, source, headers = _indexer_module_build(name)
-    if so_path.exists():
-        return so_path
-
-    logger.info(f"JIT compiling {name} module")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    obj = cache_dir / f"{name}.o"
-    implicit_deps = " ".join(str(path) for path in headers)
-    ninja_content = f"""ninja_required_version = 1.5
-
-nvcc = {nvcc}
-nvcc_flags = {nvcc_flags}
-
-rule nvcc_compile
-  command = $nvcc $nvcc_flags -c $in -o $out
-  description = Compiling $in
-
-rule nvcc_link
-  command = $nvcc -shared $in -o $out -lcuda
-  description = Linking $out
-
-build {obj}: nvcc_compile {source} | {implicit_deps}
-build {so_path}: nvcc_link {obj}
-"""
-    (cache_dir / "build.ninja").write_text(ninja_content)
-
-    result = subprocess.run(
-        ["ninja", "-j1"],
-        cwd=str(cache_dir),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"{name} compilation failed:\n"
-            f"stdout: {result.stdout}\n"
-            f"stderr: {result.stderr}"
-        )
-    return so_path
+    return _load_module("reduction_nvfp4" if nvfp4 else "reduction")
 
 
 def get_indexer_module(name):
     """Load one of ``_INDEXER_MODULE_SOURCES``. JIT compiles on first call."""
-    if name in _indexer_modules:
-        return _indexer_modules[name]
-    with _indexer_lock:
-        if name in _indexer_modules:
-            return _indexer_modules[name]
-        lock_fd = _acquire_file_lock(CACHE_BASE / f"{name}.lock")
-        try:
-            so_path = _do_compile_indexer_module(name)
-            import tvm_ffi
-            _indexer_modules[name] = tvm_ffi.load_module(str(so_path))
-        finally:
-            _release_file_lock(lock_fd)
-        return _indexer_modules[name]
+    if name not in _INDEXER_MODULE_SOURCES:
+        raise KeyError(f"unknown indexer module {name!r}")
+    return _load_module(name)

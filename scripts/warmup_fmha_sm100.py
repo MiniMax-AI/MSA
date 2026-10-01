@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 # SPDX-License-Identifier: MIT
 
-"""Pre-compile all FMHA SM100 kernel variants with a single ninja build.
+"""Pre-compile FMHA SM100 kernel variants into the JIT cache, in parallel.
 
 Usage:
     python3 scripts/warmup_fmha_sm100.py          # Compile all with max parallelism
@@ -15,14 +15,13 @@ import glob
 import itertools
 import os
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-from fmha_sm100.jit import _FMHA_SM100_DISPATCH, _FMHA_SM100_IMPOSSIBLE, _get_nvcc_flags
+from fmha_sm100.jit import _FMHA_SM100_DISPATCH, _FMHA_SM100_IMPOSSIBLE
 
 def enumerate_all_variants():
 
@@ -81,7 +80,7 @@ def select_variants_for_preset(variants, preset: str):
 def main():
     parser = argparse.ArgumentParser(description="Pre-compile all FMHA SM100 kernel variants")
     parser.add_argument("-j", "--jobs", type=int, default=0,
-                        help="Parallel jobs for ninja (0 = auto)")
+                        help="Parallel compilations (0 = one variant per core)")
     parser.add_argument("--clear", action="store_true",
                         help="Clear JIT cache before compiling")
     parser.add_argument("--all", action="store_true",
@@ -99,11 +98,7 @@ def main():
 
     if args.all:
         args.clear = True
-    from fmha_sm100.jit import (
-        CACHE_BASE, _FMHA_VARLEN_DIR, _CUTLASS_INCLUDE, _CUTLASS_UTIL_INCLUDE,
-        _get_tvm_ffi_include, _get_cuda_home, FMHAVariantManager,
-    )
-    import jinja2
+    from fmha_sm100 import jit
 
     all_variants = enumerate_all_variants()
     variants = select_variants_for_preset(all_variants, args.preset)
@@ -120,170 +115,27 @@ def main():
         return
 
     if args.clear:
-        if CACHE_BASE.exists():
-            shutil.rmtree(CACHE_BASE)
-            print(f"Cleared cache: {CACHE_BASE}")
+        namespace = jit._namespace().path
+        if namespace.exists():
+            shutil.rmtree(namespace)
+            print(f"Cleared cache: {namespace}")
 
-    # Filter already-cached variants
-    to_compile = []
-    cached = 0
-    for v in variants:
-        so_path = CACHE_BASE / v["variant_name"] / f"{v['variant_name']}.so"
-        if so_path.exists():
-            cached += 1
-        else:
-            to_compile.append(v)
-
-    plan_so = CACHE_BASE / "plan" / "fmha_sm100_plan.so"
-    need_plan = not plan_so.exists()
-    sparse_topk_dir = CACHE_BASE / "sparse_topk"
-    sparse_topk_so = sparse_topk_dir / "sparse_topk_select.so"
-    need_sparse_topk = not sparse_topk_so.exists()
-    for src in [
-        _FMHA_VARLEN_DIR / "sparse_topk_select.cu",
-        _FMHA_VARLEN_DIR / "include" / "sparse_topk_select.cuh",
-        _FMHA_VARLEN_DIR / "tvm_ffi_utils.h",
-    ]:
-        dst = sparse_topk_dir / src.name
-        if not dst.exists() or dst.read_text() != src.read_text():
-            need_sparse_topk = True
-    reduction_so = CACHE_BASE / "reduction" / "fmha_sm100_reduction.so"
-    need_reduction = not reduction_so.exists()
-
-    total = len(to_compile) + (1 if need_plan else 0) + (1 if need_sparse_topk else 0) + (1 if need_reduction else 0)
-    print(f"Already cached: {cached}, to compile: {total}")
-    if total == 0:
-        print("All variants already compiled.")
-        if include_sparse_aot:
-            warmup_sparse_attn(clear=args.clear)
-        return
-
-    # ── Generate all .cu files ──
-    build_dir = CACHE_BASE / "_warmup_build"
-    build_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(_FMHA_VARLEN_DIR / "fmha_sm100_inst.jinja") as f:
-        inst_template = jinja2.Template(f.read())
-    with open(_FMHA_VARLEN_DIR / "fmha_sm100_variant_run.cu.jinja") as f:
-        run_template = jinja2.Template(f.read())
-
-    # Copy shared headers
-    for name in ["fmha_sm100_params.h", "tvm_ffi_utils.h", "gmem_bounds_check.h"]:
-        shutil.copy2(_FMHA_VARLEN_DIR / name, build_dir / name)
-
-    cuda_home = _get_cuda_home()
-    nvcc = os.path.join(cuda_home, "bin", "nvcc")
-    tvm_include = _get_tvm_ffi_include()
-    fmha_include = str(_FMHA_VARLEN_DIR / "include")
-    cutlass_include = str(_CUTLASS_INCLUDE)
-    cutlass_util_include = str(_CUTLASS_UTIL_INCLUDE)
-
-    ninja_lines = [
-        f"ninja_required_version = 1.5\n",
-        f"nvcc = {nvcc}\n",
-        f"nvcc_flags = {_get_nvcc_flags(build_dir)}\n",
-        "rule nvcc_compile\n",
-        "  command = $nvcc $nvcc_flags -c $in -o $out\n",
-        "  description = Compiling $in\n\n",
-        "rule nvcc_link\n",
-        "  command = $nvcc -shared $in -o $out -lcuda\n",
-        "  description = Linking $out\n\n",
-        "rule nvcc_compile_other\n",
-        f"  command = $nvcc {_get_nvcc_flags(build_dir, False)} -c $in -o $out\n",
-        "  description = Compiling other kernel\n\n"
-    ]
-
-    # Generate variant .cu files and ninja rules → all link into one .so
-    all_variant_objs = []
-    for v in to_compile:
-        vname = v["variant_name"]
-
-        inst_cu = build_dir / f"inst_{vname}.cu"
-        run_cu = build_dir / f"run_{vname}.cu"
-        inst_cu.write_text(inst_template.render(**v))
-        run_cu.write_text(run_template.render(**v))
-
-        inst_o = build_dir / f"inst_{vname}.o"
-        run_o = build_dir / f"run_{vname}.o"
-        all_variant_objs.extend([inst_o, run_o])
-
-        ninja_lines.append(f"build {inst_o}: nvcc_compile {inst_cu}\n")
-        ninja_lines.append(f"build {run_o}: nvcc_compile {run_cu}\n")
-
-    # Link all variants into one .so
-    all_so_dir = CACHE_BASE / "_all_variants"
-    all_so_dir.mkdir(parents=True, exist_ok=True)
-    all_so_path = all_so_dir / "all_variants.so"
-    if all_variant_objs:
-        objs_str = " ".join(str(o) for o in all_variant_objs)
-        ninja_lines.append(f"build {all_so_path}: nvcc_link {objs_str}\n\n")
-
-    # Plan kernel
-    if need_plan:
-        plan_dir = CACHE_BASE / "plan"
-        plan_dir.mkdir(parents=True, exist_ok=True)
-        plan_cu_src = _FMHA_VARLEN_DIR / "fmha_sm100_plan.cu"
-        plan_cu = build_dir / "fmha_sm100_plan.cu"
-        shutil.copy2(plan_cu_src, plan_cu)
-
-        plan_o = build_dir / "fmha_sm100_plan.o"
-        plan_so = plan_dir / "fmha_sm100_plan.so"
-
-        ninja_lines.append(f"build {plan_o}: nvcc_compile_other {plan_cu}\n")
-        ninja_lines.append(f"build {plan_so}: nvcc_link {plan_o}\n\n")
-
-    # Sparse topk kernel
-    if need_sparse_topk:
-        topk_dir = CACHE_BASE / "sparse_topk"
-        topk_dir.mkdir(parents=True, exist_ok=True)
-        topk_cu_src = _FMHA_VARLEN_DIR / "sparse_topk_select.cu"
-        if topk_cu_src.exists():
-            topk_cu = build_dir / "sparse_topk_select.cu"
-            shutil.copy2(topk_cu_src, topk_cu)
-            shutil.copy2(topk_cu_src, topk_dir / "sparse_topk_select.cu")
-            shutil.copy2(_FMHA_VARLEN_DIR / "include" / "sparse_topk_select.cuh",
-                         topk_dir / "sparse_topk_select.cuh")
-            shutil.copy2(_FMHA_VARLEN_DIR / "tvm_ffi_utils.h",
-                         topk_dir / "tvm_ffi_utils.h")
-            topk_o = build_dir / "sparse_topk_select.o"
-            topk_so = topk_dir / "sparse_topk_select.so"
-            ninja_lines.append(f"build {topk_o}: nvcc_compile_other {topk_cu}\n")
-            ninja_lines.append(f"build {topk_so}: nvcc_link {topk_o}\n\n")
-
-    # Split-KV reduction kernel
-    if need_reduction:
-        red_dir = CACHE_BASE / "reduction"
-        red_dir.mkdir(parents=True, exist_ok=True)
-        red_cu_src = _FMHA_VARLEN_DIR / "fmha_sm100_reduction.cu"
-        if red_cu_src.exists():
-            red_cu = build_dir / "fmha_sm100_reduction.cu"
-            shutil.copy2(red_cu_src, red_cu)
-            red_o = build_dir / "fmha_sm100_reduction.o"
-            red_so = red_dir / "fmha_sm100_reduction.so"
-            ninja_lines.append(f"build {red_o}: nvcc_compile_other {red_cu}\n")
-            ninja_lines.append(f"build {red_so}: nvcc_link {red_o}\n\n")
-
-    (build_dir / "build.ninja").write_text("".join(ninja_lines))
-
-    # ── Run single ninja build ──
-    jobs_flag = f"-j{args.jobs}" if args.jobs > 0 else ""
-    cmd = f"ninja {jobs_flag}".strip()
-    print(f"Running: {cmd} (in {build_dir})", flush=True)
-    print(f"Compiling {total} kernels...", flush=True)
-
+    # The JIT cache checks each library against the files it was compiled from, so only the
+    # variants whose sources changed (or that were never built) compile here. A variant builds
+    # its two objects at once, so -j N runs N / 2 variants.
+    names = [v["variant_name"] for v in variants]
+    modules = ("plan", "sparse_topk", "reduction")
+    workers = max(1, args.jobs // 2) if args.jobs > 0 else None
+    print(f"Compiling into {jit._namespace().path}", flush=True)
     start = time.time()
-    result = subprocess.run(
-        cmd.split(),
-        cwd=str(build_dir),
-        text=True,
-    )
-    elapsed = time.time() - start
-
-    if result.returncode == 0:
-        print(f"\nDone in {elapsed:.1f}s: {total} compiled, {cached} cached")
-    else:
-        print(f"\nBuild failed after {elapsed:.1f}s (exit code {result.returncode})")
+    try:
+        built = jit.prebuild_fmha_variants(names, max_workers=workers)
+        built += jit.prebuild_modules(modules, max_workers=workers)
+    except RuntimeError as error:
+        print(f"\nBuild failed after {time.time() - start:.1f}s: {error}")
         sys.exit(1)
+    cached = len(names) + len(modules) - len(built)
+    print(f"\nDone in {time.time() - start:.1f}s: {len(built)} compiled, {cached} cached")
 
     if include_sparse_aot:
         warmup_sparse_attn(clear=args.clear)

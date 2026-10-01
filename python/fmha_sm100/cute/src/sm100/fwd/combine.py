@@ -1484,7 +1484,7 @@ def combine(
                 stream,
                 options="--enable-tvm-ffi",
             )
-            save_aot(key, _combine_compile_cache[key])
+            save_aot(key, _combine_compile_cache[key], sources=[__name__])
 
     with torch.cuda.nvtx.range("K2_Combine"):
         _combine_compile_cache[key](

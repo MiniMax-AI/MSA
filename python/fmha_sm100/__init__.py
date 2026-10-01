@@ -35,15 +35,23 @@ _SPARSE_LAZY_EXPORTS = frozenset(
     }
 )
 
+# Parallel build of the native kernels one serving configuration needs (fmha_sm100.msa_warmup).
+_WARMUP_LAZY_EXPORTS = frozenset({"warmup", "plan_warmup"})
+
 __all__ = [
     *sorted(_DENSE_LAZY_EXPORTS),
     *sorted(_SPARSE_LAZY_EXPORTS),
+    *sorted(_WARMUP_LAZY_EXPORTS),
 ]
 
 
 def __getattr__(name):
     # PEP 562 module-level hook: resolve sparse symbols on first access by
     # importing the fmha_sm100.sparse shim (which loads the CuTe-DSL stack).
+    if name in _WARMUP_LAZY_EXPORTS:
+        from . import msa_warmup as _msa_warmup
+
+        return getattr(_msa_warmup, name)
     if name in _DENSE_LAZY_EXPORTS:
         from . import api as _api
 
@@ -56,7 +64,7 @@ def __getattr__(name):
 
 
 def __dir__():
-    return sorted({*globals(), *_DENSE_LAZY_EXPORTS, *_SPARSE_LAZY_EXPORTS})
+    return sorted({*globals(), *_DENSE_LAZY_EXPORTS, *_SPARSE_LAZY_EXPORTS, *_WARMUP_LAZY_EXPORTS})
 
 try:
     import ctypes
