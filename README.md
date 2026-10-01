@@ -123,6 +123,13 @@ See:
 
 - [`python/fmha_sm100/decode_q8kv4/README.md`](python/fmha_sm100/decode_q8kv4/README.md)
 
+Sparse prefill on the same cache runs on the Q8KV4 prefill kernel when Q is E4M3
+and the batch fits it (16 Q heads per KV head, 4 to 32 blocks, SM100/SM103, CUDA
+13.4 or newer); BF16 Q keeps the CuTe-DSL NVFP4 kernel. `prefill_backend` steers
+that. See:
+
+- [`python/fmha_sm100/prefill_q8kv4/README.md`](python/fmha_sm100/prefill_q8kv4/README.md)
+
 ### JIT cache
 
 Native kernels are JIT-compiled on first use (about a minute each) and cached under
@@ -182,6 +189,10 @@ python -m pytest tests/q8kv4 -q -m "not full"
 python -m pytest tests/q8kv4 -q
 FMHA_SM100_DECODE_Q8KV4_DISABLE_QMUL4=1 python -m pytest tests/q8kv4 -q
 
+# Q8KV4 NVFP4 sparse prefill: smoke set, full matrices.
+python -m pytest tests/q8kv4_prefill -q -m "not full"
+python -m pytest tests/q8kv4_prefill -q
+
 # CuTe-DSL forward-only sparse attention.
 cd python/fmha_sm100/cute
 python -m pytest test_sparse_atten.py -q
@@ -216,6 +227,13 @@ python benchmarks/bench_q8kv4_decode.py --suite mtp --backends q8kv4,kv_mode3
 python benchmarks/bench_q8kv4_decode.py --suite full --gqa 16 --shift 3 --output /tmp/q8kv4_full.json
 ```
 
+`benchmarks/bench_q8kv4_prefill.py` times NVFP4 sparse prefill through the same API
+on the Q8KV4 prefill kernel and on the CuTe-DSL NVFP4 kernel (E4M3 and BF16 Q):
+
+```bash
+python benchmarks/bench_q8kv4_prefill.py --suite full --json /tmp/q8kv4_prefill.json
+```
+
 ## Layout
 
 ```
@@ -227,15 +245,18 @@ python/fmha_sm100/                  Python package
   sparse_fmha_adapter.py            Bridge: fmha_sm100 API → sparse_atten_func
   q8kv4_decode_adapter.py           Bridge: fmha_sm100 API → decode_q8kv4 (NVFP4 sparse decode)
   msa_warmup.py                     warmup(): parallel build of one serving configuration's kernels
+  q8kv4_prefill_adapter.py          Bridge: fmha_sm100 API → prefill_q8kv4 (NVFP4 sparse prefill)
   decode_q8kv4/                     Q8KV4 paged sparse decode (own csrc + JIT, see its README)
+  prefill_q8kv4/                    Q8KV4 paged sparse prefill (own csrc + JIT, see its README)
   csrc/                             CUDA kernels + Jinja templates (JIT-compiled)
     include/                        Vendored FlashInfer / CUTLASS-derived / TRT-LLM headers
   cutlass/                          NVIDIA CUTLASS git submodule (include/ + tools/util/include/)
   cute/                             CuTe-DSL sparse attention (loaded via sys.path)
 tests/                              Correctness tests
-  smoke/  integration/  regression/  q8kv4/  warmup/
+  smoke/  integration/  regression/  q8kv4/  q8kv4_prefill/  warmup/
 scripts/                            Warmup + cache-management helpers
-benchmarks/                         bench_sparse_attention_ops.py, bench_q8kv4_decode.py
+benchmarks/                         bench_sparse_attention_ops.py, bench_q8kv4_decode.py,
+                                    bench_q8kv4_prefill.py
 ```
 
 ## Stacks
@@ -250,6 +271,10 @@ benchmarks/                         bench_sparse_attention_ops.py, bench_q8kv4_d
 - **Q8KV4 decode** — CUTLASS C++ paged sparse decode on the NVFP4 cache
   (`fmha_sm100.decode_q8kv4`), reached through `fmha_sm100` for uint8 caches
   or directly via `plan_decode` / `run_decode`.
+- **Q8KV4 prefill** — CUTLASS C++ KV-stationary sparse prefill on the NVFP4
+  cache (`fmha_sm100.prefill_q8kv4`) over the CuTe-DSL CSR, schedule and
+  combine, reached through `fmha_sm100` for uint8 caches with E4M3 Q or
+  directly via `BatchPrefillWithPagedKVCacheWrapper`.
 - **Bridge** — `sparse_fmha_plan` / `sparse_fmha` adapt the dense-API call
   site to the sparse backend for prefill paths; useful when you already
   drive the dense kernel and want a one-line swap to sparse.

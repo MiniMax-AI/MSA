@@ -61,6 +61,7 @@ fmha_sm100 = [
     "cute/Makefile",
     "csrc/**/*",
     "decode_q8kv4/csrc/**/*",
+    "prefill_q8kv4/csrc/**/*",
     "cutlass/include/**/*",
     "cutlass/tools/util/include/**/*",
 ]

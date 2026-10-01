@@ -23,6 +23,7 @@ from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduct
 from .nvfp4_kv import nvfp4_head_slot_views
 from .sparse_fmha_adapter import sparse_fmha, sparse_fmha_plan
 from . import q8kv4_decode_adapter
+from . import q8kv4_prefill_adapter
 
 
 _np_staging = np.empty(4096 * 1024, dtype=np.int32)
@@ -1044,11 +1045,17 @@ def fmha_sm100_plan(
         blocks, causal, no max-score output) and keeps the kv_mode 3 kernel otherwise;
         ``"q8kv4"`` requires the Q8KV4 kernel and raises when the batch or a later call does
         not fit; ``"kv_mode3"`` never plans it.
+    prefill_backend : str, optional
+        ``"auto"`` (default) plans sparse NVFP4 prefill on the Q8KV4 kernel when the batch fits
+        it (page size 128, 16 Q heads per KV head, 4/8/16/32 blocks, causal, no max-score
+        output, SM100/SM103 with a CUDA 13.4+ toolkit) and keeps the CuTe-DSL NVFP4 kernel
+        otherwise; ``"q8kv4"`` requires the Q8KV4 kernel and raises when the batch or a later
+        call does not fit; ``"cute_dsl"`` never plans it.
     kv_dtype : str, optional
-        ``"fp8"`` skips the Q8KV4 plan (its workspace is only useful for NVFP4 caches);
-        ``"nvfp4"`` or ``None`` allows it.
+        ``"fp8"`` skips the Q8KV4 plans (they only serve NVFP4 caches); ``"nvfp4"`` or
+        ``None`` allows them.
     block_scale_shift : int, optional
-        Block-scale staging of the Q8KV4 kernel; 3 (default) for caches whose E4M3 block
+        Block-scale staging of the Q8KV4 kernels; 3 (default) for caches whose E4M3 block
         scales use the full range next to a global scale (TransformerEngine convention), 0 for
         caches whose ``code * block_scale`` products already fit E4M3.
     split_prefill_decode : bool, optional
@@ -1073,6 +1080,7 @@ def fmha_sm100_plan(
     # assert qo_offset is None or isinstance(qo_offset, int) or qo_offset.device.type == 'cpu'
 
     decode_backend, kv_dtype, block_scale_shift = q8kv4_decode_adapter.plan_options(kwargs)
+    prefill_backend = q8kv4_prefill_adapter.plan_options(kwargs)
 
     def attach_q8kv4(plan, decode_qo_lens, decode_kv_lens):
         q8kv4_decode_adapter.attach_plan(
@@ -1083,6 +1091,16 @@ def fmha_sm100_plan(
             causal=kwargs.get("causal", True), output_maxscore=kwargs.get("output_maxscore", False),
             usable_sm_count=kwargs.get("usable_SM_count", -1), device=kwargs.get("device"),
             backend=decode_backend, kv_dtype=kv_dtype, block_scale_shift=block_scale_shift)
+
+    def attach_q8kv4_prefill(plan, prefill_kv_lens):
+        q8kv4_prefill_adapter.attach_plan(
+            plan, kv_segment_lens=prefill_kv_lens,
+            num_qo_heads=args[0] if args else kwargs["num_qo_heads"],
+            num_kv_heads=args[1] if len(args) > 1 else kwargs.get("num_kv_heads", -1),
+            page_size=kwargs.get("page_size", -1), kv_block_num=kwargs.get("kv_block_num", -1),
+            causal=kwargs.get("causal", True), output_maxscore=kwargs.get("output_maxscore", False),
+            device=kwargs.get("device"), backend=prefill_backend, kv_dtype=kv_dtype,
+            block_scale_shift=block_scale_shift)
 
     if qo_offset is None:
         qo_offset = kv_segment_lens - qo_segment_lens
@@ -1111,11 +1129,13 @@ def fmha_sm100_plan(
         prefill_qo_offset = qo_offset[split:]
         prefill = _fmha_sm100_plan(prefill_qo_segment_lens, prefill_kv_segment_lens, *args,
                                     qo_offset=prefill_qo_offset, **kwargs)
+        attach_q8kv4_prefill(prefill, prefill_kv_segment_lens)
         return (True, split, batch_size, decode, prefill)
     else:
         plan = _fmha_sm100_plan(qo_segment_lens, kv_segment_lens, *args, 
                                     qo_offset=qo_offset, **kwargs)
         attach_q8kv4(plan, qo_segment_lens, kv_segment_lens)
+        attach_q8kv4_prefill(plan, kv_segment_lens)
         return (False, 0, batch_size, plan, None)
 
 def fmha_sm100(
@@ -1186,11 +1206,13 @@ def fmha_sm100(
     each head.
     ``k_scale`` and ``v_scale`` are CUDA float32 scalar tensors for NVFP4:
     ``value = E2M1(code) * E4M3(block_scale) * global_scale``.
-    Use BF16 Q for prefill and E4M3 Q for decode. No cache conversion is needed.
+    Use BF16 or E4M3 Q for prefill and E4M3 Q for decode. No cache conversion is needed.
     Sparse NVFP4 decode runs on the Q8KV4 kernel when ``fmha_sm100_plan`` planned it
     (``decode_backend``); calls it cannot serve (max-score output, ``q_offset_override``,
     ``o_scale`` other than 1, BF16 Q) fall back to the kv_mode 3 kernel unless the backend
-    was forced.
+    was forced. Sparse NVFP4 prefill likewise runs on the Q8KV4 prefill kernel when planned
+    (``prefill_backend``) and Q is E4M3 (pass its dequant factor as ``q_scale``); BF16 Q keeps
+    the CuTe-DSL NVFP4 kernel.
 
     Returns
     -------

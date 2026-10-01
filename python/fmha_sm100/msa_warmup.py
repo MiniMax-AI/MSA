@@ -4,9 +4,9 @@
 """Build the native kernels one MSA serving configuration needs, in parallel, before serving.
 
 Every native kernel of fmha_sm100 (csrc FMHA variants, their plan/reduction/top-k modules, the
-indexer modules, the Q8KV4 decode kernels, the k2q CSR builder) is JIT-compiled on first use,
-one at a time, about a minute each. A serving engine therefore either compiles during its first
-requests or warms up by running dummy batches that compile whatever they happen to reach,
+indexer modules, the Q8KV4 decode and prefill kernels, the k2q CSR builder) is JIT-compiled on
+first use, one at a time, about a minute each. A serving engine therefore either compiles during
+its first requests or warms up by running dummy batches that compile whatever they happen to reach,
 serially. ``warmup()`` instead derives, from the same planner and dispatch helpers
 ``fmha_sm100`` runs, exactly the kernels a configuration can request (split by the KV-cache and
 index-cache dtypes, so an NVFP4 deployment builds no FP8 or BF16 variants) and builds them all
@@ -139,6 +139,7 @@ def plan_warmup(
     block_scale_shift: int = 3,
     sparse_decode: bool = True,
     sparse_prefill: bool = True,
+    prefill_backend: str = "auto",
     device=None,
 ) -> list[WarmupItem]:
     """The native kernels ``warmup`` builds for this configuration (nothing is compiled)."""
@@ -195,13 +196,33 @@ def plan_warmup(
         items.append(WarmupItem(f"fmha split-KV reduction ({kv_dtype})",
                                 lambda: jit.get_reduction_module(nvfp4=kv_dtype == "nvfp4")))
 
-    # Attention prefill: the CuTe-DSL kernels compile on first use; the CSR builder is native.
+    # Attention prefill: the CuTe-DSL kernels compile on first use; the CSR builder is native,
+    # and so is the Q8KV4 prefill kernel NVFP4 caches take for E4M3 Q (prefill_backend).
+    from . import q8kv4_prefill_adapter
+
+    if prefill_backend not in q8kv4_prefill_adapter.PREFILL_BACKENDS:
+        raise ValueError(f"prefill_backend must be one of "
+                         f"{q8kv4_prefill_adapter.PREFILL_BACKENDS}, got {prefill_backend!r}")
     if sparse_prefill:
         def build_k2q_csr():
             from . import sparse  # noqa: F401  (puts the cute/ modules on sys.path)
             import src.sm100.build_k2q_csr  # noqa: F401  (compiles on import)
 
         items.append(WarmupItem("k2q CSR builder", build_k2q_csr))
+        if kv_dtype == "nvfp4" and prefill_backend != "cute_dsl":
+            blocker = q8kv4_prefill_adapter._plan_blocker(
+                num_qo_heads=num_q_heads, num_kv_heads=num_kv_heads, page_size=page_size,
+                kv_block_num=topk, causal=True, output_maxscore=False,
+                device=q8kv4_prefill_adapter._cuda_device(device))
+            if blocker is None:
+                from .prefill_q8kv4 import jit as prefill_jit
+
+                items.append(WarmupItem(
+                    f"q8kv4 prefill shift={block_scale_shift}",
+                    lambda: prefill_jit.load_extension(device, block_scale_shift)))
+            elif prefill_backend == "q8kv4":
+                raise ValueError(f"prefill_backend='q8kv4' cannot serve this configuration: "
+                                 f"{blocker}")
 
     # Indexer.
     if index_dtype == "nvfp4":
@@ -233,6 +254,7 @@ def warmup(
     block_scale_shift: int = 3,
     sparse_decode: bool = True,
     sparse_prefill: bool = True,
+    prefill_backend: str = "auto",
     device=None,
     max_workers: int | None = None,
 ) -> WarmupReport:
@@ -242,9 +264,11 @@ def warmup(
     kernels: with ``sparse_decode``, sparse TopK decode for that cache (the Q8KV4 decode kernel
     for NVFP4 when ``decode_backend`` routes there, as ``fmha_sm100_plan`` does; pass False when
     the engine decodes with its own kernel) and, with ``sparse_prefill``, the k2q CSR builder of
-    sparse prefill. ``index_cache_dtype`` selects the indexer: the
-    Q8KV4/Q8KV8 indexer modules for ``"nvfp4"``, the max-score prefill scoring variants over
-    ``num_index_heads`` heads plus sparse top-k for ``"bf16"``/``"fp8"``, nothing for ``None``.
+    sparse prefill plus, for NVFP4 when ``prefill_backend`` routes there, the Q8KV4 prefill
+    kernel (``"cute_dsl"`` skips it, e.g. for engines that prefill with BF16 Q).
+    ``index_cache_dtype`` selects the indexer: the Q8KV4/Q8KV8 indexer modules for ``"nvfp4"``,
+    the max-score prefill scoring variants over ``num_index_heads`` heads plus sparse top-k for
+    ``"bf16"``/``"fp8"``, nothing for ``None``.
     Head counts are per rank; ``decode_query_lens`` are the uniform decode query lengths
     (``1 + num_speculative_tokens``); ``block_scale_shift`` is the NVFP4 staging shift the
     plans use (3 by default). Kernels already in the cache are only loaded. Safe to call from
@@ -255,7 +279,7 @@ def warmup(
         kv_cache_dtype, index_cache_dtype, num_q_heads, num_kv_heads, topk, decode_query_lens,
         num_index_heads=num_index_heads, page_size=page_size, decode_backend=decode_backend,
         block_scale_shift=block_scale_shift, sparse_decode=sparse_decode,
-        sparse_prefill=sparse_prefill, device=device)
+        sparse_prefill=sparse_prefill, prefill_backend=prefill_backend, device=device)
     from . import jit
 
     variants = [item.fmha_variant for item in items if item.fmha_variant]
@@ -294,6 +318,7 @@ def _main() -> None:
     parser.add_argument("--block-scale-shift", type=int, default=3)
     parser.add_argument("--no-sparse-decode", action="store_true")
     parser.add_argument("--no-sparse-prefill", action="store_true")
+    parser.add_argument("--prefill-backend", default="auto", choices=("auto", "q8kv4", "cute_dsl"))
     parser.add_argument("--jobs", type=int, default=None)
     parser.add_argument("--dry-run", action="store_true", help="list the kernels, build nothing")
     args = parser.parse_args()
@@ -303,7 +328,7 @@ def _main() -> None:
         decode_query_lens=[int(v) for v in args.decode_query_lens.split(",")],
         num_index_heads=args.num_index_heads, decode_backend=args.decode_backend,
         block_scale_shift=args.block_scale_shift, sparse_decode=not args.no_sparse_decode,
-        sparse_prefill=not args.no_sparse_prefill)
+        sparse_prefill=not args.no_sparse_prefill, prefill_backend=args.prefill_backend)
     if args.dry_run:
         for item in plan_warmup(**kwargs):
             print(item.label)

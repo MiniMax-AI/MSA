@@ -33,6 +33,8 @@ from sparse_index_utils import build_k2q_csr
 from src.sm100.prepare_scheduler import SPARSE_SCHEDULE_MODEL
 from src.common.aot_cache import aot_object_path
 
+from . import q8kv4_prefill_adapter
+
 
 def _compute_aot_kernel_paths(head_dim, n_block_size, qhead_per_kv, topk,
                               causal,
@@ -353,6 +355,25 @@ def sparse_fmha(
     )
 
     is_paged = page_size > 0 and k.ndim == 4
+
+    # Sparse NVFP4 prefill runs on the Q8KV4 kernel when the plan carries it and the call fits it
+    # (E4M3 Q); otherwise the CuTe-DSL NVFP4 kernel below serves it.
+    q8kv4 = plan_info.get(q8kv4_prefill_adapter.PLAN_KEY) if is_nvfp4 else None
+    if q8kv4 is not None:
+        blocker = q8kv4_prefill_adapter.run_blocker(
+            q8kv4, q=q, kv_indices=kv_indices if is_paged else None,
+            k_global_scale=k_scale, v_global_scale=v_scale,
+        )
+        if blocker is None:
+            result = q8kv4_prefill_adapter.run(
+                q8kv4, q, k, v, k_sf, v_sf, plan_info=plan_info, q2k=q2k,
+                kv_indices=kv_indices, seqused_k=seqused_k, k_global_scale=k_scale,
+                v_global_scale=v_scale, sm_scale=sm_scale, q_scale=q_scale, o_scale=o_scale,
+                out=out,
+            )
+            return result, None
+        if q8kv4["backend"] == "q8kv4":
+            raise ValueError(f"prefill_backend='q8kv4' cannot serve this call: {blocker}")
 
     page_table = None
     if is_paged:

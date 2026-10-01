@@ -48,6 +48,9 @@ def test_plan_is_split_by_dtype(name):
         assert not variants, "NVFP4 KV and index caches need no FP8/BF16 FMHA variant"
         assert any(label.startswith("q8kv4 decode gqa") for label in labels)
         assert any(label.startswith("indexer module") for label in labels)
+        assert "q8kv4 prefill shift=3" in labels
+        skipped = [item.label for item in plan_warmup(**config, prefill_backend="cute_dsl")]
+        assert not any(label.startswith("q8kv4 prefill") for label in skipped)
     else:
         prefix = "1_" if config["kv_cache_dtype"] == "fp8" else "0_"
         assert variants and all(v.startswith(prefix) and "nvfp4" not in v for v in variants)
@@ -107,6 +110,24 @@ def _run_decode(config, device, batch, q_len):
                **scales)
 
 
+def _run_q8kv4_prefill(config, device):
+    """Sparse NVFP4 prefill with E4M3 Q through fmha_sm100 (the Q8KV4 prefill route)."""
+    from q8kv4_prefill.cases import PrefillCase, global_scale, make_inputs, pack_head_slot_pages
+
+    case = PrefillCase("warmup", (300, 64), (2_300, 3_000), topk=TOPK,
+                       num_kv_heads=config["num_kv_heads"], ascending=True)
+    inputs = make_inputs(case, device)
+    k_packed, v_packed = pack_head_slot_pages(inputs)
+    kv = torch.tensor(case.k_lens, dtype=torch.int32)
+    qo = torch.tensor(case.q_lens, dtype=torch.int32)
+    plan = fmha_sm100_plan(qo, kv, config["num_q_heads"], num_kv_heads=config["num_kv_heads"],
+                           qo_offset=kv - qo, page_size=PAGE, kv_block_num=TOPK, causal=True,
+                           prefill_backend="q8kv4", device=device)
+    one = global_scale(1.0, device)
+    fmha_sm100(inputs.q, k_packed, v_packed, plan, kv_indices=inputs.kv_indices,
+               kv_block_indexes=inputs.kv_block_indexes, sm_scale=0.088, k_scale=one, v_scale=one)
+
+
 def _run_index_score(config, device, chunks):
     kind = config["index_cache_dtype"]
     heads = config["num_index_heads"]
@@ -136,6 +157,8 @@ def test_serving_paths_need_no_build_after_warmup(device, monkeypatch, name):
     if config["index_cache_dtype"] in ("fp8", "bf16"):
         for chunks in PREFILL_CHUNKS:
             _run_index_score(config, device, chunks)
+    if config["kv_cache_dtype"] == "nvfp4":
+        _run_q8kv4_prefill(config, device)
     torch.cuda.synchronize()
     requested = set(jit.requested_fmha_variants()) - before
     assert requested <= set(report.fmha_variants), sorted(requested - set(report.fmha_variants))

@@ -31,7 +31,11 @@ def normalize_target_arch(
 
 
 def target_arch(
-    device=None, *, component: str = "MM-Sparse", supported_arches=("100a", "103a")
+    device=None,
+    *,
+    component: str = "MM-Sparse",
+    supported_arches=("100a", "103a"),
+    env_var: str = FMHA_SM100_DECODE_Q8KV4_ARCH,
 ) -> str:
     """Select an architecture from a tensor device or the offline-build override.
 
@@ -54,7 +58,7 @@ def target_arch(
             f"{major}{minor}a", component=component, supported_arches=supported_arches
         )
 
-    if value := os.environ.get(FMHA_SM100_DECODE_Q8KV4_ARCH):
+    if value := os.environ.get(env_var):
         return normalize_target_arch(
             value, component=component, supported_arches=supported_arches
         )
@@ -66,7 +70,7 @@ def target_arch(
         )
 
     # Preserve the historical offline default. Reproducible AOT builds should
-    # always set FMHA_SM100_DECODE_Q8KV4_ARCH explicitly.
+    # always set the op's architecture variable (``env_var``) explicitly.
     return "103a"
 
 
