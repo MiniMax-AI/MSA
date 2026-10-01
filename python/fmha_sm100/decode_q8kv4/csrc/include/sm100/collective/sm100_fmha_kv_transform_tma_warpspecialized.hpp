@@ -226,13 +226,46 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
   }
 #endif
 
+  // Byte mask of one V scale word: tokens 4 * token_quad + b (byte b) below valid_tokens keep
+  // their scale, the rest get 0. The tile's V rows past the item's visible length (the causal tail
+  // of the query's own page) have P = 0, but the PV MMA still multiplies them, so a NaN block
+  // scale there (0x7F / 0xFF, e.g. stale bytes of a block last used under another cache format)
+  // would give 0 x NaN = NaN. A zero scale makes those V values exactly 0 whatever the cache
+  // holds past the length.
+  CUTLASS_DEVICE static uint32_t visible_v_scale_mask(int token_quad, int valid_tokens) {
+    int const visible = valid_tokens - token_quad * 4;
+    return visible >= 4 ? 0xffffffffu : visible <= 0 ? 0u : (1u << (visible * 8)) - 1u;
+  }
+
+#if MINIMAX_MSA_Q8KV4_HAS_QMUL4
+  // The QMUL4 converters read the TMA-landed V scale words in place, so on the tail tile the
+  // warpgroup zeroes the words' tail bytes there first: 128 threads x 8 consecutive bytes, one
+  // token quad per thread (byte offset 8t lies in quad t / 4), then syncs because every warp
+  // reads words the other warps wrote.
+  CUTLASS_DEVICE static void mask_v_scale_tail(uint8_t *smem_stage_base, int lane_idx,
+                                               int warp_group_warp_idx, int valid_tokens,
+                                               int barrier_id) {
+    static_assert(Traits::kRawKvScaleBytesPerStage == 128 * sizeof(uint2),
+                  "one 8-byte word pair per transform thread.");
+    uint2 *words = reinterpret_cast<uint2 *>(smem_stage_base + Traits::kRawKvDataBytesPerStage);
+    int const thread = warp_group_warp_idx * cutlass::NumThreadsPerWarp + lane_idx;
+    uint32_t const mask = visible_v_scale_mask(thread / 4, valid_tokens);
+    uint2 pair = words[thread];
+    pair.x &= mask;
+    pair.y &= mask;
+    words[thread] = pair;
+    Sm100FmhaNamedBarrier::sync(128, barrier_id);
+  }
+#endif
+
 #if !MINIMAX_MSA_Q8KV4_HAS_QMUL4
   // FP16 fallback: convert one raw stage's V scales to F16 pairs once, instead of in every V
   // iteration (Traits::kF16VScaleScratch sizes the scratch). The cache's token-quad order already
   // holds, per head-dim group, the four tokens' E4M3 scales in one word, so a lane fetches its
   // pair of group words with one 8-byte load. The QMUL4 path consumes those words in place.
   CUTLASS_DEVICE void prepare_v_scale_stage(int lane_idx, int warp_group_warp_idx,
-                                            uint8_t *smem_stage_base, int barrier_id) const {
+                                            uint8_t *smem_stage_base, int barrier_id,
+                                            int valid_tokens) const {
     uint8_t const *scale_stage_base = smem_stage_base + Traits::kRawKvDataBytesPerStage;
     uint8_t *scale_scratch_base =
         smem_stage_base + Traits::kRawKvDataBytesPerStage + Traits::kRawKvScaleBytesPerStage;
@@ -241,8 +274,13 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
     int const scale_pair = (warp_group_lane >> 2) & 3;
     int const token_quad = warp_group_lane & 3;
     int const loop_offset = (warp_group_lane >> 4) & 7;
-    uint2 const words = *reinterpret_cast<uint2 const *>(scale_stage_base + loop_offset * 128 +
-                                                         token_quad * 32 + scale_pair * 8);
+    uint2 words = *reinterpret_cast<uint2 const *>(scale_stage_base + loop_offset * 128 +
+                                                   token_quad * 32 + scale_pair * 8);
+    if (valid_tokens < Traits::kTileKv) {
+      uint32_t const mask = visible_v_scale_mask(loop_offset * 4 + token_quad, valid_tokens);
+      words.x &= mask;
+      words.y &= mask;
+    }
     // 16 B chunk per (loop offset, token quad, pair): {g0: f16x2(t0,t1), f16x2(t2,t3)}
     // {g1: f16x2(t0,t1), f16x2(t2,t3)}. Quads are 16 B apart so the four chunks a warp reads per
     // V iteration sit in distinct banks (a 64 B quad stride aliases quads 0/2 and 1/3 across the
@@ -343,7 +381,8 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
                                   uint32_t transformed_empty_phase, int lane_idx,
                                   int warp_group_warp_idx,
                                   int scale_barrier_id = kScaleReorderBarrierId,
-                                  int release_barrier_id = kRawKvReleaseVBarrierId) const {
+                                  int release_barrier_id = kRawKvReleaseVBarrierId,
+                                  int valid_tokens = Traits::kTileKv) const {
     // Observe the TMEM stage release (PV of this stage's previous V tile) before the raw-full
     // parity wait: that previous V tile's fill then completed, so the wait is one phase ahead at
     // most (see kRawVStagesAlternateGroups).
@@ -356,9 +395,13 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
     stage_v_scales(storage.smem_kv.stage_ptr(raw_stage), lane_idx, warp_group_warp_idx,
                    scale_barrier_id);
 #endif
+    if (valid_tokens < Traits::kTileKv) {
+      mask_v_scale_tail(storage.smem_kv.stage_ptr(raw_stage), lane_idx, warp_group_warp_idx,
+                        valid_tokens, scale_barrier_id);
+    }
 #else
     prepare_v_scale_stage(lane_idx, warp_group_warp_idx, storage.smem_kv.stage_ptr(raw_stage),
-                          scale_barrier_id);
+                          scale_barrier_id, valid_tokens);
 #endif
 
     transform_v_stage(tmem_base, transformed_stage, lane_idx, warp_group_warp_idx,
@@ -435,7 +478,8 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
   }
 
   CUTLASS_DEVICE void transform_sparse_v_event(Storage &storage, int lane_idx,
-                                               int warp_group_warp_idx, VState &state) const {
+                                               int warp_group_warp_idx, VState &state,
+                                               int valid_tokens = Traits::kTileKv) const {
     int const event = state.event;
     state.event += 2;
     int const tile = event / 2;
@@ -460,16 +504,24 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
                 empty_phase_for_event(event, Traits::kNumStagesRawKv),
                 full_phase_for_event(event, Traits::kNumStagesTransform),
                 empty_phase_for_event(event, Traits::kNumStagesTransform), lane_idx,
-                warp_group_warp_idx);
+                warp_group_warp_idx, kScaleReorderBarrierId, kRawKvReleaseVBarrierId,
+                valid_tokens);
+  }
+
+  // V rows of `tile` (local to the item) that the item sees: only the tile that holds the
+  // query's own page has a causal tail (Sm100FmhaSparseSelection::tail_tile).
+  CUTLASS_DEVICE static int visible_v_tokens(uint32_t record, int global_tile) {
+    using Ring = Sm100FmhaSelectionRing<Traits>;
+    return global_tile == Ring::tail_tile(record) ? Ring::tail_limit(record) : Traits::kTileKv;
   }
 
   CUTLASS_DEVICE void run_sparse_k_tile(Storage &storage, Params const &params, int batch_idx,
                                         int kv_head_idx, int q_token_idx, int lane_idx,
                                         int warp_group_warp_idx, State &state,
                                         int kv_tile_begin = 0, int kv_tile_end = INT_MAX) const {
-    int const full_tiles =
-        Sm100FmhaSelectionRing<Traits>::selected_pages(
-            Sm100FmhaSelectionRing<Traits>::consume(storage, lane_idx, state.selection_event));
+    uint32_t const record =
+        Sm100FmhaSelectionRing<Traits>::consume(storage, lane_idx, state.selection_event);
+    int const full_tiles = Sm100FmhaSelectionRing<Traits>::selected_pages(record);
     Sm100FmhaKvTileRange const tile_range =
         make_kv_tile_range(full_tiles, kv_tile_begin, kv_tile_end);
     uint32_t const tmem_base = storage.tmem_state_ptr()[0];
@@ -495,7 +547,8 @@ template <class Traits> struct Sm100FmhaKvTransformTmaWarpspecialized {
                     full_phase_for_event(v_event, Traits::kNumStagesTransform),
                     empty_phase_for_event(v_event, Traits::kNumStagesTransform), lane_idx,
                     warp_group_warp_idx, kAssistScaleReorderBarrierId,
-                    kAssistRawKvReleaseVBarrierId);
+                    kAssistRawKvReleaseVBarrierId,
+                    visible_v_tokens(record, tile_range.begin + tile));
       }
     }
   }

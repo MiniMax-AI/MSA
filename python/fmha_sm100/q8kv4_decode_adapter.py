@@ -41,6 +41,16 @@ def plan_options(kwargs: dict) -> tuple[str, str | None, int]:
     return backend, kv_dtype, block_scale_shift
 
 
+def _cuda_device(device) -> torch.device:
+    """``fmha_sm100_plan``'s ``device``: None, a CUDA index, a string or a ``torch.device``."""
+    if device is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", device) if isinstance(device, int) else torch.device(device)
+    if device.type != "cuda":
+        raise ValueError(f"device must be a CUDA device, got {device}")
+    return device if device.index is not None else torch.device("cuda", torch.cuda.current_device())
+
+
 def _plan_blocker(
     *, qo_lens, kv_lens, num_qo_heads, num_kv_heads, page_size, kv_block_num, causal,
     output_maxscore,
@@ -97,7 +107,7 @@ def attach_plan(
         if backend == "q8kv4":
             raise ValueError(f"decode_backend='q8kv4' cannot plan this batch: {blocker}")
         return
-    device = torch.device("cuda", torch.cuda.current_device() if device is None else device)
+    device = _cuda_device(device)
     page_counts = [(length + _PAGE_SIZE - 1) // _PAGE_SIZE for length in kv_lens]
     plan[PLAN_KEY] = {
         "plan": plan_decode(

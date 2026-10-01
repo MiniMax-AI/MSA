@@ -773,9 +773,9 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
                                int warp_group_warp_idx, State &state, int kv_tile_begin = 0,
                                int kv_tile_end = INT_MAX, int kv_split_idx = 0,
                                int kv_split_count = 0) const {
-    int const full_tiles =
-        Sm100FmhaSelectionRing<Traits>::selected_pages(
-            Sm100FmhaSelectionRing<Traits>::consume(storage, lane_idx, state.selection_event));
+    uint32_t const record =
+        Sm100FmhaSelectionRing<Traits>::consume(storage, lane_idx, state.selection_event);
+    int const full_tiles = Sm100FmhaSelectionRing<Traits>::selected_pages(record);
     Sm100FmhaKvTileRange const tile_range =
         make_kv_tile_range(full_tiles, kv_tile_begin, kv_tile_end);
     int const tiles = tile_range.count;
@@ -841,8 +841,9 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
                                    : state.output_scale;
 
     {
-      KvTransform{}.transform_sparse_v_event(storage, lane_idx, warp_group_warp_idx,
-                                             state.sparse_v_state);
+      KvTransform{}.transform_sparse_v_event(
+          storage, lane_idx, warp_group_warp_idx, state.sparse_v_state,
+          KvTransform::visible_v_tokens(record, tile_range.begin));
     }
 
     StatsFragment stats;
@@ -852,8 +853,9 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     CUTLASS_PRAGMA_NO_UNROLL
     for (int tile = 0; tile + 1 < tiles; ++tile) {
       {
-        KvTransform{}.transform_sparse_v_event(storage, lane_idx, warp_group_warp_idx,
-                                               state.sparse_v_state);
+        KvTransform{}.transform_sparse_v_event(
+            storage, lane_idx, warp_group_warp_idx, state.sparse_v_state,
+            KvTransform::visible_v_tokens(record, tile_range.begin + tile + 1));
       }
     }
     int const final_event = state.softmax_event;

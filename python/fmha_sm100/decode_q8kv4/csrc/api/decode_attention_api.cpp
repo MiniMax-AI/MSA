@@ -8,8 +8,8 @@
 #include "decode_attention_api.hpp"
 
 #include <ATen/DLConvertor.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <Python.h>
+#include <c10/cuda/CUDAFunctions.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>
@@ -39,14 +39,15 @@ void initialize() {
     if (!Py_IsInitialized()) {
       Py_Initialize();
     }
-    PyGILState_STATE gstate = PyGILState_Ensure();
-    PyObject *modules = PySys_GetObject("modules");
-    constexpr char kModuleName[] = "fmha_sm100.decode_q8kv4";
-    if (!modules || !PyDict_GetItemString(modules, kModuleName)) {
+    // Importing the package registers the JIT callbacks. It may be vendored
+    // under another top-level package (vllm.third_party.fmha_sm100), so look
+    // for the registered callback instead of the module name.
+    if (!tvm::ffi::Function::GetGlobal("fmha_sm100.decode_q8kv4.jit_get_plan")) {
+      PyGILState_STATE gstate = PyGILState_Ensure();
       int const status = PyRun_SimpleString("import fmha_sm100.decode_q8kv4");
+      PyGILState_Release(gstate);
       TORCH_CHECK(status == 0, "failed to import fmha_sm100.decode_q8kv4");
     }
-    PyGILState_Release(gstate);
     g_initialized = true;
   });
 }
@@ -379,9 +380,9 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
   constexpr bool kPlanCausal = false;
   TORCH_CHECK(split_mode == "legacy" || split_mode == "streamk",
               "split_mode must be 'legacy' or 'streamk', got ", split_mode);
-  int device = device_opt.has_value() ? device_opt.value() : at::cuda::current_device();
+  int device = device_opt.has_value() ? device_opt.value() : c10::cuda::current_device();
   c10::cuda::CUDAGuard device_guard(device);
-  int64_t stream_int = reinterpret_cast<int64_t>(at::cuda::getCurrentCUDAStream().stream());
+  int64_t stream_int = reinterpret_cast<int64_t>(c10::cuda::getCurrentCUDAStream().stream());
 
   TORCH_CHECK(!qo_segment_lens.is_cuda() && !kv_segment_lens.is_cuda(),
               "prepare metadata must be host tensors; device-to-host planning is forbidden");
@@ -592,7 +593,7 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   int num_kv_heads = k.size(1);
   int page_size = k.size(2);
 
-  int64_t stream_int = reinterpret_cast<int64_t>(at::cuda::getCurrentCUDAStream().stream());
+  int64_t stream_int = reinterpret_cast<int64_t>(c10::cuda::getCurrentCUDAStream().stream());
 
   int64_t qo_total_len = nnz_qo;
   int batch_size = plan.qo_segment_lens.size(0);
