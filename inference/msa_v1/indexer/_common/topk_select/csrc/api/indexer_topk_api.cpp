@@ -22,7 +22,7 @@ void check_same_device(torch::Tensor const &reference, torch::Tensor const &tens
 void check_sm100_family(torch::Tensor const &reference) {
   c10::cuda::CUDAGuard const device_guard(reference.device());
   cudaDeviceProp const *properties = at::cuda::getCurrentDeviceProperties();
-  TORCH_CHECK(properties->major == 10 && (properties->minor == 0 || properties->minor == 3),
+  TORCH_CHECK(properties->major == 10 && (properties->minor == 0 || properties->minor == 3 || properties->minor == 7),
               "MSA v1 indexer TopK requires an SM100-family GPU");
 }
 

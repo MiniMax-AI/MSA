@@ -63,14 +63,14 @@ def test_sm100_family_uses_architecture_specific_reduction_and_dynamic_grid(
     monkeypatch.setattr(_build_utils, "_REPOSITORY_ROOT", tmp_path / "wheel_install")
     _build_utils.cutlass_root.cache_clear()
     try:
-        for capability in ((10, 0), (10, 3)):
+        for capability in ((10, 0), (10, 3), (10, 7)):
             monkeypatch.setattr(
                 torch.cuda, "get_device_capability", lambda _: capability
             )
             assert interface._check_runtime(torch.device("cuda")) == capability
         assert _build_utils.cutlass_root() == headers.parents[1]
-        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 7))
-        with pytest.raises(RuntimeError, match="SM107"):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+        with pytest.raises(RuntimeError, match="SM100, SM103 and SM107"):
             interface._check_runtime(torch.device("cuda"))
     finally:
         _build_utils.cutlass_root.cache_clear()
@@ -88,7 +88,7 @@ def test_sm100_family_uses_architecture_specific_reduction_and_dynamic_grid(
     assert not sm100.use_tmem_load_reduce
     assert sm103.num_persistent_clusters == 73
     assert sm103.use_tmem_load_reduce
-    with pytest.raises(ValueError, match="SM100 or SM103"):
+    with pytest.raises(ValueError, match="SM100, SM103 or SM107"):
         PrefillIndexerGemmSm100(
             compute_capability=(9, 0),
             num_persistent_clusters=1,
