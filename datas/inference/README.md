@@ -1,13 +1,15 @@
 # Inference workloads
 
-[English](README.en.md)
+[Simplified Chinese](README.zh-CN.md)
 
-本目录保存从本地 inference shape dump 归一化得到的 prefill workload。它是 MSA v1
-Attention 和 Indexer 测试、benchmark 共用的数据源，不包含 tensor payload。
+This directory stores normalized prefill workloads derived from local
+inference shape dumps. It is the shared data source for MSA v1 Attention
+and Indexer tests and benchmarks and does not contain tensor payloads.
 
-## 数据语义
+## Data semantics
 
-只处理 `batch_type == "prefill"`。原始 `kv_lens` 表示本次 prefill 前的 cached prefix：
+Only records with `batch_type == "prefill"` are processed. The original
+`kv_lens` represents the cached prefix before the current prefill call:
 
 ```text
 final_kv_lens[i] = prefix_lens[i] + query_lens[i]
@@ -15,19 +17,25 @@ query_position    = prefix_lens[i] + q_idx
 local_page        = floor(query_position / 128)
 ```
 
-10,937 条原始 prefill 记录归一化为 10,562 个唯一 shape，总调用权重为 14,805。原始
-dump 由仓库 `.gitignore` 排除；提交的 manifest 不保存 DP rank、源文件名或源文件 hash。
+The 10,937 original prefill records normalize to 10,562 unique shapes with a
+total call weight of 14,805. Original dumps are excluded by `.gitignore`; the
+committed manifests do not store DP ranks, source file names, or source file
+hashes.
 
-## 文件与 schema
+## Files and schema
 
-- `prefill_cases_v1/part-*.jsonl`：按 4,096 行确定性分片的唯一 shape、调用权重和
-  shape metrics；加载时按文件名顺序组成一个逻辑 manifest，每个 shard 小于 5 MiB。
-- `prefill_cases_v1.meta.json`：schema、分片清单与校验值、规范化规则和汇总计数。
-- `prefill_test_cases_v1.json`：smoke、full、CUDA Graph、exhaustive 和算子专用测试层。
-- `prefill_benchmark_cases_v1.json`：固定 128-case benchmark selection；代表性权重合计
-  14,805。
+- `prefill_cases_v1/part-*.jsonl`: unique shapes, call weights, and shape
+  metrics, deterministically split into 4,096-line shards. Files are loaded in
+  file-name order as one logical manifest, and each shard is smaller than
+  5 MiB.
+- `prefill_cases_v1.meta.json`: schema, shard list and checksums,
+  normalization rules, and aggregate counts.
+- `prefill_test_cases_v1.json`: smoke, full, CUDA Graph, exhaustive, and
+  operator-specific test tiers.
+- `prefill_benchmark_cases_v1.json`: fixed 128-case benchmark selection whose
+  representative weights sum to 14,805.
 
-每个 manifest case 包含：
+Each manifest case contains:
 
 ```text
 schema_version
@@ -40,34 +48,32 @@ count
 metrics
 ```
 
-`case_id` 是规范化 shape JSON 的 SHA256 前缀，与输入文件顺序无关。`metrics` 保存
-workspace、FLOPs 和 shape 相关的审计指标。
+`case_id` is a SHA256 prefix of the normalized shape JSON and is independent
+of input file order. `metrics` stores workspace, FLOPs, and shape-related audit
+metrics.
 
-## 测试分层
+## Test tiers
 
-`prefill_test_cases_v1.json` 定义以下通用 tier：
+`prefill_test_cases_v1.json` defines these shared tiers:
 
-- `static_all`：全部 10,562 case 的 schema、长度、FLOPs、唯一性和 selection 引用检查。
-- `msa_v1_smoke`：32 个确定性真实 case，用于 MSA v1 快速正确性检查。
-- `msa_v1_full`：512 个真实 case，用于 MSA v1 全量输出数值正确性检查。
-- `smoke`：原有 96 个确定性真实 case，用于扩展覆盖。
-- `full`：原有 1,024 个真实 case，用于扩展覆盖。
-- `gemm_topk_e2e`：1,024 个 Indexer 端到端 case。
-- `cuda_graph`：16 个覆盖不同 batch、workspace 和调度不均衡程度的 case。
-- `exhaustive`：全部 10,562 case 的 GPU 结构执行层。
+- `static_all`: schema, lengths, FLOPs, uniqueness, and selection-reference
+  checks for all 10,562 cases.
+- `msa_v1_smoke`: 32 deterministic real cases for MSA v1 quick correctness checks.
+- `msa_v1_full`: 512 real cases for full-output MSA v1 correctness checks.
+- `gemm_topk_e2e`: 1,024 end-to-end Indexer cases.
+- `cuda_graph`: 16 cases covering different batches, workspace sizes, and
+  workload imbalance.
+- `exhaustive`: GPU execution over all 10,562 cases.
 
-测试根据 `case_id` 生成可复现输入和随机、非连续 physical page table；数据文件不保存
-tensor payload。
+Tests derive reproducible inputs and randomized, non-contiguous physical page
+tables from `case_id`; data files do not store tensor payloads.
 
-## Benchmark 选择
+## Benchmark selection
 
-默认 benchmark 固定为 128 个 case，包含 representative、hot、batch anchor 和多类 stress
-shape。production-weighted 近似聚合只使用 representative case；其
-`representative_weight` 总和严格等于 14,805。
-
-`full` 包含固定的 128 个 case。聚合结果只对其中带 `representative_weight` 的生产代表
-case 做加权，同时报告所有 case 的单项结果。`exhaustive` 测试层覆盖全部 10,562 个
-shape。加权指标计算如下：
+The MSA v1 `full` benchmark contains 128 representative, hot, batch anchor, and
+stress cases. Weighted statistics use its production-representative cases with
+`representative_weight`, whose weights sum to 14,805. The complete dataset contains
+10,562 shapes for broader coverage checks. Statistics are computed as follows:
 
 ```text
 weighted_mean_latency =
@@ -80,11 +86,13 @@ aggregate_useful_TFLOPS =
     / 1e12
 ```
 
-`useful_flops == 0` 的 case 只报告 latency，不单独计算 TFLOPS。
+Cases with `useful_flops == 0` report latency without an individual TFLOPS
+value.
 
-## FLOPs 口径
+## FLOPs convention
 
-对 sequence `i` 的 query row `q_idx`，kernel 只计算 forced tail 前的完整历史 page：
+For query row `q_idx` in sequence `i`, the workload counts complete historical
+pages before the forced tail:
 
 ```text
 historical_pages(i, q_idx) = floor((prefix_lens[i] + q_idx) / 128)
@@ -94,21 +102,23 @@ useful_flops =
     * sum_i sum_q_idx historical_pages(i, q_idx)
 ```
 
-其中第一个 128 是 page token 数，第二个 128 是 head dimension。TopK 不折算为
-TFLOPS。
+The first 128 is the page token count and the second is the head dimension.
+TopK is not included in the TFLOPS count.
 
-## 生成与检查
+## Generation and validation
 
 ```bash
 python3 datas/inference/generate_cases.py
 python3 datas/inference/generate_cases.py --check
 ```
 
-测试和 benchmark 统一从 `datas.inference.cases` 读取数据。
+Tests and benchmarks read data through `datas.inference.cases`.
 
-Prefill benchmark 计时 CUDA Graph 中公开 `run()` 的完整 E2E 路径，不包含 `plan()`。
-通过 disjoint multi-tensor rotation 建立超过 2 倍 L2 的 reuse distance，使用 5 次 warmup
-和 20 次 replay。结果包含各 case 的 latency 和 CV，用于描述计时波动。
+This prefill benchmark measures the complete public `run()` E2E path under CUDA
+Graph replay, excluding `plan()`. Component timings do not replace E2E.
+Prefill uses disjoint multi-tensor rotation with a reuse
+distance greater than twice L2, 5 warmups, 20 replays, and a per-case
+`CV <= 3%` requirement.
 
 ```bash
 python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
@@ -118,4 +128,11 @@ python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
   --suite full --baseline /path/to/baseline.json --out /path/to/candidate.json
 ```
 
-`smoke` 用于快速检查；`full` 运行固定的 128 个 case，并提供生产权重加权结果。
+Use `smoke` for a quick check; `full` uses the complete 128-case benchmark selection.
+
+Q8KV8 prefill indexer accepts `--num-index-heads` 1/2/4 and returns `[H, total_q, 16]`.
+Useful FLOPs equal the single-head count above multiplied by H. Production-weighted
+throughput is the weighted FLOPs sum divided by the weighted E2E time sum.
+`--verify` independently checks every
+head/query outside timing. Baseline and candidate must use the same device, DSL
+version, timing protocol, and cold-cache slot count.

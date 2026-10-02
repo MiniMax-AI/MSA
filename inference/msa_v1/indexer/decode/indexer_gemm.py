@@ -1,4 +1,4 @@
-"""CuTe DSL Q8KV8 decode indexer GEMM for SM100/SM103."""
+"""CuTe DSL BF16/E4M3 decode indexer GEMM for SM100/SM103."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class _NamedBarrier(enum.IntEnum):
 
 
 class DecodeIndexerGemmSm100:
-    """Compute direct-E4M3 page scores with balanced persistent workers."""
+    """Compute per-head page scores with balanced persistent workers."""
 
     page_size = 128
     head_dim = 128
@@ -41,11 +41,22 @@ class DecodeIndexerGemmSm100:
     k_cache_evict_first = 0x12F0000000000000
 
     def __init__(
-        self, *, num_index_heads: int, sm_count: int, query_columns: int
+        self,
+        *,
+        num_index_heads: int,
+        sm_count: int,
+        query_columns: int,
+        input_dtype: type,
     ) -> None:
         if num_index_heads not in (1, 2, 4) or sm_count <= 0:
             raise ValueError("invalid head count or SM count")
         self.num_index_heads = num_index_heads
+        if input_dtype not in (cutlass.BFloat16, cutlass.Float8E4M3FN):
+            raise TypeError("input_dtype must be BF16 or E4M3")
+        self.input_dtype = input_dtype
+        self.score_scale = (
+            1.0 / (self.head_dim**0.5) if input_dtype == cutlass.BFloat16 else 1.0
+        )
         if query_columns not in range(8, 65, 8):
             raise ValueError("query_columns must be a multiple of 8 in [8, 64]")
         self.query_columns = query_columns
@@ -67,10 +78,10 @@ class DecodeIndexerGemmSm100:
         stream: cuda.CUstream = None,
     ) -> None:
         if cutlass.const_expr(
-            mQ.element_type is not cutlass.Float8E4M3FN
-            or mKCache.element_type is not cutlass.Float8E4M3FN
+            mQ.element_type != self.input_dtype
+            or mKCache.element_type != self.input_dtype
         ):
-            raise TypeError("q and k_cache must be Float8E4M3FN")
+            raise TypeError("q and k_cache must match the configured BF16 or E4M3 type")
         if cutlass.const_expr(
             mPageTable.element_type is not Int32 or mSeqLens.element_type is not Int32
         ):
@@ -141,14 +152,18 @@ class DecodeIndexerGemmSm100:
             mQ.element_type,
             self.q_stages,
         )
+        # MMA stores consecutive 128-byte K sectors before advancing to the
+        # next sector. BF16 therefore has two sectors per 128-element row.
+        sector_elements = 128 * 8 // self.input_dtype.width
+        k_sectors = self.k_chunk // sector_elements
         sK_tma_layout = cute.make_composed_layout(
             sK_layout.inner,
             0,
             cute.make_layout(
-                (self.page_size, self.k_chunk, self.k_stages),
+                (self.page_size, (sector_elements, k_sectors), self.k_stages),
                 stride=(
-                    self.k_chunk,
-                    1,
+                    sector_elements,
+                    (1, self.page_size * sector_elements),
                     self.page_size * self.k_chunk,
                 ),
             ),
@@ -158,13 +173,13 @@ class DecodeIndexerGemmSm100:
             0,
             cute.make_layout(
                 (
-                    self.k_chunk,
+                    (sector_elements, k_sectors),
                     self.query_columns,
                     self.chunks_per_page,
                 ),
                 stride=(
-                    1,
-                    self.k_chunk,
+                    (1, self.query_columns * sector_elements),
+                    sector_elements,
                     self.query_columns * self.k_chunk,
                 ),
             ),
@@ -268,14 +283,14 @@ class DecodeIndexerGemmSm100:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         sK = smem.allocate_tensor(
-            element_type=cutlass.Float8E4M3FN,
+            element_type=self.input_dtype,
             layout=sK_layout.outer,
             swizzle=sK_layout.inner,
             byte_alignment=128,
         )
         sK_tma = cute.make_tensor(sK.iterator, sK_tma_layout.outer)
         sQ = smem.allocate_tensor(
-            element_type=cutlass.Float8E4M3FN,
+            element_type=self.input_dtype,
             layout=sQ_layout.outer,
             swizzle=sQ_layout.inner,
             byte_alignment=128,
@@ -309,7 +324,7 @@ class DecodeIndexerGemmSm100:
             num_stages=self.k_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            tx_count=self.page_size * self.k_chunk,
+            tx_count=self.page_size * self.k_chunk * self.input_dtype.width // 8,
             barrier_storage=storage.k_mbar_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
@@ -317,7 +332,7 @@ class DecodeIndexerGemmSm100:
             num_stages=1,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            tx_count=self.query_columns * self.head_dim,
+            tx_count=self.query_columns * self.head_dim * self.input_dtype.width // 8,
             barrier_storage=storage.q_mbar_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
@@ -556,7 +571,7 @@ class DecodeIndexerGemmSm100:
                                         current_batch * query_length
                                         + query_idx // self.num_index_heads,
                                         logical_page,
-                                    ] = row_max
+                                    ] = row_max * self.score_scale
                     global_page += Int32(1)
                     logical_page += Int32(1)
                 pages_remaining -= segment_pages

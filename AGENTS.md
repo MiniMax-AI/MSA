@@ -248,6 +248,8 @@
    运行 benchmark。
 2. 新增 op、kernel 修改或 bug fix 在最终提交前必须运行目标 op 所属目录
    `AGENTS.md` 规定的 full correctness。开发验证过程中可以只运行 smoke suite。
+   接口层维护、文件移动或目录重组若保持现有 kernel 计算和公开数据契约不变，
+   只需运行受影响路径的 smoke 测试，不要求 full correctness 或 E2E benchmark。
 3. 修改共享组件时必须运行所有受影响测试；无法确定影响范围时运行全量测试。
 4. 新增功能和修复必须有测试覆盖；优先扩展已有测试函数，无必要不要新增测试函数。
 5. sparse/varlen 测试至少覆盖：不规则 `cu_seqlens`、离散无序 topK、最后一个
@@ -308,9 +310,9 @@
 - 面向使用者的 `README.md`、公开接口文档和正式产品文档必须随代码同步
   维护并提交。新增 op、修改公开接口、数据契约、依赖、支持范围、运行方式或用户可见
   行为时，同一 commit 必须更新最近的算子 README 和必要的上级 README。
-- MSA 面向使用者的文档默认使用英文，`README.md` 为英文默认入口和权威版本。
-  保留的其他语言版本必须与英文版互相链接，并在标题结构、表格、示例、命令、
-  公开契约和限制上语义对齐；修改时同步维护。向用户提供的 review 说明使用简体中文。
+- 每个 Git 跟踪的面向使用者 `README.md` 默认使用英文，并必须在同目录
+  维护 `README.zh-CN.md` 简体中文 companion。两个版本顶部必须互相链接；标题结构、表格、示例、
+  命令、公开契约和限制必须语义对齐。修改任一版本时必须在同一 commit 同步另一版本。
 - README 只面向算子使用者，只介绍功能、安装与依赖、公开 API、输入输出契约、支持范围、
   调用示例、用户可见错误与验收命令。不得记录 warp/CTA 分工、TMA/TMEM/SMEM 布局、
   pipeline/barrier、scheduler、私有 stage、内部 workspace 组织、SASS 或调优过程；这些内容

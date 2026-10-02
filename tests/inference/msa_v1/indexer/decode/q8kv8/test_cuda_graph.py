@@ -5,9 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from inference.msa_v1.indexer.decode._interface import (
+    _BatchDecodeProxyScoreWrapper,
+)
 from inference.msa_v1.indexer.decode.q8kv8.interface import (
     BatchDecodeIndexerWithPagedKVCacheWrapper,
-    _BatchDecodeProxyScoreWrapper,
 )
 from tests.inference.msa_v1.indexer.decode.q8kv8.reference import (
     indexer_gemm_reference,

@@ -12,7 +12,6 @@ from tests.inference.msa_v1.attention.prefill.q8kv8.real_cases import (
     RealPrefillAttentionInputs,
 )
 
-
 HEAD_DIM = 128
 Q_HEADS = 64
 KV_HEADS = 4
@@ -31,13 +30,15 @@ def paged_sparse_attention_reference(
     *,
     softmax_scale: float = HEAD_DIM**-0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Model E4M3 QK/PV, per-page partial storage, and split combine."""
+    """Model paged attention, including E4M3 probability rounding when applicable."""
 
     output = torch.zeros_like(q, dtype=torch.float32)
     lse = torch.full(q.shape[:-1], -torch.inf, dtype=torch.float32, device=q.device)
     token_in_page = torch.arange(PAGE_SIZE, device=q.device)
     q_offset = 0
     query_chunk = 16
+    kv_heads = k_cache.shape[1]
+    q_heads_per_kv = q.shape[1] // kv_heads
 
     old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
     old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
@@ -53,9 +54,9 @@ def paged_sparse_attention_reference(
                     k_len - q_len + q_end,
                     device=q.device,
                 )
-                for kv_head in range(KV_HEADS):
-                    head_begin = kv_head * Q_HEADS_PER_KV
-                    head_end = head_begin + Q_HEADS_PER_KV
+                for kv_head in range(kv_heads):
+                    head_begin = kv_head * q_heads_per_kv
+                    head_end = head_begin + q_heads_per_kv
                     logical_pages = topk_indices[kv_head, q_slice].to(torch.int64)
                     valid_pages = logical_pages >= 0
                     logical_pages_safe = logical_pages.clamp_min(0)
@@ -85,17 +86,18 @@ def paged_sparse_attention_reference(
                     probability.masked_fill_(~visible[:, None], 0.0)
                     row_sum = probability.sum(dim=-1)
                     probability_scale = 448.0
-                    probability_fp8 = (
-                        (probability * probability_scale).to(torch.float8_e4m3fn).float()
+                    probability_for_pv = (
+                        (probability * probability_scale)
+                        .to(torch.float8_e4m3fn)
+                        .float()
                         / probability_scale
+                        if q.dtype == torch.float8_e4m3fn
+                        else probability
                     )
-                    partial = torch.einsum(
-                        "qhpt,qptd->qphd", probability_fp8, mV
-                    )
-                    partial.div_(
-                        row_sum.permute(0, 2, 1).clamp_min(1.0)[..., None]
-                    )
-                    partial = partial.to(torch.bfloat16).float()
+                    partial = torch.einsum("qhpt,qptd->qphd", probability_for_pv, mV)
+                    partial.div_(row_sum.permute(0, 2, 1).clamp_min(1.0)[..., None])
+                    if q.dtype == torch.float8_e4m3fn:
+                        partial = partial.to(torch.bfloat16).float()
                     partial_lse = row_max + torch.log(row_sum.clamp_min(1.0))
                     partial_lse.masked_fill_(~finite_page, -torch.inf)
 
@@ -129,8 +131,7 @@ def sampled_real_case_reference(
     ordered = sorted(candidates)
     if len(ordered) > limit:
         indices = {
-            round(index * (len(ordered) - 1) / (limit - 1))
-            for index in range(limit)
+            round(index * (len(ordered) - 1) / (limit - 1)) for index in range(limit)
         }
         ordered = [ordered[index] for index in sorted(indices)]
 
@@ -163,14 +164,14 @@ def sampled_real_case_reference(
         probability = torch.exp(scores - row_max[:, :, None])
         row_sum = probability.sum(dim=-1)
         probability_scale = 448.0
-        probability_fp8 = (
-            (probability * probability_scale).to(torch.float8_e4m3fn).float()
-            / probability_scale
-        )
+        probability_fp8 = (probability * probability_scale).to(
+            torch.float8_e4m3fn
+        ).float() / probability_scale
         partial_out = (
-            torch.einsum("hpt,hptd->hpd", probability_fp8, mV)
-            / row_sum[:, :, None]
-        ).to(torch.bfloat16).float()
+            (torch.einsum("hpt,hptd->hpd", probability_fp8, mV) / row_sum[:, :, None])
+            .to(torch.bfloat16)
+            .float()
+        )
         partial_lse = row_max + torch.log(row_sum)
         combined_lse = torch.logsumexp(partial_lse, dim=-1)
         weights = torch.exp(partial_lse - combined_lse[:, None])

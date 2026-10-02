@@ -1,65 +1,73 @@
-# MSA v1 推理算子
+# MSA v1 Inference Operators
 
-[English](README.en.md)
+[简体中文](README.zh-CN.md)
 
-## 概览
+## Overview
 
-MSA v1 提供 paged sparse attention 和 indexer 的 decode/prefill 接口。所有公开算子
-均采用 `plan()` / `run()` 生命周期：`plan()` 接收请求级 metadata，`run()` 接收当前层
-的张量并返回结果。
+MSA v1 provides decode and prefill APIs for paged sparse attention and indexers. Every public
+operator follows a `plan()` / `run()` lifecycle: `plan()` accepts request-level metadata, and
+`run()` accepts tensors for the current layer and returns results.
 
-## 公开接口
+## Public APIs
 
-| 算子 | 包 | 公开 wrapper |
+| Operator | Package | Public wrapper |
 | --- | --- | --- |
 | Decode attention | `inference.msa_v1.attention.decode.<dtype>` | `BatchDecodeWithPagedKVCacheWrapper` |
 | Prefill attention | `inference.msa_v1.attention.prefill.<dtype>` | `BatchPrefillWithPagedKVCacheWrapper` |
 | Decode indexer | `inference.msa_v1.indexer.decode.<variant>` | `BatchDecodeIndexerWithPagedKVCacheWrapper` |
 | Prefill indexer | `inference.msa_v1.indexer.prefill.<variant>` | `BatchPrefillIndexerWithPagedKVCacheWrapper` |
 
-可用数据格式与约束：
+Available formats and constraints:
 
-- Attention：BF16 prefill、Q8KV4 decode/prefill 和 Q8KV8 decode/prefill。
-- Indexer：BF16 prefill、H=1/2/4 Q8KV4/Q8KV8 decode，以及 H=1/2/4 Q8KV8 prefill。
-- Q8KV4/Q8KV8 decode indexer 支持 Q=1–16，输出 `[H,B*Q,16]`；
-  `inference.msa_v1.indexer.decode.BatchDecodeIndexerPlan` 支持跨层共享及 Graph 内更新。
-- BF16 paged prefill attention 支持 contiguous 和 SGLang-style strided K/V view。
-- BF16 paged prefill indexer 支持 1 或 4 个本地 index head，输出为
-  `[num_index_heads, total_q, 16]`。
-- Q8KV4 与 Q8KV8 decode attention 在 B200/SM100、B300/SM103 上支持 GQA=8/16，
-  按实际 `Hq/Hkv` dispatch，输出 BF16；query length 由公开接口指定。
-  Q8KV4 使用原生 CUTLASS C++，并保留 CUDA 13.5 或更新版本上的 SM107 GQA=16 支持。
-- Q8KV8 prefill attention 支持 GQA group size 1、2、4、8 或 16。
+- Attention: BF16 decode/prefill, Q8KV4 decode/prefill, and Q8KV8 decode/prefill.
+- Indexer: H=1/2/4 BF16 prefill, H=1/2/4 BF16/Q8KV4/Q8KV8 decode, and H=1/2/4 Q8KV8 prefill.
+- BF16/Q8KV4/Q8KV8 decode indexers support Q=1–16 and return `[H,B*Q,16]`;
+  `inference.msa_v1.indexer.decode.BatchDecodeIndexerPlan` supports sharing across layers and updates inside Graphs.
+- BF16 paged prefill attention accepts contiguous and SGLang-style strided K/V views.
+- BF16 paged prefill indexer supports one, two, or four local index heads and returns
+  `[num_index_heads, total_q, 16]`.
+- Q8KV4 and Q8KV8 decode attention support GQA=8/16 on B200/SM100 and B300/SM103,
+  dispatch by the actual `Hq/Hkv`, and return BF16. Query length is configured through the public
+  interface. Q8KV4 uses native CUTLASS C++ and retains SM107 GQA=16 support with
+  CUDA 13.5 or newer.
+- Q8KV8 prefill attention supports GQA group sizes 1, 2, 4, 8, and 16.
 
-BF16/Q8KV8 prefill attention 还保留 SM107 Rubin 路径，由实际设备架构选择。
+BF16/Q8KV8 prefill attention also retains SM107 Rubin paths selected by the actual device architecture.
 
-具体张量 shape、dtype 和调用示例见各算子目录中的 README。
+See the README in each operator directory for exact tensor shapes, dtypes, and usage examples.
 
-## 通用数据契约
+## Common data contract
 
-- 仅支持 paged KV cache；varlen 请求必须提供真实的长度 metadata。
-- TopK logical page 可以离散、无序，不能假设连续或排序。
-- TopK 有效项位于前缀，无效后缀为 `-1`；最后一个有效项必须是 local page。
-- `plan()` 必须在 CUDA Graph capture 外调用。需要 graph capture 的路径应先 warmup，
-  并在 capture 时使用预分配输出。
-- Wrapper 不会为了绕过输入限制而隐式排序 TopK、复制或重排 K/V。
+- Only paged KV caches are supported. Varlen requests must provide their real length metadata.
+- TopK logical pages may be scattered and unordered; callers must not assume they are
+  contiguous or sorted.
+- Valid TopK entries form a prefix followed by `-1`, and the final valid entry must be the local
+  page.
+- Call `plan()` outside CUDA Graph capture. Paths used with graph capture must be warmed up
+  first and use preallocated outputs during capture.
+- Wrappers do not silently sort TopK entries or copy and reorder K/V to bypass input
+  restrictions.
 
-## 可选依赖与格式转换
+## Optional dependencies and format conversion
 
-通用 NVFP4 到 E4M3 转换由 `inference.dequant` 提供，包括 dense 转换和仅处理 TopK
-选中页的 sparse K/V 转换。
+`inference.dequant` provides general NVFP4-to-E4M3 conversion, including dense conversion and
+sparse K/V conversion that processes only TopK-selected pages.
 
-Q8K8 decode attention 使用外部 FlashInfer backend。仓库不分发 FlashInfer 源码或
-cubin；通过 `python -m pip install -e '.[flashinfer]'` 安装固定的
-`flashinfer-python==0.6.17`。该 adapter 不会隐式执行 FP4 dequant。
+BF16/Q8KV8 decode attention uses an external FlashInfer backend. This repository does not distribute
+FlashInfer source code or cubins. Install the pinned `flashinfer-python==0.6.17` dependency with
+`python -m pip install -e '.[flashinfer]'`. The adapter does not perform implicit FP4 dequantization.
 
-## 验证
+## Validation
 
-- Decode correctness：96-case smoke suite 和 256-case full suite。
-- Prefill correctness：32-case smoke suite 和 512-case full suite。
-- 正确性测试对公开输出和必要辅助输出做全量 reference 比较。
-- Decode full benchmark 使用 28 个 RL rollout case；Prefill 使用固定 128 个生产 case。
-- Benchmark 报告 CUDA Graph 中公开 `run()` 全路径的 E2E latency。
+- Decode correctness: a 96-case smoke suite and a 256-case full suite.
+- Prefill correctness: a 32-case smoke suite and a 512-case full suite.
+- Correctness tests compare every element of public outputs and required auxiliary outputs
+  against an independent reference.
+- The full decode benchmarks use 28 RL-rollout cases; prefill uses 128 fixed production cases.
+- Benchmarks report end-to-end latency of the public `run()` path inside a CUDA
+  Graph.
 
-共享 case、运行命令和统计方法见仓库根目录 [README](../../README.md)、
-[inference data manifests](../../datas/inference/README.md)。
+See the repository [README](../../README.md),
+[inference data manifests](../../datas/inference/README.md) for shared cases, commands, and measurement methods.
+
+BF16 decode indexing supports H=1/2/4 and Q=1–16; BF16 decode attention supports GQA=8/16. See the [BF16 indexer](indexer/decode/bf16/README.md) and [BF16 attention](attention/decode/bf16/README.md) for input layouts, metadata and lifecycle requirements. BF16 attention uses the same optional FlashInfer 0.6.17 dependency as Q8KV8.

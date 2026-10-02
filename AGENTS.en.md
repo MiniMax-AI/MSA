@@ -228,6 +228,9 @@ find its cause instead of relaxing tolerances.
   if the affected scope cannot be determined. Add coverage for features and
   fixes, preferably by extending existing tests. Deterministic paths include
   repeated execution checks; nondeterministic paths use fixed thresholds.
+- Interface maintenance or file/directory reorganization that preserves kernel
+  computation and public data contracts requires only smoke tests for affected
+  paths; full correctness and E2E benchmarks are not required.
 - Sparse/varlen tests cover irregular `cu_seqlens`, unordered pages,
   local-block-last, local partial pages, minimums, and upper bounds.
 - A single kernel execution over 30 seconds is a deadlock. Compile and run
@@ -308,11 +311,11 @@ changes also require cache-reuse checks and an E2E benchmark.
   any change to a public interface, data contract, dependency, supported
   configuration, invocation, or user-visible behavior updates the nearest
   operator README and any affected parent README in the same commit.
-- MSA user-facing documentation defaults to English. `README.md` is the default
-  English entry point and normative version. Retained translations link to the
-  English version and vice versa; keep headings, tables, examples, commands,
-  public contracts, and limitations semantically aligned and update them together.
-  Write explanations provided for user review in Simplified Chinese.
+- Every tracked user-facing `README.md` uses English by default and has a
+  same-directory Simplified-Chinese `README.zh-CN.md` companion. Both files link to
+  each other at the top. Their heading structure, tables, examples, commands,
+  public contracts, and limitations remain semantically aligned. Updating
+  either language requires updating the other in the same commit.
 - README files are for operator users. They document purpose, installation and
   dependencies, public APIs, input/output contracts, supported configurations,
   invocation examples, user-visible errors, and validation commands. They do

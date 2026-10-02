@@ -7,9 +7,9 @@ import argparse
 import json
 import statistics
 import sys
-from importlib import metadata as importlib_metadata
 from pathlib import Path
 
+import cutlass
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[6]
@@ -217,6 +217,7 @@ def run_case(
     warmup: int,
     replays: int,
     num_index_heads: int,
+    verify: bool = False,
 ) -> dict[str, object]:
     case = selection.case
     input_slots = [_make_inputs(case, num_index_heads) for _ in range(slots)]
@@ -232,6 +233,42 @@ def run_case(
     for slot in range(slots):
         baseline_outputs.append(launch(slot).clone())
     torch.cuda.synchronize()
+
+    if verify:
+        from tests.inference.msa_v1.indexer.prefill.q8kv8.cases import RealPrefillInputs
+        from tests.inference.msa_v1.indexer.prefill.q8kv8.reference import (
+            assert_full_topk_quality,
+            assert_topk_structure,
+            expected_lengths,
+            full_score_reference,
+        )
+
+        q, k_cache, page_table, cu_q, cu_k = input_slots[0]
+        lengths = expected_lengths(case).to(device=q.device)
+        history = torch.arange(case.max_cols, device=q.device)[None, :] < (
+            lengths[:, None] - 1
+        )
+        for head in range(num_index_heads):
+            inputs = RealPrefillInputs(
+                q=q[:, head : head + 1],
+                k_cache=k_cache,
+                page_table=page_table,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+            )
+            expected_scores = full_score_reference(case, inputs)
+            actual_scores = wrappers[0]._plan_state.proxy_scores[head][history]
+            assert bool(torch.isfinite(actual_scores).all())
+            torch.testing.assert_close(
+                actual_scores,
+                expected_scores[history] / (HEAD_DIM**0.5),
+                atol=2e-4,
+                rtol=2e-4,
+            )
+            assert_topk_structure(baseline_outputs[0][head], lengths)
+            assert_full_topk_quality(
+                expected_scores, lengths, baseline_outputs[0][head]
+            )
 
     graph_outputs = []
     rotation_graph = torch.cuda.CUDAGraph()
@@ -282,7 +319,11 @@ def run_case(
         * working_set_bytes
         / properties.L2_cache_size,
         "e2e_scope": "BatchPrefillIndexerWithPagedKVCacheWrapper.run",
-        "correctness": "passed (full TopK bitwise graph replay)",
+        "correctness": (
+            "passed (full score/TopK reference + bitwise graph replay)"
+            if verify
+            else "passed (full TopK bitwise graph replay)"
+        ),
         **roofline_metrics(
             device_name=properties.name,
             useful_flops=useful_flops,
@@ -309,10 +350,11 @@ def main() -> None:
         type=int,
         choices=M3_PAGED_DIRECT_SCORE_NUM_HEADS,
         default=DEFAULT_NUM_INDEX_HEADS,
-        help="Number of local index heads: 1 or 4",
+        help="Number of local index heads: 1, 2, or 4",
     )
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
     if args.slots < 0 or args.warmup < 1 or args.replays < 2:
         parser.error("slots must be non-negative, warmup positive, and replays >= 2")
@@ -344,6 +386,7 @@ def main() -> None:
             warmup=args.warmup,
             replays=args.replays,
             num_index_heads=args.num_index_heads,
+            verify=args.verify,
         )
         rows.append(row)
         print(json.dumps(row, sort_keys=True), flush=True)
@@ -375,7 +418,7 @@ def main() -> None:
         "compute_capability": list(capability),
         "protocol": {
             "suite": args.suite,
-            "nvidia_cutlass_dsl": importlib_metadata.version("nvidia-cutlass-dsl"),
+            "nvidia_cutlass_dsl": cutlass.__version__,
             "formal_full_selection": is_formal,
             "e2e_scope": "public wrapper.run: proxy GEMM + TopK",
             "num_index_heads": args.num_index_heads,

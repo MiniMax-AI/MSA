@@ -59,8 +59,9 @@ def make_inputs(
     device: torch.device,
     num_index_heads: int = 1,
     query_length: int = 8,
+    dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> tuple[torch.Tensor, ...]:
-    """Create deterministic E4M3 inputs with non-identity page tables."""
+    """Create deterministic inputs with non-identity page tables."""
 
     generator = torch.Generator(device=device).manual_seed(seed)
     physical_pages = max_pages + 3
@@ -74,7 +75,7 @@ def make_inputs(
             device=device,
         )
         * 0.5
-    ).to(torch.float8_e4m3fn)
+    ).to(dtype)
     k_cache = (
         torch.randn(
             physical_pages,
@@ -84,7 +85,7 @@ def make_inputs(
             device=device,
         )
         * 0.5
-    ).to(torch.float8_e4m3fn)
+    ).to(dtype)
     page_table = torch.stack(
         [
             torch.randperm(physical_pages, generator=generator, device=device)[

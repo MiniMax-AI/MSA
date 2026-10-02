@@ -79,6 +79,8 @@
   目标 op 的 smoke correctness；无提升的候选直接拒绝，不要求运行精度验证。
 - 新增 op 或 bug fix 必须先通过目标 op 的 smoke correctness；新增 op、kernel 修改或 bug fix
   在最终提交前必须通过目标 op 的 full correctness。
+- 接口层维护、文件移动或目录重组若保持现有 kernel 计算和公开数据契约不变，
+  只需运行受影响路径的 smoke 测试，不要求 full correctness 或 E2E benchmark。
 - Baseline 与 candidate 必须使用相同输入、Graph 配置、cold-cache 策略、warmup 和统计方式。
   一次优化目标中的所有 candidate 都与开发分支起点的固定 baseline commit 比较，同时记录
   相对上一个有效版本的增量变化。

@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 
 import torch
 
@@ -15,14 +16,16 @@ def _terminate_deadlock() -> None:
     os._exit(124)
 
 
-def run_cuda(label: str, operation):
-    torch.cuda.synchronize()
+@contextmanager
+def cuda_execution(label: str):
+    """Time a compiled launch region, including completion synchronization."""
     watchdog = threading.Timer(30, _terminate_deadlock)
     watchdog.daemon = True
     watchdog.start()
     started = time.perf_counter()
     try:
-        result = operation()
+        torch.cuda.synchronize()
+        yield
         torch.cuda.synchronize()
     finally:
         watchdog.cancel()
@@ -30,4 +33,8 @@ def run_cuda(label: str, operation):
     logger.info("Ran %s in %.3fms", label, elapsed * 1.0e3)
     if elapsed > 30:
         raise RuntimeError("kernel run exceeded the 30-second deadlock threshold")
-    return result
+
+
+def run_cuda(label: str, operation):
+    with cuda_execution(label):
+        return operation()

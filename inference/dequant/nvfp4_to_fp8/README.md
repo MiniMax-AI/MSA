@@ -1,13 +1,13 @@
-# NVFP4 to E4M3 dequantization
+# NVFP4 to E4M3 Dequantization
 
-[English](README.en.md)
+[简体中文](README.zh-CN.md)
 
-## 功能
+## Purpose
 
-该模块提供通用 dense NVFP4 转 E4M3，以及仅转换 paged sparse decode 所选
-`(physical_page, kv_head)` 的融合 K/V 路径。
+This package provides general dense NVFP4-to-E4M3 conversion and a fused K/V path that
+converts only the `(physical_page, kv_head)` pairs selected by paged sparse decode.
 
-## 公开接口
+## Public API
 
 ```python
 from inference.dequant import (
@@ -16,19 +16,21 @@ from inference.dequant import (
 )
 ```
 
-Dense 接口处理任意 `[..., 64]` packed E2M1 输入。Sparse wrapper 使用
-`plan()` 接收 TopK 与 page-table metadata，使用 `run()` 转换每层 K/V 数据。
+The dense function accepts packed E2M1 inputs with shape `[..., 64]`. The sparse wrapper
+accepts TopK and page-table metadata through `plan()` and converts per-layer K/V data through
+`run()`.
 
-## 数据契约
+## Data contract
 
-- Head dim 固定为 128，scale group 固定为 16。
-- NVFP4 数据与 E4M3 scale 均为线性、非 swizzle GMEM 布局。
-- Sparse TopK 为有效前缀、`-1` 后缀，最后一个有效项必须为 local page。
-- Sparse 接口只转换 TopK 选中的 `(physical_page, kv_head)`，并返回可供下游
-  paged attention 使用的 compact K/V cache、block table 和 sequence lengths。
+- The head dimension is fixed at 128, and the scale-group size is fixed at 16.
+- NVFP4 data and E4M3 scales use linear, non-swizzled GMEM layouts.
+- Sparse TopK entries form a valid prefix followed by `-1`; the final valid entry must be the
+  local page.
+- The sparse API converts only selected `(physical_page, kv_head)` pairs and returns compact
+  K/V caches, block tables, and sequence lengths suitable for downstream paged attention.
 
-## 运行约束
+## Runtime requirements
 
-仅支持 SM100/SM103。CUDA 13.4 及以上使用公开 QMUL4 指令；较早工具链使用
-精确的 FP16 dequant fallback。`plan()` 必须在 CUDA Graph capture 外执行；capture
-期间 `run()` 必须使用预分配输出。
+Only SM100 and SM103 are supported. CUDA 13.4 or newer uses the public QMUL4 instruction;
+older supported toolkits use the exact FP16 dequantization fallback. Call `plan()` outside
+CUDA Graph capture and provide preallocated outputs to `run()` during capture.

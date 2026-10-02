@@ -6,7 +6,7 @@ import time
 import cutlass
 from packaging.version import Version
 
-from inference.msa_v1.attention.decode.q8kv8._flashinfer import load_backend
+from inference.msa_v1.attention.decode._flashinfer import load_backend
 from tests.inference.msa_v1.attention.decode.runtime import run_cuda
 
 logger = logging.getLogger(__name__)

@@ -11,9 +11,11 @@ from functools import partial
 import pytest
 import torch
 
+from inference.msa_v1.indexer.decode._interface import (
+    _BatchDecodeProxyScoreWrapper,
+)
 from inference.msa_v1.indexer.decode.q8kv8.interface import (
     BatchDecodeIndexerWithPagedKVCacheWrapper,
-    _BatchDecodeProxyScoreWrapper,
 )
 from tests.inference.cases import active_inference_suite
 from tests.inference.msa_v1.decode.cases import correctness_cases, make_seq_lens

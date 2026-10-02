@@ -19,12 +19,14 @@ TRAINING_ROOT = REPO_ROOT / "training"
 INFERENCE_ROOT = REPO_ROOT / "inference"
 MSA_V1_INFERENCE_ROOT = INFERENCE_ROOT / "msa_v1"
 MSA_V1_OPERATOR_ROOTS = (
+    MSA_V1_INFERENCE_ROOT / "attention/decode/bf16",
     MSA_V1_INFERENCE_ROOT / "attention/decode/q8kv4",
     MSA_V1_INFERENCE_ROOT / "attention/decode/q8kv8",
     MSA_V1_INFERENCE_ROOT / "attention/prefill/bf16",
     MSA_V1_INFERENCE_ROOT / "attention/prefill/q8kv4",
     MSA_V1_INFERENCE_ROOT / "attention/prefill/q8kv8",
     MSA_V1_INFERENCE_ROOT / "indexer/decode/q8kv4",
+    MSA_V1_INFERENCE_ROOT / "indexer/decode/bf16",
     MSA_V1_INFERENCE_ROOT / "indexer/decode/q8kv8",
     MSA_V1_INFERENCE_ROOT / "indexer/prefill/bf16",
     MSA_V1_INFERENCE_ROOT / "indexer/prefill/q8kv8",
@@ -174,7 +176,12 @@ def test_msa_v1_inference_layout_is_canonical() -> None:
     assert (msa_v1_root / "attention/prefill/_common/atten_fwd_sm100.py").is_file()
     assert not (msa_v1_root / "attention/prefill/q8kv8/atten_fwd.py").exists()
     assert (msa_v1_root / "attention/prefill/bf16/interface.py").is_file()
-    assert (msa_v1_root / "indexer/decode/q8kv8/indexer_gemm.py").is_file()
+    assert (msa_v1_root / "indexer/decode/_interface.py").is_file()
+    assert (msa_v1_root / "indexer/decode/indexer_gemm.py").is_file()
+    assert not (msa_v1_root / "indexer/decode/bf16/indexer_gemm.py").exists()
+    assert not (msa_v1_root / "indexer/decode/q8kv8/indexer_gemm.py").exists()
+    assert not (msa_v1_root / "indexer/decode/dense_gemm.py").exists()
+    assert not (msa_v1_root / "indexer/decode/dense_interface.py").exists()
     assert (msa_v1_root / "indexer/prefill/q8kv8/indexer_gemm.py").is_file()
     assert (msa_v1_root / "indexer/prefill/bf16/indexer_gemm.py").is_file()
 
@@ -297,6 +304,12 @@ def test_q8kv8_decode_adapter_does_not_vendor_flashinfer() -> None:
 
 def test_msa_v1_operator_readmes_use_one_structure() -> None:
     expected_headings = ["## 功能", "## 公开接口", "## 数据契约", "## 运行约束"]
+    english_headings = [
+        "## Purpose",
+        "## Public API",
+        "## Data contract",
+        "## Runtime requirements",
+    ]
     development_terms = (
         "PASS",
         "TFLOPS",
@@ -305,17 +318,38 @@ def test_msa_v1_operator_readmes_use_one_structure() -> None:
         "迁移",
     )
     for operator_root in MSA_V1_OPERATOR_ROOTS:
-        readme = operator_root / "README.md"
+        readme = operator_root / "README.zh-CN.md"
         text = readme.read_text(encoding="utf-8")
         headings = [line for line in text.splitlines() if line.startswith("## ")]
         assert headings in (
             expected_headings,
             [*expected_headings, "## 验收命令"],
+            [*expected_headings, "## 验证命令"],
+            [*expected_headings, "## 验证与性能测试"],
         ), readme.relative_to(REPO_ROOT)
+        companion = operator_root / "README.md"
+        english = companion.read_text(encoding="utf-8")
+        assert "(README.md)" in text
+        assert "(README.zh-CN.md)" in english
+        translations = dict(zip(expected_headings, english_headings))
+        translations.update(
+            {
+                "## 验收命令": "## Validation commands",
+                "## 验证命令": "## Validation commands",
+                "## 验证与性能测试": "## Validation and performance testing",
+            }
+        )
+        assert [line for line in english.splitlines() if line.startswith("## ")] == [
+            translations[heading] for heading in headings
+        ], companion.relative_to(REPO_ROOT)
         assert not any(term in text for term in development_terms), readme.relative_to(
             REPO_ROOT
         )
-        overview = text.partition("## 验收命令")[0]
+        overview = (
+            text.partition("## 验收命令")[0]
+            .partition("## 验证命令")[0]
+            .partition("## 验证与性能测试")[0]
+        )
         assert not any(term in overview for term in ("benchmark", "验收")), (
             readme.relative_to(REPO_ROOT)
         )
@@ -330,13 +364,25 @@ def test_msa_v1_tracked_document_style_is_portable() -> None:
         "results.md",
     }
     tracked_output = subprocess.run(
-        ["git", "ls-files", "--", "inference/msa_v1/**/*.md"],
+        [
+            "git",
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "inference/msa_v1/**/*.md",
+        ],
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
         text=True,
     ).stdout
-    tracked_markdown = [REPO_ROOT / path for path in tracked_output.splitlines()]
+    tracked_markdown = [
+        REPO_ROOT / path
+        for path in tracked_output.splitlines()
+        if (REPO_ROOT / path).is_file()
+    ]
     assert not [
         path for path in tracked_markdown if path.name in legacy_development_names
     ]

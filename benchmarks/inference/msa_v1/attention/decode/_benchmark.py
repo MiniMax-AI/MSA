@@ -41,6 +41,7 @@ NUM_Q_HEADS = 64
 NUM_KV_HEADS = 4
 TOPK = 16
 KV_FORMAT = "q8kv4"
+ENABLE_PDL = True
 MAX_CV = 0.03
 MAX_TIMING_ATTEMPTS = 3
 KV_HEAD_PAGE_BYTES = 2 * (PAGE_SIZE * (HEAD_DIM // 2) + PAGE_SIZE * (HEAD_DIM // 16))
@@ -49,6 +50,11 @@ KV_HEAD_PAGE_BYTES = 2 * (PAGE_SIZE * (HEAD_DIM // 2) + PAGE_SIZE * (HEAD_DIM //
 def _wrapper_type():
     module = importlib.import_module(f"inference.msa_v1.attention.decode.{KV_FORMAT}")
     return module.BatchDecodeWithPagedKVCacheWrapper
+
+
+def _make_wrapper():
+    kwargs = {} if KV_FORMAT == "q8kv4" else {"enable_pdl": ENABLE_PDL}
+    return _wrapper_type()(**kwargs)
 
 
 def _ensure_exclusive() -> None:
@@ -79,12 +85,18 @@ def _plan(wrapper, topk, page_table, seq_lens, q_len, num_kv_splits):
     wrapper.plan(topk, page_table, seq_lens, **kwargs)
 
 
+def _make_query(shape, *, generator, device):
+    if KV_FORMAT == "bf16":
+        return torch.randn(shape, generator=generator, device=device).to(torch.bfloat16)
+    return _make_finite_e4m3(shape, generator=generator, device=device)
+
+
 def _cache_tensors(packed_shape, scale_shape, generator, device):
-    if KV_FORMAT == "q8kv8":
+    if KV_FORMAT in ("bf16", "q8kv8"):
         shape = (*packed_shape[:-1], HEAD_DIM)
         return (
-            _make_finite_e4m3(shape, generator=generator, device=device),
-            _make_finite_e4m3(shape, generator=generator, device=device),
+            _make_query(shape, generator=generator, device=device),
+            _make_query(shape, generator=generator, device=device),
             None,
             None,
         )
@@ -265,7 +277,7 @@ class CaseStorage:
             page_tables.append(page_table)
 
         total_q = case.batch * case.q_len_per_req
-        q = _make_finite_e4m3(
+        q = _make_query(
             (total_q, NUM_KV_HEADS * 16, HEAD_DIM),
             generator=generator,
             device=device,
@@ -344,7 +356,7 @@ def _run(
 ) -> torch.Tensor:
     kwargs = (
         {}
-        if KV_FORMAT == "q8kv8"
+        if KV_FORMAT != "q8kv4"
         else {"kv_cache_sf": (storage.k_scale, storage.v_scale)}
     )
     return wrapper.run(
@@ -363,7 +375,7 @@ def _make_wrappers(
     wall_start = time.perf_counter()
     start.record()
     for topk, page_table in zip(storage.topk_slots, storage.page_tables, strict=True):
-        wrapper = _wrapper_type()()
+        wrapper = _make_wrapper()
         _plan(
             wrapper,
             topk,
@@ -387,9 +399,7 @@ def _warm_compilation(device: torch.device) -> float:
 
     started = time.perf_counter()
     generator = torch.Generator(device=device).manual_seed(7301)
-    q = _make_finite_e4m3(
-        (1, NUM_Q_HEADS, HEAD_DIM), generator=generator, device=device
-    )
+    q = _make_query((1, NUM_Q_HEADS, HEAD_DIM), generator=generator, device=device)
     packed_shape = (TOPK, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM // 2)
     scale_shape = (TOPK, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM // 16)
     k_cache, v_cache, k_scale, v_scale = _cache_tensors(
@@ -402,9 +412,9 @@ def _warm_compilation(device: torch.device) -> float:
     out = torch.empty((1, NUM_Q_HEADS, HEAD_DIM), dtype=torch.bfloat16, device=device)
     split_options = (1, 2) if KV_FORMAT == "q8kv4" else (None,)
     for num_kv_splits in split_options:
-        wrapper = _wrapper_type()()
+        wrapper = _make_wrapper()
         _plan(wrapper, topk, page_table, seq_lens, 1, num_kv_splits)
-        kwargs = {} if KV_FORMAT == "q8kv8" else {"kv_cache_sf": (k_scale, v_scale)}
+        kwargs = {} if KV_FORMAT != "q8kv4" else {"kv_cache_sf": (k_scale, v_scale)}
         wrapper.run(q, (k_cache, v_cache), out=out, **kwargs)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
@@ -487,7 +497,9 @@ def run_case(
     from types import SimpleNamespace
 
     reference_module = importlib.import_module(
-        f"tests.inference.msa_v1.attention.decode.{KV_FORMAT}.reference"
+        "tests.inference.msa_v1.attention.decode."
+        + ("q8kv8" if KV_FORMAT == "bf16" else KV_FORMAT)
+        + ".reference"
     )
     inputs = SimpleNamespace(
         q=storage.q,
@@ -504,7 +516,10 @@ def run_case(
     )
     reference = reference_module.decode_attention_reference(inputs)
     torch.testing.assert_close(
-        expected_output.float(), reference.float(), atol=0.05, rtol=0.05
+        expected_output.float(),
+        reference.float(),
+        atol=0.03 if KV_FORMAT == "bf16" else 0.05,
+        rtol=0.03 if KV_FORMAT == "bf16" else 0.05,
     )
     if KV_FORMAT == "q8kv8":
         cosine = torch.nn.functional.cosine_similarity(
@@ -546,7 +561,7 @@ def run_case(
     )
     useful_flops = 4 * NUM_Q_HEADS * HEAD_DIM * int(selected_tokens.sum())
     logical_kv_bytes = int(valid_pages.sum()) * NUM_KV_HEADS * KV_HEAD_PAGE_BYTES
-    logical_q_bytes = total_q * NUM_Q_HEADS * HEAD_DIM
+    logical_q_bytes = total_q * NUM_Q_HEADS * HEAD_DIM * storage.q.element_size()
     logical_o_bytes = total_q * NUM_Q_HEADS * HEAD_DIM * 2
     logical_bytes = logical_kv_bytes + logical_q_bytes + logical_o_bytes
     result = {
@@ -593,6 +608,7 @@ def run_case(
             useful_flops=useful_flops,
             logical_bytes=logical_bytes,
             latency_us=latency_us,
+            compute_dtype="bf16" if KV_FORMAT == "bf16" else "fp8",
         ),
     }
     del graph, wrappers, storage
@@ -689,12 +705,13 @@ def _resolve_slots(
 
 
 def main(kv_format: str = "q8kv4") -> None:
-    global KV_FORMAT, NUM_Q_HEADS, NUM_KV_HEADS, KV_HEAD_PAGE_BYTES
+    global KV_FORMAT, NUM_Q_HEADS, NUM_KV_HEADS, KV_HEAD_PAGE_BYTES, ENABLE_PDL
     KV_FORMAT = kv_format
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--num-q-heads", type=int, default=64)
     parser.add_argument("--num-kv-heads", type=int, default=4)
+    parser.add_argument("--disable-pdl", action="store_true")
     parser.add_argument("--suite", choices=("smoke", "full"), default="smoke")
     parser.add_argument("--batch", type=int, choices=BATCH_SIZES, action="append")
     parser.add_argument("--q-len", type=int, choices=Q_LENGTHS, action="append")
@@ -722,6 +739,9 @@ def main(kv_format: str = "q8kv4") -> None:
     parser.add_argument("--maximum-case-regression", type=float, default=0.05)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
+    if KV_FORMAT == "q8kv4" and args.disable_pdl:
+        parser.error("--disable-pdl applies only to BF16/Q8KV8")
+    ENABLE_PDL = not args.disable_pdl
     if not 0.0 <= args.maximum_case_regression <= 0.05:
         parser.error("--maximum-case-regression must be in [0, 0.05]")
     NUM_Q_HEADS, NUM_KV_HEADS = args.num_q_heads, args.num_kv_heads
@@ -732,17 +752,24 @@ def main(kv_format: str = "q8kv4") -> None:
         or NUM_Q_HEADS // NUM_KV_HEADS not in (8, 16)
     ):
         parser.error("head ratio must be 8 or 16")
-    if KV_FORMAT == "q8kv8" and args.num_kv_splits != "auto":
+    if KV_FORMAT != "q8kv4" and args.num_kv_splits != "auto":
         parser.error("--num-kv-splits applies only to Q8KV4")
     KV_HEAD_PAGE_BYTES = (
         2
         * PAGE_SIZE
-        * (HEAD_DIM if KV_FORMAT == "q8kv8" else HEAD_DIM // 2 + HEAD_DIM // 16)
+        * (
+            {
+                "bf16": 2 * HEAD_DIM,
+                "q8kv8": HEAD_DIM,
+                "q8kv4": HEAD_DIM // 2 + HEAD_DIM // 16,
+            }[KV_FORMAT]
+        )
     )
     import cutlass
+    from packaging.version import Version
 
-    if cutlass.__version__ != "4.5.2":
-        raise RuntimeError("formal benchmark requires CuTe DSL 4.5.2")
+    if Version(cutlass.__version__) < Version("4.5.2"):
+        raise RuntimeError("benchmark requires CuTe DSL >=4.5.2")
     if args.slots == 1 or args.slots < 0:
         parser.error("--slots must be zero (auto) or at least two")
     if args.slots > args.graph_calls:
@@ -790,9 +817,10 @@ def main(kv_format: str = "q8kv4") -> None:
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "kv_format": KV_FORMAT,
+            "enable_pdl": ENABLE_PDL if KV_FORMAT != "q8kv4" else None,
             "implementation": inspect.getfile(_wrapper_type()),
             "flashinfer": importlib.metadata.version("flashinfer-python")
-            if KV_FORMAT == "q8kv8"
+            if KV_FORMAT != "q8kv4"
             else None,
         },
         "protocol": {

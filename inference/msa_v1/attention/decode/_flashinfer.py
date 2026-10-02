@@ -1,4 +1,4 @@
-"""Private FlashInfer adapter for Q8KV8 sparse decode."""
+"""Private FlashInfer adapter for BF16 and Q8KV8 sparse decode."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def load_backend() -> FlashInferBackend:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
     except ImportError as error:
         raise RuntimeError(
-            "Q8KV8 decode requires an external FlashInfer installation with the "
+            "Sparse decode requires an external FlashInfer installation with the "
             "TRTLLM-GEN block-sparse backend"
         ) from error
 
@@ -56,7 +56,7 @@ def load_backend() -> FlashInferBackend:
     missing = sorted(required_parameters - actual_parameters)
     if missing:
         raise RuntimeError(
-            "installed FlashInfer does not provide the required Q8KV8 block-sparse "
+            "installed FlashInfer does not provide the required block-sparse "
             f"decode API parameters: {missing}"
         )
     logger.info("Loaded FlashInfer in %.3fs", time.perf_counter() - started)
@@ -262,6 +262,8 @@ def run_flashinfer(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     out: torch.Tensor,
+    *,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """Keep each query's sparse pages and causal length independent."""
     for name, tensor in (
@@ -287,7 +289,7 @@ def run_flashinfer(
         kv_layout="HND",
         backend="trtllm-gen",
         q_len_per_req=1,
-        enable_pdl=True,
+        enable_pdl=enable_pdl,
         multi_ctas_kv_counter_buffer=state.counter,
         enable_block_sparse_attention=True,
     )

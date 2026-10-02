@@ -68,7 +68,7 @@ def _make_inputs(
         * 0.25
     ).to(torch.float8_e4m3fn)
     if num_index_heads > 1:
-        # Keep head zero and K identical to the original single-head baseline baseline.
+        # Keep head zero and K identical to the original H=1 baseline.
         additional_q = (
             torch.randn(
                 (case.total_q, num_index_heads - 1, HEAD_DIM),
@@ -327,7 +327,7 @@ def run_case(
 
 
 def _compare_throughput(rows: list[dict], baseline: dict, num_index_heads: int) -> dict:
-    """Compare weighted useful work per E2E second against the original single-head baseline."""
+    """Compare weighted useful work per E2E second against the original H=1 implementation."""
     baseline_rows = {row["case_id"]: row for row in baseline["results"]}
     if set(baseline_rows) != {row["case_id"] for row in rows}:
         raise ValueError("baseline/candidate case mismatch")

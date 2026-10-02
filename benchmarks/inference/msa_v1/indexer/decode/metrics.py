@@ -8,7 +8,80 @@ MINIMUM_MBU_RATIO = 0.99
 MINIMUM_Q8KV4_MULTIHEAD_MBU_RATIO = 0.90
 
 
-def necessary_bytes(lengths, heads, page_bytes, *, query_length=8):
+def compare_bf16_mbu(candidate, baseline):
+    """Compare BF16 against Q8KV8 at identical local head and query counts."""
+    if candidate["precision"] != "bf16" or baseline["precision"] != "q8kv8":
+        raise ValueError("BF16 acceptance requires a Q8KV8 baseline")
+    for key in ("protocol", "device", "device_uuid", "dsl_version", "num_index_heads"):
+        if candidate[key] != baseline[key]:
+            raise ValueError(f"baseline/candidate {key} mismatch")
+    protocol = candidate["protocol"]
+    counts = {"full": 28, "low-latency": 12}
+    if not protocol["formal"] or protocol["suite"] not in counts:
+        raise ValueError(
+            "acceptance requires an unfiltered production or low-latency suite"
+        )
+    for key, value in (
+        ("warmup_replays", 5),
+        ("timed_replays", 20),
+        ("cuda_graph_calls", 120),
+    ):
+        if protocol[key] != value:
+            raise ValueError(f"acceptance requires {key}={value}")
+    previous = {row["name"]: row for row in baseline["results"]}
+    rows = candidate["results"]
+    count = counts[protocol["suite"]]
+    if (
+        len(previous) != count
+        or len(rows) != count
+        or set(previous) != {r["name"] for r in rows}
+    ):
+        raise ValueError("acceptance requires identical complete case sets")
+    totals = [0.0, 0.0, 0.0, 0.0]
+    for row in rows:
+        old = previous[row["name"]]
+        if row["weight"] != old["weight"] or row["slots"] != old["slots"]:
+            raise ValueError("case weights and cold-cache slots must match")
+        for value in (row, old):
+            if not all(
+                math.isfinite(value[key])
+                for key in (
+                    "cv",
+                    "latency_us",
+                    "necessary_bytes",
+                    "weight",
+                    "reuse_distance_over_l2",
+                )
+            ):
+                raise ValueError("invalid measurement")
+            if (
+                not 0 <= value["cv"] <= 0.03
+                or value["reuse_distance_over_l2"] <= 2
+                or value["latency_us"] <= 0
+                or value["necessary_bytes"] <= 0
+                or value["weight"] < 0
+            ):
+                raise ValueError("invalid measurement")
+        weight = 1.0 if protocol["suite"] == "low-latency" else row["weight"]
+        if weight <= 0:
+            raise ValueError("production weights must be positive")
+        totals[0] += weight * row["necessary_bytes"]
+        totals[1] += weight * row["latency_us"]
+        totals[2] += weight * old["necessary_bytes"]
+        totals[3] += weight * old["latency_us"]
+    ratio = (totals[0] / totals[1]) / (totals[2] / totals[3])
+    return {
+        "passed": ratio >= 0.9,
+        "minimum_weighted_effective_mbu_ratio": 0.9,
+        "weighted_effective_mbu_ratio": ratio,
+        "weighted_latency_ratio": totals[1] / totals[3],
+        "weighting": "equal" if protocol["suite"] == "low-latency" else "production",
+    }
+
+
+def necessary_bytes(
+    lengths, heads, page_bytes, *, query_length=8, query_element_bytes=1
+):
     """Count shared K once per request; do not credit redundant kernel traffic."""
     local = (
         lengths[:, None].to(torch.int64) - query_length + torch.arange(query_length)
@@ -19,7 +92,7 @@ def necessary_bytes(lengths, heads, page_bytes, *, query_length=8):
     batch = lengths.numel()
     return (
         pages * page_bytes
-        + batch * query_length * heads * 128
+        + batch * query_length * heads * 128 * query_element_bytes
         + pages * 4
         + batch * 4
         + batch * query_length * heads * 4
@@ -41,7 +114,7 @@ def compare_mbu(candidate, baseline):
         raise ValueError("acceptance requires the same 28 cases")
     heads = candidate["num_index_heads"]
     if baseline["num_index_heads"] != 1:
-        raise ValueError("baseline must be original H=1")
+        raise ValueError("baseline must be the original H=1 implementation")
     totals = [0.0, 0.0, 0.0, 0.0]
     regressed = []
     for row in rows:

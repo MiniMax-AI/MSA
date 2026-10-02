@@ -119,8 +119,9 @@ def make_decode_attention_inputs(
     page_layout: str,
     num_q_heads: int = Q_HEADS,
     num_kv_heads: int = KV_HEADS,
+    dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> DecodeAttentionInputs:
-    """Materialize one shared case using native E4M3 Q/K/V payloads."""
+    """Materialize one shared case without changing its sparse metadata."""
 
     if seq_lens_cpu.dtype != torch.int32 or seq_lens_cpu.ndim != 1:
         raise ValueError("seq_lens_cpu must be a one-dimensional int32 tensor")
@@ -138,14 +139,24 @@ def make_decode_attention_inputs(
         physical_pages = max_pages + batch + 7
     else:
         raise ValueError(f"unsupported page layout: {page_layout}")
-    q = _make_finite_e4m3(
+
+    def make_payload(shape, *, generator, device):
+        if dtype == torch.bfloat16:
+            return torch.randn(
+                shape, generator=generator, device=device, dtype=torch.float32
+            ).to(dtype)
+        if dtype != torch.float8_e4m3fn:
+            raise ValueError("only BF16 and E4M3 payloads are supported")
+        return _make_finite_e4m3(shape, generator=generator, device=device)
+
+    q = make_payload(
         (batch * q_len_per_req, num_q_heads, HEAD_DIM),
         generator=generator,
         device=device,
     )
     cache_shape = (physical_pages, num_kv_heads, PAGE_SIZE, HEAD_DIM)
-    k_cache = _make_finite_e4m3(cache_shape, generator=generator, device=device)
-    v_cache = _make_finite_e4m3(cache_shape, generator=generator, device=device)
+    k_cache = make_payload(cache_shape, generator=generator, device=device)
+    v_cache = make_payload(cache_shape, generator=generator, device=device)
     page_table = _make_page_table(
         batch,
         max_pages,

@@ -21,7 +21,7 @@ _HEAD_DIM = 128
 _PHYSICAL_M_TILE = 256
 _K_TILE = 128
 _SM_SCALE = 1.0 / math.sqrt(_HEAD_DIM)
-M3_PAGED_DIRECT_SCORE_NUM_HEADS = (1, 4)
+M3_PAGED_DIRECT_SCORE_NUM_HEADS = (1, 2, 4)
 
 
 @dsl_user_op
@@ -65,7 +65,7 @@ class M3IndexerGemmSm100:
         if (q_stages, k_stages, acc_stages) != (1, 4, 4):
             raise ValueError("M3 K1 requires q/k/acc stages = 1/4/4")
         if num_index_heads not in M3_PAGED_DIRECT_SCORE_NUM_HEADS:
-            raise ValueError("M3 indexer requires one or four local index heads")
+            raise ValueError("M3 indexer requires 1, 2, or 4 local index heads")
 
         self.num_index_heads = num_index_heads
         if compute_capability not in {(10, 0), (10, 3)}:

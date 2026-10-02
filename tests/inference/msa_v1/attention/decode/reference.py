@@ -26,6 +26,8 @@ def sparse_decode_reference(
     group_size = q_heads // kv_heads
     rows = total_q * kv_heads
     q = inputs.q.reshape(rows, group_size, head_dim)
+    fp8_probability = inputs.q.dtype == torch.float8_e4m3fn
+    probability_scale = _P_SCALE if fp8_probability else 1.0
     topk = inputs.topk_indices.reshape(rows, -1)
     output = torch.empty_like(inputs.q, dtype=torch.bfloat16).reshape(
         rows, group_size, head_dim
@@ -81,11 +83,15 @@ def sparse_decode_reference(
                 safe_maxima = torch.where(torch.isfinite(new_maxima), new_maxima, 0.0)
                 correction = torch.exp(maxima - safe_maxima)
                 probability = (
-                    torch.exp(page_scores - safe_maxima[:, :, None]) * _P_SCALE
+                    torch.exp(page_scores - safe_maxima[:, :, None]) * probability_scale
                 )
-                probability_fp8 = probability.to(torch.float8_e4m3fn).float()
+                probability_for_pv = (
+                    probability.to(torch.float8_e4m3fn).float()
+                    if fp8_probability
+                    else probability
+                )
                 accumulator = accumulator * correction[:, :, None] + torch.bmm(
-                    probability_fp8, v[:, page]
+                    probability_for_pv, v[:, page]
                 )
                 denominator = denominator * correction + probability.sum(-1)
                 maxima = new_maxima

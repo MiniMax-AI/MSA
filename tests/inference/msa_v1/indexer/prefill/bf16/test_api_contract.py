@@ -24,7 +24,7 @@ def test_wrapper_is_the_only_public_entrypoint() -> None:
     )
 
 
-@pytest.mark.parametrize("num_index_heads", (1, 4))
+@pytest.mark.parametrize("num_index_heads", (1, 2, 4))
 def test_output_is_always_head_major_3d(num_index_heads: int) -> None:
     cu_seqlens = torch.tensor((0, 1), dtype=torch.int32, device="cuda")
     page_table = torch.zeros((1, 1), dtype=torch.int32, device="cuda")

@@ -1,13 +1,13 @@
-# 多 Head Q8KV8 Decode Indexer
+# Multi-head Q8KV8 Decode Indexer
 
-[English](README.en.md)
+[简体中文](README.zh-CN.md)
 
-## 功能
+## Purpose
 
-面向 SM100/SM103 的 paged decode indexer。Q/K 均使用 E4M3，输出每个 query 选中的 logical
-page indices，并保证包含 local page。接口不接收 `k_scale`。
+Paged decode indexer for SM100/SM103. Q/K use E4M3, and the output contains selected logical page
+indices for each query, including the local page. The API does not accept `k_scale`.
 
-## 公开接口
+## Public API
 
 ```python
 from inference.msa_v1.indexer.decode.q8kv8 import (
@@ -19,20 +19,23 @@ wrapper.plan(page_table, seq_lens, num_index_heads=4, query_length=q.shape[1])
 topk_indices = wrapper.run(q, paged_k_cache)
 ```
 
-可通过 `workspace_size(batch_size)` 查询 workspace 大小并向 wrapper 传入外部 workspace。
-查询时应将当前 CUDA device 设为目标 device；所需容量包含该设备的调度 metadata。
-升级后请重新查询容量，不要复用旧版本的固定字节数。长度或 page mapping 改变后必须重新 `plan()`。
-CUDA Graph 模式还需要在构造 wrapper 时传入地址稳定的 `page_table_buffer` 和
-`seq_lens_buffer`，并向 `run()` 传入预分配输出。
+Use `workspace_size(batch_size)` to query the required workspace size and optionally provide an
+external workspace. Set the current CUDA device to the target device before querying; capacity
+includes that device's scheduling metadata. Query again after upgrading instead of reusing an old
+fixed byte count. Without an explicit shared plan, call `plan()` again when lengths or page
+mappings change. Shared-plan updates are described below.
+CUDA Graph mode also requires address-stable
+`page_table_buffer` and `seq_lens_buffer` tensors at wrapper construction and a preallocated
+output passed to `run()`.
 
-### 共享 plan 与 Graph 更新
+### Shared plan and Graph updates
 
-`query_length` 接受 1–16 的整数，默认 8，同一 batch 内 Q 相同。有效长度必须满足
-`Q <= seq_lens[b] <= max_pages * 128`。
+`query_length` accepts integers from 1 through 16 and defaults to 8. All requests in a batch
+use the same Q. Lengths must satisfy `Q <= seq_lens[b] <= max_pages * 128`.
 
-改变 Q 或 H 可能触发新的编译；请在 Graph capture 前预热需要的配置。
+Changing Q or H may trigger compilation; warm up the required configurations before Graph capture.
 
-从 `inference.msa_v1.indexer.decode` 导入 `BatchDecodeIndexerPlan`，在 capture 外创建：
+Import `BatchDecodeIndexerPlan` from `inference.msa_v1.indexer.decode` and construct it outside capture:
 
 ```python
 from inference.msa_v1.indexer.decode import BatchDecodeIndexerPlan
@@ -46,37 +49,42 @@ wrapper.plan(
 shared_plan.update()
 ```
 
-构造 plan、绑定 wrapper 和首次 `run()` 编译必须在 capture 外完成。
-`shared_plan.update()` 可以捕获进 CUDA Graph，随后调用所有使用该 plan 的层的 `run()`。
-更改同地址 `seq_lens` 后，replay 会刷新 plan；各层可以使用不同 page table，
-但共享时必须具有相同的 B、Q、H、page capacity、长度源地址和 device。
-共享 plan 的 wrapper 不应额外传入 `workspace_buffer`。
+Construct the plan, bind wrappers, and compile the first `run()` outside capture.
+Capture `shared_plan.update()` followed by every consuming layer's `run()` in a CUDA Graph.
+Replay refreshes the plan after in-place changes to `seq_lens`. Layers may use different page tables,
+but must share B, Q, H, page capacity, source-length address, and device.
+Do not additionally pass `workspace_buffer` to a wrapper using a shared plan.
+In shared mode, update a bound page table in place before consumers run; changing only its
+contents does not require rebinding. Rebind outside capture when metadata addresses or shapes
+change. Create a matching new plan when B, Q, H, or page capacity changes, and recapture Graphs
+that used the previous bindings.
 
-首次消费前必须调用 `update()`。长度改变后，每一步更新一次；不能跨 step 复用旧结果。
-跨 stream 使用时，由调用方用 event 保证 update 完成后再消费，且全部消费者完成后才能再次更新。
-plan 与 wrapper 必须在相关 Graph 的生命周期内保持存活。Graph 内不允许重新绑定或分配。
+Call `update()` before the first consumer and once per step when lengths change; do not reuse stale
+results across steps. For multiple streams, use events to order consumers after the update and the
+next update after all consumers. Keep plans and wrappers alive for the lifetime of their Graphs.
+Rebinding and allocation are not supported inside capture.
 
-## 数据契约
+## Data contract
 
-- `q`：`[B, Q, H, 128]`，E4M3。
-- `paged_k_cache`：`[physical_pages, 128, 128]`，E4M3。
-- `page_table`：`[B, max_pages]`，CUDA `torch.int32` logical-to-physical page mapping。
-- `seq_lens`：`[B]`，CUDA `torch.int32`，包含当前 Q-token query chunk。
-- 输出：`[H, B * Q, 16]`，`torch.int32` logical page indices。有效项位于前缀，最后
-  一个有效项为 local page。
+- `q`: `[B, Q, H, 128]`, E4M3.
+- `paged_k_cache`: `[physical_pages, 128, 128]`, E4M3.
+- `page_table`: `[B, max_pages]`, a CUDA `torch.int32` logical-to-physical page mapping.
+- `seq_lens`: `[B]`, CUDA `torch.int32`, including the current Q-token query chunk.
+- Output: `[H, B * Q, 16]`, `torch.int32` logical page indices. Valid entries form a prefix, and
+  the final valid entry is the local page.
 
-所有输入 tensor 必须在同一 CUDA 设备上且 contiguous。每个历史 page 的分数为该页 token 与对应 Q head 点积的最大值；各 head 独立选择历史候选，输出不足 16 项的位置填 `-1`。
+All input tensors must be contiguous and on the same CUDA device. A historical page score is the maximum dot product between its tokens and the corresponding Q head. Each head selects historical candidates independently; unused output slots are filled with `-1`.
 
-## 运行约束
+## Runtime requirements
 
-- 对 query `q_idx`，local page 为 `(seq_lens[b] - Q + q_idx) // 128`。
-- 历史 page 的物理映射允许乱序和不连续。
-- `plan()` 必须在 CUDA Graph capture 外调用。
-- 支持 B200/SM100 和 B300/SM103，并要求 `nvidia-cutlass-dsl[cu13]>=4.5.2`。
+- For query `q_idx`, the local page is `(seq_lens[b] - Q + q_idx) // 128`.
+- Historical pages may map to scattered and unordered physical pages.
+- Call `plan()` outside CUDA Graph capture.
+- B200/SM100 and B300/SM103 are supported, and `nvidia-cutlass-dsl[cu13]>=4.5.2` is required.
 
-`num_index_heads` 只接受 1/2/4；默认 1。各 head 独立选择历史 page，共享单 head K。H=1 也必须传入四维 Q，并返回三维输出。输出 `out` 必须为相同设备上 contiguous int32，shape 为 `[H,B*Q,16]`。
+`num_index_heads` accepts only 1/2/4; the default is 1. Heads independently select historical pages and share the single-head K cache. H=1 also requires four-dimensional Q and returns a three-dimensional output. Preallocated `out` must be contiguous int32 on the same device with shape `[H,B*Q,16]`.
 
-## 验证命令
+## Validation and performance testing
 
 ```bash
 MINIMAX_INFERENCE_TEST_SUITE=smoke python -m pytest tests/inference/msa_v1/indexer/decode/q8kv8
@@ -84,33 +92,35 @@ MINIMAX_INFERENCE_TEST_SUITE=full python -m pytest tests/inference/msa_v1/indexe
 python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark --suite full --num-index-heads 4 --verify --out result.json
 ```
 
-### 低延迟 benchmark
+### Low-latency benchmark
 
-`--suite low-latency` 独立覆盖 batch={1,2,4} × KV length={1000,4000,8000,32000}，
-共 12 个 case，默认 Q=8，可通过 `--query-length` 指定 Q。batch=1 使用准确的标称长度；batch=2/4 使用真实变长
-metadata，平均长度等于标称值。两者均走相同的公开接口。
+`--suite low-latency` independently covers batch={1,2,4} × KV length={1000,4000,8000,32000}:
+12 cases with Q=8 by default, configurable through `--query-length`. Batch=1 uses the exact nominal length; batch=2/4 use
+true variable-length metadata with the nominal mean. Both use the same public interface.
 
-该组单独报告，不并入 28-case `full` 加权结果。`--baseline` 比较相同 H、设备、
-DSL 版本及计时协议的结果。采用 disjoint-page cold-cache（复用距离≥2×L2）、
-5 次 warmup、20 次 replay、每 Graph 120 calls；`--verify` 全量校验 scores 和 TopK。
+This suite is separate from the 28-case `full` production-weighted statistics.
+`--baseline` compares results with matching H, device, DSL version, and timing protocol.
+The suite uses disjoint-page cold-cache rotation (reuse distance≥2×L2), 5 warmups,
+20 replays, and 120 calls per Graph. `--verify` checks all scores and TopK outputs.
 
 ```bash
 python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark --suite low-latency --num-index-heads 1 --verify --out low_latency.json
 python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark --suite low-latency --num-index-heads 1 --verify --baseline low_latency.json --out candidate.json
 ```
 
-`--query-length` 可指定 Q=1–16；不同 Q 的结果分别报告。
-共享 plan 的测试与分阶段计时：
+Use `--query-length` to select Q=1–16. Results for different Q values are reported separately.
+Shared-plan tests and separate timing scopes:
 
 ```bash
 python -m pytest tests/inference/msa_v1/indexer/decode/test_shared_plan.py
 python -m benchmarks.inference.msa_v1.indexer.decode.plan --precision q8kv8 --num-index-heads 4 --query-length 8 --layers 1 --out plan.json
 ```
 
-共享 plan benchmark 覆盖同一组 12 个 low-latency case，分别记录 host+device update、
-Graph update、Graph run 和 Graph update+run。`--layers` 是显式指定的算子重复层数，
-不代表某个模型配置；Graph 延迟对应这些层的一次整体调用，不除以层数。
-独立 update 使用 metadata 热缓存计时；run 和 update+run 使用 disjoint K rotation，
-K 的复用距离至少为 2×L2。两种缓存条件分别报告。
-host+device 计时若三次尝试后仍超过 CV=3%，结果会标记为无效，命令返回失败；
-独立有效的 Graph 计时仍保存在输出文件中。
+The shared-plan benchmark covers the same 12 low-latency cases and records host+device update,
+Graph update, Graph run, and Graph update+run separately. `--layers` explicitly selects an operator
+layer count, not a model configuration. Graph latency covers one complete invocation of these layers
+and is not divided by the layer count.
+Standalone update timing uses hot metadata caches. Run and update+run use disjoint K rotation
+with a K reuse distance of at least 2×L2. These cache conditions are reported separately.
+If host+device timing still exceeds CV=3% after three attempts, it is marked invalid and
+the command fails. Independently valid Graph timings remain in the output file.

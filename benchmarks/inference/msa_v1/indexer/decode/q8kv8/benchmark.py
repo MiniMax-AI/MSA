@@ -19,6 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from benchmarks.inference.msa_v1.hardware import roofline_metrics
 from benchmarks.inference.msa_v1.indexer.decode.metrics import (
+    compare_bf16_mbu,
     compare_low_latency,
     compare_mbu,
     necessary_bytes,
@@ -51,6 +52,7 @@ def _make_slot(
     seed: int,
     num_index_heads: int = 1,
     query_length: int = 8,
+    dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> tuple[torch.Tensor, ...]:
     max_pages = (int(lengths_cpu.max()) + PAGE_SIZE - 1) // PAGE_SIZE
     physical_pages = case.batch * max_pages
@@ -64,7 +66,7 @@ def _make_slot(
             device=device,
         )
         * 0.5
-    ).to(torch.float8_e4m3fn)
+    ).to(dtype)
     k_cache = (
         torch.randn(
             physical_pages,
@@ -74,7 +76,7 @@ def _make_slot(
             device=device,
         )
         * 0.5
-    ).to(torch.float8_e4m3fn)
+    ).to(dtype)
     physical_indices = torch.arange(
         physical_pages,
         dtype=torch.int32,
@@ -194,7 +196,18 @@ def run_case(
     num_index_heads: int = 1,
     query_length: int = 8,
     verify: bool = False,
+    precision: str = "q8kv8",
 ) -> dict[str, object]:
+    dtype = torch.bfloat16 if precision == "bf16" else torch.float8_e4m3fn
+    element_bytes = torch.empty((), dtype=dtype).element_size()
+    page_bytes = PAGE_BYTES * element_bytes
+    wrapper_type = (
+        BatchDecodeIndexerWithPagedKVCacheWrapper
+        if precision == "q8kv8"
+        else importlib.import_module(
+            f"inference.msa_v1.indexer.decode.{precision}"
+        ).BatchDecodeIndexerWithPagedKVCacheWrapper
+    )
     device = torch.device("cuda")
     properties = torch.cuda.get_device_properties(device)
     lengths_cpu = make_seq_lens(case)
@@ -219,12 +232,12 @@ def run_case(
     )
     valid_scores = int(query_local_pages.sum())
     read_bytes_per_call = (
-        valid_pages * PAGE_BYTES
-        + case.batch * query_length * HEAD_DIM
+        valid_pages * page_bytes
+        + case.batch * query_length * HEAD_DIM * num_index_heads * element_bytes
         + valid_pages * 4
         + case.batch * 4
     )
-    reuse_distance_bytes = (slots_count - 1) * valid_pages * PAGE_BYTES
+    reuse_distance_bytes = (slots_count - 1) * valid_pages * page_bytes
     l2_bytes = properties.L2_cache_size
     if reuse_distance_bytes <= 2 * l2_bytes:
         raise RuntimeError(
@@ -240,11 +253,12 @@ def run_case(
             seed=case.seed * 100 + slot,
             num_index_heads=num_index_heads,
             query_length=query_length,
+            dtype=dtype,
         )
         for slot in range(slots_count)
     ]
     wrappers = [
-        BatchDecodeIndexerWithPagedKVCacheWrapper(
+        wrapper_type(
             use_cuda_graph=True,
             page_table_buffer=torch.empty_like(slot[2]),
             seq_lens_buffer=torch.empty_like(slot[3]),
@@ -295,7 +309,11 @@ def run_case(
     flops = 2 * num_index_heads * valid_scores * PAGE_SIZE * HEAD_DIM
     output_bytes = num_index_heads * case.batch * query_length * 16 * 4
     logical_bytes = necessary_bytes(
-        lengths_cpu, num_index_heads, PAGE_BYTES, query_length=query_length
+        lengths_cpu,
+        num_index_heads,
+        page_bytes,
+        query_length=query_length,
+        query_element_bytes=element_bytes,
     )
     effective_tb_s = logical_bytes / latency_us / 1.0e6
     if verify:
@@ -308,6 +326,8 @@ def run_case(
 
         q, k, table, lengths, output = slots[0]
         expected = indexer_gemm_reference(q, k, table, lengths)
+        if precision == "bf16":
+            expected = expected / (HEAD_DIM**0.5)
         local = (
             lengths[:, None] - query_length + torch.arange(query_length, device=device)
         ) // 128
@@ -362,11 +382,12 @@ def run_case(
             useful_flops=flops,
             logical_bytes=logical_bytes,
             latency_us=latency_us,
+            compute_dtype="bf16" if precision == "bf16" else "fp8",
         ),
     }
 
 
-def main() -> None:
+def main(*, precision: str = "q8kv8") -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--suite", choices=("smoke", "full", "low-latency"), default="smoke"
@@ -432,31 +453,34 @@ def main() -> None:
             num_index_heads=args.num_index_heads,
             query_length=args.query_length,
             verify=args.verify,
+            precision=precision,
         )
         result["suite"] = args.suite
         results.append(result)
         print(json.dumps(result, sort_keys=True), flush=True)
     formal = args.suite == "full" and not args.batch and not args.seq_len
     aggregate = None
-    if formal:
-        total_weight = sum(case.weight for case in cases)
+    if formal or (args.suite == "low-latency" and not args.batch and not args.seq_len):
+        weights = [1 if args.suite == "low-latency" else case.weight for case in cases]
+        total_weight = sum(weights)
         weighted_latency = (
             sum(
-                case.weight * float(result["latency_us"])
-                for case, result in zip(cases, results, strict=True)
+                weight * float(result["latency_us"])
+                for weight, result in zip(weights, results, strict=True)
             )
             / total_weight
         )
         aggregate = {
             "total_weight": total_weight,
+            "weighting": "equal" if args.suite == "low-latency" else "production",
             "weighted_mean_e2e_latency_us": weighted_latency,
             "weighted_effective_mbu": sum(
-                case.weight * row["necessary_bytes"]
-                for case, row in zip(cases, results, strict=True)
+                weight * row["necessary_bytes"]
+                for weight, row in zip(weights, results, strict=True)
             )
             / sum(
-                case.weight * row["latency_us"]
-                for case, row in zip(cases, results, strict=True)
+                weight * row["latency_us"]
+                for weight, row in zip(weights, results, strict=True)
             )
             / 1e6
             / results[0]["peak_hbm_tb_s"],
@@ -464,7 +488,7 @@ def main() -> None:
     payload = {
         "schema_version": 2,
         "num_index_heads": args.num_index_heads,
-        "precision": "q8kv8",
+        "precision": precision,
         "device_uuid": str(torch.cuda.get_device_properties("cuda").uuid),
         "device": torch.cuda.get_device_properties("cuda").name,
         "dsl_version": importlib.metadata.version("nvidia-cutlass-dsl"),
@@ -494,6 +518,8 @@ def main() -> None:
     if args.baseline is not None:
         baseline_payload = json.loads(args.baseline.read_text())
         comparator = compare_low_latency if args.suite == "low-latency" else compare_mbu
+        if precision == "bf16":
+            comparator = compare_bf16_mbu
         payload["acceptance"] = comparator(payload, baseline_payload)
         acceptance_failed = not payload["acceptance"]["passed"]
     if args.out is not None:

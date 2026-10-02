@@ -1,32 +1,94 @@
 # BF16 Paged Prefill Indexer
 
-[English](README.en.md)
+[简体中文](README.zh-CN.md)
 
-## 功能
+## Purpose
 
-面向 SM100/SM103 的 BF16 paged prefill indexer。它为每个 query 选择 logical pages，
-并保证结果包含 local page。
+BF16 paged prefill indexer for SM100 and SM103. It selects logical pages for each query and
+guarantees that the result includes the local page.
 
-## 公开接口
+## Public API
 
-`BatchPrefillIndexerWithPagedKVCacheWrapper` 提供统一的 `plan()` / `run()` 生命周期。
-`plan()` 接收 varlen 与 page-table metadata，`run()` 接收当前层的 BF16 Q 和 paged BF16
-K cache。调用方可以向 `run()` 传入预分配输出。
+```python
+import torch
+from inference.msa_v1.indexer.prefill.bf16 import (
+    BatchPrefillIndexerWithPagedKVCacheWrapper,
+)
 
-## 数据契约
+q = torch.randn(5, 2, 128, device="cuda", dtype=torch.bfloat16)
+k_cache = torch.randn(4, 1, 128, 128, device="cuda", dtype=torch.bfloat16)
+cu_seqlens_q = torch.tensor([0, 2, 5], device="cuda", dtype=torch.int32)
+cu_seqlens_k = torch.tensor([0, 128, 384], device="cuda", dtype=torch.int32)
+page_table = torch.tensor([[2, 0], [3, 1]], device="cuda", dtype=torch.int32)
+out = torch.empty(2, 5, 16, device="cuda", dtype=torch.int32)
+wrapper = BatchPrefillIndexerWithPagedKVCacheWrapper()
+wrapper.plan(
+    cu_seqlens_q, cu_seqlens_k, page_table,
+    total_q=5, max_seqlen_q=3, max_seqlen_k=256, num_index_heads=2,
+)
+indices = wrapper.run(q, k_cache, out=out)
+assert indices.shape == (2, 5, 16)
+```
 
-- Q 和 K 为 BF16。
-- 支持 1 或 4 个本地 index head。
-- 输出为 `[num_index_heads, total_q, 16]`，内容为 logical page ID。有效项位于前缀，
-  最后一个有效项必须是当前 query 的 local page。
-- K cache 使用单个 KV head、128 的 head dimension 和 128 的 page size。
-- Varlen metadata 和 page table 使用 CUDA `torch.int32`。
+`BatchPrefillIndexerWithPagedKVCacheWrapper` provides a `plan()` / `run()` lifecycle. `plan()`
+accepts varlen and page-table metadata, and `run()` accepts BF16 Q and paged BF16 K tensors for
+the current layer. Callers may pass a preallocated output to `run()`.
 
-## 运行约束
+## Data contract
 
-- 仅支持 SM100/SM103 和 paged K cache。
-- 要求 `nvidia-cutlass-dsl[cu13]>=4.5.2`；升级 DSL 后需要重新构建编译缓存。
-- Logical page 可以离散、无序。
-- `plan()` 必须在 CUDA Graph capture 外调用；首次 `run()` 也必须在 capture 外完成。
-- Q/K、metadata、workspace 和输出必须位于同一 CUDA device，并满足接口校验的 shape、
-  stride 和 alignment。
+- Q and K use BF16.
+- One, two, or four local index heads are supported.
+- Output shape is `[num_index_heads, total_q, 16]` and values are logical page IDs. Valid entries
+  form a prefix, and the final valid entry must be the current query's local page.
+- The K cache uses one KV head, head dimension 128, and page size 128.
+- Varlen metadata and the page table use CUDA `torch.int32`.
+
+| Argument | Shape | Dtype |
+| --- | --- | --- |
+| `q` | `[total_q,H,128]` | `torch.bfloat16` |
+| `paged_k_cache` | `[physical_pages,1,128,128]` | `torch.bfloat16` |
+| `cu_seqlens_q`, `cu_seqlens_k` | `[B+1]` | `torch.int32` |
+| `page_table` | `[B,max_pages]` | `torch.int32` |
+| `out` | `[H,total_q,16]` | `torch.int32` |
+
+All inputs and outputs must be contiguous, 16-byte aligned, and on the same CUDA device.
+Cumulative lengths start at zero and are nondecreasing; the final Q offset equals `total_q`,
+and each request's KV length must cover its query length. `max_seqlen_q`/`max_seqlen_k` are
+host upper bounds on per-request lengths. The KV bound is at most 8192×128, and the page table
+must cover that bound. `num_index_heads` defaults to 4 and supports H=1/2/4.
+The valid page count follows the bottom-right causal position:
+
+```text
+query_position = kv_length - query_length + query_index
+local_page = query_position // 128
+```
+
+A historical page's score is the maximum FP32 Q/K dot product across its tokens, scaled by
+`1/sqrt(128)`. TopK uses approximate 16-bit quantized ordering; near-tied scores need not match
+exact FP32 sorting.
+
+## Runtime requirements
+
+- Only SM100/SM103 and paged K caches are supported.
+- Requires `nvidia-cutlass-dsl[cu13]>=4.5.2`; rebuild compiled caches after upgrading DSL.
+- Logical pages may be scattered and unordered.
+- Call `plan()` outside CUDA Graph capture and complete the first `run()` before capture.
+- Q/K, metadata, workspace, and output must reside on the same CUDA device and satisfy the
+  validated shape, stride, and alignment requirements.
+
+Each wrapper owns its writable workspace and default output; later `run()` calls overwrite
+the default output. Use separate wrappers for concurrent streams and events to order metadata
+updates before consumers. With metadata addresses, shapes, total Q, and capacities unchanged,
+call `replan()` outside capture after in-place length updates; finish in-place page mapping
+updates before consumers run. Changes to addresses, shapes, head counts, or capacities require
+`plan()` and a new capture. Keep the wrapper, inputs, and outputs alive while using its Graph.
+
+## Validation commands
+
+```bash
+MINIMAX_INFERENCE_TEST_SUITE=smoke python -m pytest tests/inference/msa_v1/indexer/prefill/bf16
+python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark --suite full --num-index-heads 2 --verify --out prefill_bf16.json
+```
+
+The benchmark measures the public `run()` path inside CUDA Graphs. `--verify` checks all
+valid historical scores and TopK outputs against an independent reference outside timing.

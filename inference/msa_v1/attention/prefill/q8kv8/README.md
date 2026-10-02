@@ -1,17 +1,19 @@
 # Q8KV8 Prefill Attention
 
-[English](README.en.md)
+[简体中文](README.zh-CN.md)
 
-## 功能
+## Purpose
 
-面向 SM100/SM103/SM107 的 paged sparse causal prefill attention。Q/K/V 均使用 E4M3，输出为
-BF16，支持 varlen chunk prefill，且不使用 K/V scale。
+Paged sparse causal prefill attention for SM100, SM103, and SM107. Q/K/V use E4M3, the output uses
+BF16, varlen chunk prefill is supported, and no K/V scales are used.
 
-Attention 概率按 `E4M3(P × 448)` 量化，并在归一化时补偿该缩放；返回的 LSE
-保持原始 logits 的自然对数语义。概率量化语义与 decode 对齐，但不承诺最终输出跨路径逐位一致。
-使用硬件 exp2；与 decode 的对齐范围为缩放和补偿语义，不要求 P 逐位一致。
+Attention probabilities use `E4M3(P * 448)` with compensation during normalization.
+Returned LSE retains the natural-log semantics of the original logits. Probability
+quantization follows decode semantics; final outputs are not guaranteed bitwise identical across paths.
+Hardware exp2 is used. Alignment with decode covers scaling
+and compensation semantics, without requiring bitwise-identical P.
 
-## 公开接口
+## Public API
 
 ```python
 from inference.msa_v1.attention.prefill.q8kv8 import (
@@ -34,29 +36,33 @@ wrapper.plan(
 out, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
 ```
 
-调用方可以向 `run()` 传入预分配的 `out` 和 `lse`。
+Callers may pass preallocated `out` and `lse` tensors to `run()`.
 
-构造 wrapper 时可选传入 `enable_fp16_softmax` 和 `enable_2x_fp8`。
-默认 `None` 按实际设备选择：仅在 Rubin FP8 路径启用；`False` 关闭对应优化。
-在不支持的架构或输入类型上显式设置 `True` 会报错。
+The wrapper constructor optionally accepts `enable_fp16_softmax` and `enable_2x_fp8`.
+The default `None` enables these only for Rubin FP8 inputs on the actual device;
+`False` disables the corresponding optimization. Explicit `True` raises an error
+on unsupported architectures or input types.
 
-## 数据契约
+## Data contract
 
-- `q`：`[total_q, Hq, 128]`，E4M3。
-- `k_cache` / `v_cache`：`[physical_pages, Hkv, 128, 128]`，E4M3。
-- `topk_indices`：`[Hkv, total_q, 16]`，logical page ID。有效项位于前缀，无效后缀
-  为 `-1`；历史页允许离散无序，local page 必须是最后一个有效项。
-- `cu_seqlens_q` / `cu_seqlens_k`：`[B + 1]`，CUDA `torch.int32`。
-- `page_table`：`[B, max_pages]`，logical-to-physical page mapping。
-- `out`：`[total_q, Hq, 128]`，BF16；`lse`：`[total_q, Hq]`，FP32。
+- `q`: `[total_q, Hq, 128]`, E4M3.
+- `k_cache` / `v_cache`: `[physical_pages, Hkv, 128, 128]`, E4M3.
+- `topk_indices`: `[Hkv, total_q, 16]` logical page IDs. Valid entries form a prefix followed
+  by `-1`; historical pages may be scattered and unordered, and the local page must be the final
+  valid entry.
+- `cu_seqlens_q` / `cu_seqlens_k`: `[B + 1]`, CUDA `torch.int32`.
+- `page_table`: `[B, max_pages]`, mapping logical pages to physical pages.
+- `out`: `[total_q, Hq, 128]`, BF16; `lse`: `[total_q, Hq]`, FP32.
 
-## 运行约束
+## Runtime requirements
 
-- 实现按输入 tensor 所在设备选择；SM107 使用 Rubin 路径。FP8 Rubin 路径需要提供
-  `cutlass.utils.rubin_helpers` 的 CuTe DSL 版本及支持 SM107 的 CUDA 工具链。
+- The input tensor device selects the implementation; SM107 uses the Rubin path.
+  The FP8 Rubin path requires a CuTe DSL version providing `cutlass.utils.rubin_helpers`
+  and a CUDA toolchain supporting SM107.
 
 
-- 仅支持 paged KV 和 causal attention；chunk prefill 使用 bottom-right causal 对齐。
-- `Hq / Hkv` 支持 1、2、4、8 或 16；默认 `Hq=64`、`Hkv=4`。
-- `cu_seqlens_k` 是 KV 长度的唯一来源；接口不接收 K/V scale。
-- `plan()` 必须在 CUDA Graph capture 外调用；capture 时应预分配 `out` 和 `lse`。
+- Only paged KV and causal attention are supported; chunk prefill uses bottom-right causal
+  alignment.
+- `Hq / Hkv` may be 1, 2, 4, 8, or 16; the defaults are `Hq=64` and `Hkv=4`.
+- `cu_seqlens_k` is the only source of KV lengths; the API does not accept K/V scales.
+- Call `plan()` outside CUDA Graph capture and preallocate `out` and `lse` during capture.

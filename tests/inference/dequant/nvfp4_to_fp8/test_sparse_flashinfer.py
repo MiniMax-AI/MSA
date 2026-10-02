@@ -7,7 +7,7 @@ import torch
 
 from inference.dequant import SparsePagedNvfp4ToFp8Wrapper
 from inference.dequant.nvfp4_to_fp8 import jit
-from inference.msa_v1.attention.decode.q8kv8._flashinfer import load_backend
+from inference.msa_v1.attention.decode._flashinfer import load_backend
 from tests.inference.msa_v1.attention.decode.q8kv4.real_cases import (
     make_decode_attention_inputs,
 )

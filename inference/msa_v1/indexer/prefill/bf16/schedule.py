@@ -25,8 +25,8 @@ class M3IndexerScheduleSm100:
     """Expand packed Q fragments into fixed-size indexer tasks."""
 
     def __init__(self, *, q_per_cluster: int = 64) -> None:
-        if q_per_cluster not in (64, 256):
-            raise ValueError("M3 indexer requires 64 or 256 queries per cluster")
+        if q_per_cluster not in (64, 128, 256):
+            raise ValueError("M3 indexer requires 64, 128, or 256 queries per cluster")
         self.q_per_cluster = q_per_cluster
         self.threads_per_cta = cute.arch.WARP_SIZE
 

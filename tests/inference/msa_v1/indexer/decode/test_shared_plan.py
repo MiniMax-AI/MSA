@@ -116,7 +116,7 @@ def test_shared_plan_replay_and_cache():
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("kind", ("q8kv8", "q8kv4"))
+@pytest.mark.parametrize("kind", ("q8kv8", "q8kv4", "bf16"))
 @pytest.mark.parametrize("heads", (1, 2, 4))
 def test_shared_plan_query_lengths(kind, heads):
     """Check all rows, padding, local-page boundaries and query-length cache reuse."""
@@ -185,12 +185,16 @@ def test_shared_plan_query_lengths(kind, heads):
                 (local + 1).reshape(-1).repeat(heads).cpu().numpy(),
                 output.reshape(-1, 16).cpu().numpy(),
             )
-        if kind == "q8kv8":
-            current_keys = set(api._COMPILE_CACHE)
+        if kind != "q8kv4":
+            current_keys = set(
+                importlib.import_module(
+                    "inference.msa_v1.indexer.decode._interface"
+                )._COMPILE_CACHE
+            )
         else:
             jit = importlib.import_module("inference.msa_v1.indexer.decode.q8kv4.jit")
             current_keys = jit._load_extension_for_arch.cache_info().misses
-        granularity = 8 if kind == "q8kv8" else 16
+        granularity = 8 if kind != "q8kv4" else 16
         query_columns = (
             (query_length * heads + granularity - 1) // granularity
         ) * granularity
@@ -201,7 +205,10 @@ def test_shared_plan_query_lengths(kind, heads):
 
 
 @pytest.mark.gpu
-def test_shared_plan_cross_precision_lifetime():
+@pytest.mark.parametrize(
+    "kinds", (("q8kv8", "q8kv4"), ("bf16", "q8kv8"), ("bf16", "q8kv4"))
+)
+def test_shared_plan_cross_precision_lifetime(kinds):
     """Two precision consumers own outputs while sharing only read-only metadata."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
@@ -211,7 +218,7 @@ def test_shared_plan_cross_precision_lifetime():
     )
     workspace_ref = weakref.ref(plan._workspace)
     consumers = []
-    for kind in ("q8kv8", "q8kv4"):
+    for kind in kinds:
         api = importlib.import_module(
             f"inference.msa_v1.indexer.decode.{kind}.interface"
         )
@@ -252,7 +259,7 @@ def test_shared_plan_cross_precision_lifetime():
         _synchronize(stream)
     for original, (wrapper, q, k, kwargs) in zip(expected, consumers, strict=True):
         assert torch.equal(original, wrapper._topk_indices)
-        kind = "q8kv4" if kwargs else "q8kv8"
+        kind = "q8kv4" if kwargs else ("bf16" if q.dtype == torch.bfloat16 else "q8kv8")
         ref = importlib.import_module(
             f"tests.inference.msa_v1.indexer.decode.{kind}.reference"
         )

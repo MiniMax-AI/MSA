@@ -49,7 +49,7 @@ def run_case(case, *, precision, heads, query_length, layers):
                 num_index_heads=heads,
                 query_length=query_length,
             )
-            if precision == "q8kv8":
+            if precision != "q8kv4":
                 q, k, table, _, output = values
                 kwargs = {}
             else:
@@ -122,7 +122,7 @@ def run_case(case, *, precision, heads, query_length, layers):
 
     for wrapper, q, k, kwargs, output in consumers[0]:
         proxy = wrapper._proxy_score
-        if precision == "q8kv8":
+        if precision != "q8kv4":
             expected = reference.indexer_gemm_reference(
                 q, k, proxy._page_table, proxy._seq_lens
             )
@@ -156,7 +156,9 @@ def run_case(case, *, precision, heads, query_length, layers):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--precision", choices=("q8kv8", "q8kv4"), required=True)
+    parser.add_argument(
+        "--precision", choices=("q8kv8", "q8kv4", "bf16"), required=True
+    )
     parser.add_argument("--num-index-heads", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--query-length", type=int, choices=range(1, 17), default=8)
     parser.add_argument("--layers", type=int, default=1)

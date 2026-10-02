@@ -1,12 +1,13 @@
 # MSA v1 training benchmark
 
-[English](README.en.md)
+[Simplified Chinese](README.zh-CN.md)
 
-该 benchmark 覆盖 Attention FWD、Attention BWD、Indexer 和 KL backward。默认使用
-真实 `192K / CP16 / 12 chunks per rank` workload。默认 smoke 运行每个 CP rank 一个
-case；full 的 32 个 shape strata 权重合计代表 1500 条真实调用。
+This benchmark covers Attention FWD, Attention BWD, Indexer, and KL backward.
+By default it uses the real `192K / CP16 / 12 chunks per rank` workload. The
+smoke suite runs one case per CP rank, while the 32 full-suite shape strata use
+weights that represent 1,500 real calls.
 
-## 使用方式
+## Usage
 
 ```bash
 python benchmarks/training/msa_v1/benchmark.py --kernel attention-fwd
@@ -16,9 +17,10 @@ python benchmarks/training/msa_v1/benchmark.py --kernel indexer --use-fp16-score
 python benchmarks/training/msa_v1/benchmark.py --kernel kl
 ```
 
-默认 `--case-suite smoke`；`--case-suite full` 运行固定 32-case selection，
-`--benchmark-case-id` 运行一个固定 case，`--case-suite all` 运行所有 rank-local case。
-旧人工 workload 只能通过显式参数运行，例如：
+The default is `--case-suite smoke`. Use `--case-suite full` for the fixed
+32-case selection, `--benchmark-case-id` for one fixed case, or
+`--case-suite all` for every rank-local case. Legacy synthetic workloads are
+available only through explicit arguments, for example:
 
 ```bash
 python benchmarks/training/msa_v1/benchmark.py \
@@ -26,10 +28,12 @@ python benchmarks/training/msa_v1/benchmark.py \
   --synthetic-scenario 128k_cp16
 ```
 
-## 计时与 FLOPs
+## Timing and FLOPs
 
-输入构造、JIT、metadata 分配和 plan 不进入 hot-path CUDA Event 计时。输出同时保留
-preprocess/cold-e2e 指标，并使用 `representative_weight` 计算真实分布的 weighted aggregate。
+Input construction, JIT compilation, metadata allocation, and planning are
+excluded from hot-path CUDA Event timing. Results also retain preprocess and
+cold-E2E metrics and use `representative_weight` for the production-weighted
+aggregate.
 
 ```text
 FWD FLOPs = 2 * (Dqk + Dv) * Hq * sparse_elements
@@ -38,6 +42,7 @@ Indexer FLOPs = 2 * Di * Hi * causal_elements
 KL FLOPs = 2 * (Dqk * Hq + 3 * Di * Hi) * sparse_elements
 ```
 
-MSA v1 使用 `Dqk=Dv=Di=128`、`Hq=64`、`Hi=4`、`block_size=128`、`topK=16`。
-Indexer 的 `--use-fp16-score` 使用 FP16 score workspace，不改变公开输出契约。
-结果与临时 profile 写入仓库外的 agent 工作目录。
+MSA v1 uses `Dqk=Dv=Di=128`, `Hq=64`, `Hi=4`, `block_size=128`, and
+`topK=16`. Indexer option `--use-fp16-score` uses an FP16 score workspace
+without changing the public output contract. Results and temporary profiles
+are written to the agent workspace outside the repository.

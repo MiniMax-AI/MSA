@@ -6,23 +6,99 @@ import torch
 from benchmarks.inference.msa_v1.indexer.decode.metrics import necessary_bytes
 
 
-@pytest.mark.parametrize("page_bytes", (128 * 128, 128 * 72))
+@pytest.mark.parametrize("suite,count", (("full", 28), ("low-latency", 12)))
+def test_bf16_mbu_compares_same_configuration(suite, count):
+    from copy import deepcopy
+
+    from benchmarks.inference.msa_v1.indexer.decode.metrics import compare_bf16_mbu
+
+    baseline = {
+        "precision": "q8kv8",
+        "device": "B300",
+        "device_uuid": "paired",
+        "dsl_version": "4.8.0",
+        "num_index_heads": 4,
+        "protocol": {
+            "formal": True,
+            "suite": suite,
+            "query_length": 3,
+            "warmup_replays": 5,
+            "timed_replays": 20,
+            "cuda_graph_calls": 120,
+        },
+        "results": [
+            {
+                "name": str(i),
+                "slots": 120,
+                "weight": 0 if suite == "low-latency" else i + 1,
+                "cv": 0.01,
+                "latency_us": 10.0,
+                "necessary_bytes": 100.0,
+                "reuse_distance_over_l2": 2.1,
+            }
+            for i in range(count)
+        ],
+    }
+    candidate = deepcopy(baseline)
+    candidate["precision"] = "bf16"
+    for row in candidate["results"]:
+        row["necessary_bytes"] = 200.0
+        row["latency_us"] = 20.0 / 0.91
+    result = compare_bf16_mbu(candidate, baseline)
+    assert result["passed"]
+    assert result["weighted_effective_mbu_ratio"] == pytest.approx(0.91)
+    assert result["weighted_latency_ratio"] > 2
+    for field, invalid in (
+        ("cv", 0.04),
+        ("cv", -0.01),
+        ("reuse_distance_over_l2", 2.0),
+        ("reuse_distance_over_l2", float("nan")),
+    ):
+        valid = candidate["results"][0][field]
+        candidate["results"][0][field] = invalid
+        with pytest.raises(ValueError, match="invalid measurement"):
+            compare_bf16_mbu(candidate, baseline)
+        candidate["results"][0][field] = valid
+    for row in candidate["results"]:
+        row["latency_us"] = 20.0 / 0.89
+    assert not compare_bf16_mbu(candidate, baseline)["passed"]
+    candidate["num_index_heads"] = 2
+    with pytest.raises(ValueError, match="num_index_heads mismatch"):
+        compare_bf16_mbu(candidate, baseline)
+
+
+@pytest.mark.parametrize(
+    "page_bytes,query_element_bytes",
+    ((128 * 128, 1), (128 * 72, 1), (128 * 128 * 2, 2)),
+)
 @pytest.mark.parametrize("query_length", (1, 4, 8, 16))
-def test_shared_k_traffic(page_bytes, query_length):
+def test_shared_k_traffic(page_bytes, query_length, query_element_bytes):
     lengths = torch.tensor([query_length, 129, 2177], dtype=torch.int32)
     local = (lengths[:, None] - query_length + torch.arange(query_length)) // 128
     shared = int(local[:, -1].sum()) * (page_bytes + 4) + 3 * 4
     per_head = (
-        3 * query_length * (128 + 4 + 16 * 4)
+        3 * query_length * (128 * query_element_bytes + 4 + 16 * 4)
         + 4 * int(local.sum())
         + 4 * int(local[local >= 16].sum())
     )
     assert (
-        necessary_bytes(lengths, 1, page_bytes, query_length=query_length)
+        necessary_bytes(
+            lengths,
+            1,
+            page_bytes,
+            query_length=query_length,
+            query_element_bytes=query_element_bytes,
+        )
         == shared + per_head
     )
     assert (
-        necessary_bytes(lengths, 4, page_bytes, query_length=query_length)
+        necessary_bytes(
+            lengths,
+            4,
+            page_bytes,
+            query_length=query_length,
+            query_element_bytes=query_element_bytes,
+        )
         == shared + 4 * per_head
     )
 

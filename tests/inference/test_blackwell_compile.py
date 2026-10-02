@@ -18,13 +18,12 @@ pytestmark = pytest.mark.gpu
 
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
 @pytest.mark.parametrize("num_index_heads", (1, 2, 4))
-@pytest.mark.parametrize("query_length", (1, 5, 9, 11, 13, 16))
-def test_q8kv8_decode_indexer_compiles_for_blackwell(
-    arch: str, num_index_heads: int, query_length: int
+@pytest.mark.parametrize("query_length", range(1, 17))
+@pytest.mark.parametrize("input_dtype", (cutlass.Float8E4M3FN, cutlass.BFloat16))
+def test_decode_indexer_compiles_for_blackwell(
+    arch: str, num_index_heads: int, query_length: int, input_dtype: type
 ) -> None:
-    from inference.msa_v1.indexer.decode.q8kv8.indexer_gemm import (
-        DecodeIndexerGemmSm100,
-    )
+    from inference.msa_v1.indexer.decode.indexer_gemm import DecodeIndexerGemmSm100
 
     assert Version(cutlass.__version__) >= Version("4.5.2")
 
@@ -40,10 +39,11 @@ def test_q8kv8_decode_indexer_compiles_for_blackwell(
         num_index_heads=num_index_heads,
         sm_count=148,
         query_columns=((query_length * num_index_heads + 7) // 8) * 8,
+        input_dtype=input_dtype,
     )
     args = (
-        tensor(cutlass.Float8E4M3FN, (2, query_length * num_index_heads, 128)),
-        tensor(cutlass.Float8E4M3FN, (37, 128, 128)),
+        tensor(input_dtype, (2, query_length * num_index_heads, 128)),
+        tensor(input_dtype, (37, 128, 128)),
         tensor(cutlass.Int32, (2, 17), 4),
         tensor(cutlass.Int32, (2,), 4),
         tensor(cutlass.Float32, (num_index_heads, 2 * query_length, 17)),
@@ -188,7 +188,7 @@ def test_training_indexer_compiles_for_blackwell(
 
 
 @pytest.mark.parametrize("capability", ((10, 0), (10, 3)))
-@pytest.mark.parametrize("heads", (1, 4))
+@pytest.mark.parametrize("heads", (1, 2, 4))
 def test_bf16_prefill_indexer_compiles_for_blackwell(capability, heads):
     assert Version(cutlass.__version__) >= Version("4.5.2")
     from inference.msa_v1.indexer.prefill.bf16.indexer_gemm import M3IndexerGemmSm100

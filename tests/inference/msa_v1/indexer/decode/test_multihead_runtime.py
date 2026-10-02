@@ -23,7 +23,7 @@ def _synchronize(stream=None):
         watchdog.cancel()
 
 
-@pytest.mark.parametrize("kind", ("q8kv8", "q8kv4"))
+@pytest.mark.parametrize("kind", ("q8kv8", "q8kv4", "bf16"))
 @pytest.mark.parametrize("heads", (1, 2, 4))
 def test_multihead_runtime(kind, heads):
     api = importlib.import_module(f"inference.msa_v1.indexer.decode.{kind}.interface")
@@ -70,7 +70,7 @@ def test_multihead_runtime(kind, heads):
         assert bounds[0] == 0 and bounds[-1] == history_pages.sum()
         counts = bounds.diff()
         assert counts.min() >= 0 and counts.max() - counts.min() <= 1
-        start_fields = 2 if kind == "q8kv8" else 3
+        start_fields = 2 if kind != "q8kv4" else 3
         start_offset = batch + sm_count + 2
         worker_start = (
             proxy._workspace_buffer[
@@ -106,8 +106,12 @@ def test_multihead_runtime(kind, heads):
             atol=1e-4,
             rtol=1e-4,
         )
-        if kind == "q8kv8":
-            current = set(api._COMPILE_CACHE)
+        if kind != "q8kv4":
+            current = set(
+                importlib.import_module(
+                    "inference.msa_v1.indexer.decode._interface"
+                )._COMPILE_CACHE
+            )
         else:
             jit = importlib.import_module("inference.msa_v1.indexer.decode.q8kv4.jit")
             current = jit._load_extension_for_arch.cache_info().misses

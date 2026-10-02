@@ -54,6 +54,10 @@ sizes and tensor values stay runtime data.
 The following correctness and benchmark rules apply to `inference/msa_v1/`.
 They do not replace the training suites.
 
+Interface maintenance or file/directory reorganization that preserves kernel
+computation and public data contracts requires only smoke tests for affected
+paths; full correctness and E2E benchmarks are not required.
+
 Formal performance for every MSA v1 operator is CUDA Graph E2E latency of the
 public `run()` path. Run a fixed baseline before the candidate, with identical
 inputs, graph configuration, cold-cache method, warmup, replay count, and
