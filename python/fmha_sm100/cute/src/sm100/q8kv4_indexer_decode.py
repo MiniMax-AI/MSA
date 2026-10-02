@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""CuTe DSL Q8KV4 paged decode indexer proxy scores for four index heads.
+"""CuTe DSL Q8KV4 paged decode indexer proxy scores for two or four index heads.
 
 K pages use the vLLM packed NVFP4 layout: 8192 bytes of E2M1 values (64 bytes
 per token, low nibble first) followed by 1024 bytes of E4M3 scales for groups
@@ -69,20 +69,18 @@ class _NamedBarrier(enum.IntEnum):
 
 
 class Q8KV4DecodeIndexerSm100:
-    """Compute NVFP4-K page scores for four index heads with persistent workers.
+    """Compute NVFP4-K page scores for two or four index heads with persistent workers.
 
-    The four heads share the single K head, so the eight MTP tokens of all
-    heads form one 32-column MMA N tile (``token * 4 + head``). Each K page is
-    loaded and dequantized once per request.
+    The heads share the single K head, so the eight MTP tokens of all heads
+    form one MMA N tile of ``8 * num_heads`` columns (``token * num_heads +
+    head``). Each K page is loaded and dequantized once per request.
     """
 
-    num_heads = 4
+    supported_num_heads = (2, 4)
     query_length = 8
-    num_queries = query_length * num_heads
     page_size = 128
     head_dim = 128
     m_tile = page_size
-    n_tile = num_queries
     k_tile = head_dim
     packed_bytes_per_token = head_dim // 2
     packed_page_bytes = page_size * packed_bytes_per_token
@@ -110,9 +108,7 @@ class Q8KV4DecodeIndexerSm100:
     # TMEM columns hold 32 bits per lane: an accumulator stage uses one column
     # per query and a K stage packs four E4M3 values per column.
     e4m3_per_tmem_col = Float32.width // cutlass.Float8E4M3FN.width
-    acc_tmem_cols = acc_stages * num_queries
     k_stage_tmem_cols = head_dim // e4m3_per_tmem_col
-    tmem_cols = acc_tmem_cols + k_stages * k_stage_tmem_cols
     threads_per_warp = 32
     score_warp_begin = 3
     score_warps = 4
@@ -128,8 +124,16 @@ class Q8KV4DecodeIndexerSm100:
     def __init__(self, *, sm_count: int, num_heads: int) -> None:
         if sm_count <= 0:
             raise ValueError("sm_count must be positive")
-        if num_heads != self.num_heads:
-            raise ValueError(f"the Q8KV4 decode kernel serves {self.num_heads} index heads")
+        if num_heads not in self.supported_num_heads:
+            raise ValueError(f"num_heads must be one of {self.supported_num_heads}")
+        self.num_heads = num_heads
+        self.num_queries = self.query_length * num_heads
+        self.n_tile = self.num_queries
+        self.acc_tmem_cols = self.acc_stages * self.num_queries
+        # The allocation is a power of two of at least 32 columns: 128 for both
+        # two heads (2 * 16 + 2 * 32 columns) and four heads (2 * 32 + 2 * 32).
+        used_tmem_cols = self.acc_tmem_cols + self.k_stages * self.k_stage_tmem_cols
+        self.tmem_cols = max(32, 1 << (used_tmem_cols - 1).bit_length())
         self.grid_ctas = sm_count * self.target_ctas_per_sm
 
     @cute.jit
@@ -484,12 +488,27 @@ class Q8KV4DecodeIndexerSm100:
             ),
         )
         # Dequant warps write the same K stages through an FP32 view: lane is
-        # the token row, each column packs four E4M3 values.
+        # the token row, each column packs four E4M3 values. A K stage is
+        # k_stage_tmem_cols wide for any head count, so the view takes the C
+        # layout of a (page_size, k_stage_tmem_cols) MMA, not the accumulator's.
+        k_view_mma = sm100_utils.make_trivial_tiled_mma(
+            cutlass.Float8E4M3FN,
+            cutlass.Float8E4M3FN,
+            OperandMajorMode.K,
+            OperandMajorMode.K,
+            Float32,
+            tcgen05.CtaGroup.ONE,
+            (self.m_tile, self.k_stage_tmem_cols),
+            tcgen05.OperandSource.TMEM,
+        )
+        k_view_layout = k_view_mma.make_fragment_C(
+            k_view_mma.partition_shape_C((self.m_tile, self.k_stage_tmem_cols))
+        ).layout
         tKtK = cute.make_tensor(
             tmem_ptr + self.acc_tmem_cols,
             cute.append(
                 cute.composition(
-                    tCtAcc_staged[(None, None, None, 0)].layout,
+                    k_view_layout,
                     cute.make_layout((self.page_size, self.k_stage_tmem_cols)),
                 ),
                 cute.make_layout((self.k_stages,), stride=(self.k_stage_tmem_cols,)),
@@ -497,7 +516,7 @@ class Q8KV4DecodeIndexerSm100:
         )
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),
+            tcgen05.Ld32x32bOp(getattr(tcgen05.Repetition, f"x{self.num_queries}")),
             Float32,
         )
         tmem_tiled_copy = tcgen05.make_tmem_copy(

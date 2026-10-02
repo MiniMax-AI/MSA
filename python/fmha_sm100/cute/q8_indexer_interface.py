@@ -487,11 +487,11 @@ class BatchDecodeIndexerQ8KV8Wrapper(_BatchDecodeIndexerBase):
 
 
 class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
-    """E4M3 Q and NVFP4 K paged decode indexer for one or four index heads.
+    """E4M3 Q and NVFP4 K paged decode indexer for one, two or four index heads.
 
     ``k_cache`` is the vLLM packed NVFP4 page; the per-tensor global scale is
     positive and does not change the ranking, so it is not an input. One head
-    runs the CUTLASS C++ kernel and four heads run the CuTe DSL kernel. Builds
+    runs the CUTLASS C++ kernel and two or four heads run the CuTe DSL kernel. Builds
     on CUDA 13.4 or newer use the public QMUL4 instruction on SM100/SM103, and
     older ones select the exact FP16 dequantization.
 
@@ -502,7 +502,7 @@ class BatchDecodeIndexerQ8KV4Wrapper(_BatchDecodeIndexerBase):
         topk_indices = wrapper.run(q, k_cache)
     """
 
-    _supported_num_heads = (1, Q8KV4DecodeIndexerSm100.num_heads)
+    _supported_num_heads = (1, *Q8KV4DecodeIndexerSm100.supported_num_heads)
     _kernel_name = "q8kv4_indexer_decode_sm100"
     _kernel_class = Q8KV4DecodeIndexerSm100
 

@@ -423,7 +423,7 @@ selects its own pages.
 
 | Wrapper | Phase | K cache | `num_heads` |
 |---|---|---|---|
-| `BatchDecodeIndexerQ8KV4Wrapper` | Decode, 8 MTP tokens per request | NVFP4, `[num_blocks, 128, 72]` uint8 | 1 or 4 |
+| `BatchDecodeIndexerQ8KV4Wrapper` | Decode, 8 MTP tokens per request | NVFP4, `[num_blocks, 128, 72]` uint8 | 1, 2, or 4 |
 | `BatchDecodeIndexerQ8KV8Wrapper` | Decode, 8 MTP tokens per request | FP8 e4m3, `[num_blocks, 128, 128]` | 1, 2, or 4 |
 | `BatchPrefillIndexerQ8KV8Wrapper` | Varlen prefill, bottom-right causal | FP8 e4m3, `[num_blocks, 128, 128]` | 1, 2, or 4 |
 
@@ -754,7 +754,7 @@ High-signal files:
 - [`test_sparse_atten.py`](./test_sparse_atten.py): interface-level tests, benchmark CLI, and profile entrypoint
 - [`test_fp4_indexer.py`](./test_fp4_indexer.py): FP4 indexer correctness tests and benchmark CLI
 - [`src/sm100/q8kv8_indexer_decode.py`](./src/sm100/q8kv8_indexer_decode.py), [`src/sm100/q8kv8_indexer_prefill.py`](./src/sm100/q8kv8_indexer_prefill.py): Q8KV8 indexer kernels
-- [`src/sm100/q8kv4_indexer_decode.py`](./src/sm100/q8kv4_indexer_decode.py): four-head Q8KV4 decode kernel; the one-head Q8KV4 decode kernel and the indexer TopK are csrc JIT modules
+- [`src/sm100/q8kv4_indexer_decode.py`](./src/sm100/q8kv4_indexer_decode.py): two- and four-head Q8KV4 decode kernel; the one-head Q8KV4 decode kernel and the indexer TopK are csrc JIT modules
 - [`test_q8_indexer.py`](./test_q8_indexer.py): Q8KV4/Q8KV8 indexer correctness tests
 - [`Makefile`](./Makefile): setup, test, benchmark, and profiling shortcuts
 - [`src/sm100/fwd`](./src/sm100/fwd): forward kernels (prefill)
@@ -766,8 +766,8 @@ High-signal files:
 - `D=128` is the only documented and tested head dimension in the current contract.
 - The FP4 indexer currently returns block max scores only; topK selection and
   CSR construction remain caller-owned downstream steps.
-- The Q8KV4/Q8KV8 indexers support 1, 2, or 4 index heads per rank (Q8KV4
-  decode: 1 or 4), `D=128`, 128-token pages, top-16, and only a forced local
+- The Q8KV4/Q8KV8 indexers support 1, 2, or 4 index heads per rank, `D=128`,
+  128-token pages, top-16, and only a forced local
   page (no forced initial pages); decode requires exactly 8 MTP tokens per
   request.
 - This repo is not packaged as a pip module yet; it is used directly from the source tree.

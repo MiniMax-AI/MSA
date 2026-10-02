@@ -55,7 +55,7 @@ E2M1_VALUES = (
 )
 DECODE_FORMATS = ("q8kv8", "q8kv4")
 DECODE_WRAPPERS = {"q8kv8": BatchDecodeIndexerQ8KV8Wrapper, "q8kv4": BatchDecodeIndexerQ8KV4Wrapper}
-DECODE_HEADS = {"q8kv8": (1, 2, 4), "q8kv4": (1, 4)}
+DECODE_HEADS = {"q8kv8": (1, 2, 4), "q8kv4": (1, 2, 4)}
 DECODE_CASES = [(fmt, num_heads) for fmt in DECODE_FORMATS for num_heads in DECODE_HEADS[fmt]]
 PREFILL_HEADS = (1, 2, 4)
 
