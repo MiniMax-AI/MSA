@@ -29,7 +29,7 @@ void check_sm100_family(torch::Tensor const &reference) {
 } // namespace
 
 torch::Tensor indexer_topk_run(torch::Tensor scores, torch::Tensor lengths, torch::Tensor output,
-                               bool compact_grid) {
+                               bool compact_grid, bool enable_pdl) {
   TORCH_CHECK(scores.is_cuda(), "scores must be a CUDA tensor");
   TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must have dtype torch.float32");
   TORCH_CHECK(scores.dim() == 2 && scores.size(0) > 0,
@@ -61,7 +61,7 @@ torch::Tensor indexer_topk_run(torch::Tensor scores, torch::Tensor lengths, torc
   cudaError_t const status = launch_indexer_topk(
       scores.data_ptr<float>(), lengths.data_ptr<int32_t>(), output.data_ptr<int32_t>(),
       static_cast<int>(scores.size(1)), static_cast<int>(scores.stride(0)),
-      static_cast<int>(scores.size(0)), stream, compact_grid);
+      static_cast<int>(scores.size(0)), stream, compact_grid, enable_pdl);
   TORCH_CHECK(status == cudaSuccess, "indexer TopK launch failed: ", cudaGetErrorString(status));
   return output;
 }

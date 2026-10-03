@@ -142,12 +142,13 @@ def test_plan_is_rejected_during_capture() -> None:
         wrapper.plan(page_table, seq_lens)
 
 
-def test_public_wrapper_cuda_graph_replays_topk() -> None:
+@pytest.mark.parametrize("page_capacity", (4, 40))
+def test_public_wrapper_cuda_graph_replays_topk(page_capacity: int) -> None:
     device = torch.device("cuda")
     q, packed_k, k_scale, page_table, seq_lens = make_inputs(
         32,
-        4,
-        torch.arange(32, dtype=torch.int32) % 377 + 128,
+        page_capacity,
+        (torch.arange(32, dtype=torch.int32) * 137) % (page_capacity * 128 - 128) + 128,
         seed=71,
         device=device,
     )
@@ -169,3 +170,26 @@ def test_public_wrapper_cuda_graph_replays_topk() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(output, expected)
+
+    # Independent wrappers and graphs must not alias mutable score/TopK buffers.
+    other = BatchDecodeIndexerWithPagedKVCacheWrapper()
+    other.plan(page_table, seq_lens)
+    other_q = q.flip(0).contiguous()
+    other_output = torch.empty_like(output)
+    other.run(other_q, packed_k, k_scale=k_scale, out=other_output)
+    torch.cuda.synchronize()
+    other_expected = other_output.clone()
+    other_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(other_graph):
+        other.run(other_q, packed_k, k_scale=k_scale, out=other_output)
+    torch.cuda.synchronize()
+    streams = (torch.cuda.Stream(), torch.cuda.Stream())
+    for _ in range(3):
+        with torch.cuda.stream(streams[0]):
+            graph.replay()
+        with torch.cuda.stream(streams[1]):
+            other_graph.replay()
+    for stream in streams:
+        stream.synchronize()
+    assert torch.equal(output, expected)
+    assert torch.equal(other_output, other_expected)

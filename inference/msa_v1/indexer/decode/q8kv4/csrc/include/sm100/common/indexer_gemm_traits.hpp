@@ -7,10 +7,12 @@ namespace minimax::msa_v1::indexer::decode::q8kv4 {
 // Include the tile in the type so JIT modules cannot share launch-initialization state.
 template <int NumIndexHeads, int QueryColumns> struct IndexerGemmTraitsForHeads {
   static constexpr int kNumIndexHeads = NumIndexHeads;
-  static constexpr int kPageWorkerGroups = 4;
+  // Narrow tiles use smaller CTAs and split each planned span to overlap memory latency.
+  static constexpr int kPageWorkerGroups = QueryColumns == 16 ? 3 : 4;
+  static constexpr int kCtasPerWorker = QueryColumns == 16 ? 2 : 1;
   static constexpr int kPageWorkerWarps = 4;
   static constexpr int kAccumulatorStages = kPageWorkerGroups;
-  static constexpr int kDequantStages = 4;
+  static constexpr int kDequantStages = kPageWorkerGroups;
   static constexpr int kDequantGroups = kPageWorkerGroups;
   static constexpr int kDequantWarpsPerGroup = kPageWorkerWarps;
   static constexpr int kConsumerGroups = kPageWorkerGroups;
@@ -27,7 +29,7 @@ template <int NumIndexHeads, int QueryColumns> struct IndexerGemmTraitsForHeads 
   static constexpr int kPageBytes = kPackedKBytes + kScaleBytes;
   static constexpr int kThreads =
       (kPageWorkerGroups * kPageWorkerWarps + 2) * cutlass::NumThreadsPerWarp;
-  static constexpr int kMaxPagesPerCta = 8;
+  static constexpr int kMaxPagesPerCta = 2 * kPageWorkerGroups;
   static constexpr int kMaximumPages = 8192;
 };
 

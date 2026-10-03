@@ -97,7 +97,7 @@ template <class Traits> struct IndexerGemmRunner {
     if (initialize_status != cudaSuccess) {
       return initialize_status;
     }
-    dim3 const grid(static_cast<unsigned int>(params.sm_count), 1, 1);
+    dim3 const grid(static_cast<unsigned int>(params.sm_count * Traits::kCtasPerWorker), 1, 1);
     cudaLaunchAttribute attributes[1]{};
     attributes[0].id = cudaLaunchAttributeClusterDimension;
     attributes[0].val.clusterDim.x = 1;

@@ -66,6 +66,7 @@ def _topk_select(
     *,
     out: torch.Tensor | None = None,
     compact_grid: bool = False,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Select 15 historical columns and one forced tail from each row.
 
@@ -83,4 +84,4 @@ def _topk_select(
             dtype=torch.int32,
             device=scores.device,
         )
-    return load_extension()._run(scores, lengths, out, compact_grid)
+    return load_extension()._run(scores, lengths, out, compact_grid, enable_pdl)

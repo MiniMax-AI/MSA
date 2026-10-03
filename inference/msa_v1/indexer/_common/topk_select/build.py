@@ -15,7 +15,7 @@ from inference.msa_v1._build_utils import cuda_home
 _LOGGER = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parent
 _CSRC = _ROOT / "csrc"
-_CACHE_ABI = "msa_v1_indexer_topk_decode_compact_v2"
+_CACHE_ABI = "msa_v1_indexer_topk_decode_pdl_v3"
 
 
 @lru_cache(maxsize=1)

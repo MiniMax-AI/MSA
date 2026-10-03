@@ -121,10 +121,14 @@ template <class Traits> struct IndexerGemmConfig {
   }
 
   CUTE_DEVICE static void initialize_work(Params const &params, SharedStorage &storage) {
-    int const worker = int(blockIdx.x);
+    int const worker = int(blockIdx.x) / Traits::kCtasPerWorker;
+    int const part = int(blockIdx.x) % Traits::kCtasPerWorker;
     int32_t const *boundaries = params.scheduler_workspace_ptr + params.batch + 1;
-    storage.next_page = boundaries[worker];
-    storage.worker_end = boundaries[worker + 1];
+    // Subdivide the existing plan without changing its workspace or shared-plan ABI.
+    int const begin = boundaries[worker];
+    int const count = boundaries[worker + 1] - begin;
+    storage.next_page = begin + count * part / Traits::kCtasPerWorker;
+    storage.worker_end = begin + count * (part + 1) / Traits::kCtasPerWorker;
     int32_t const *start = params.scheduler_workspace_ptr + params.batch + params.sm_count + 2;
     storage.batch_idx = start[worker];
     next_work(params, storage);

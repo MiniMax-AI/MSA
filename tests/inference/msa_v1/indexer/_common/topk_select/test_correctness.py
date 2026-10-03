@@ -105,10 +105,10 @@ def test_replay_and_row_permutation_are_deterministic() -> None:
     torch.testing.assert_close(permuted, baseline[permutation], atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("compact_grid", (False, True))
-def test_cuda_graph_capture_and_replay(compact_grid: bool) -> None:
+@pytest.mark.parametrize("compact_grid,enable_pdl", ((False, False), (True, False), (True, True)))
+@pytest.mark.parametrize("max_cols", (129, 1025))
+def test_cuda_graph_capture_and_replay(compact_grid: bool, enable_pdl: bool, max_cols: int) -> None:
     num_rows = 29
-    max_cols = 1025
     lengths = focused_lengths(max_cols, num_rows, seed=101)
     scores = make_scores(max_cols, lengths, seed=102)
     device_scores = torch.from_numpy(scores).to("cuda")
@@ -120,7 +120,7 @@ def test_cuda_graph_capture_and_replay(compact_grid: bool) -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         result = _topk_select(
-            device_scores, device_lengths, out=output, compact_grid=compact_grid
+            device_scores, device_lengths, out=output, compact_grid=compact_grid, enable_pdl=enable_pdl
         )
     assert result.data_ptr() == output.data_ptr()
     graph.replay()

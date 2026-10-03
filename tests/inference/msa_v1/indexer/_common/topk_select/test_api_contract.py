@@ -28,6 +28,7 @@ def test_topk_select_is_the_only_package_entrypoint() -> None:
         "lengths",
         "out",
         "compact_grid",
+        "enable_pdl",
     )
     for forbidden in (
         "forward",

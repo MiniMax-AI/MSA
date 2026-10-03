@@ -315,6 +315,7 @@ template <class Traits> struct IndexerGemmUmmaCollective : IndexerGemmConfig<Tra
       first_span = false;
       __syncthreads();
     }
+    cudaTriggerProgrammaticLaunchCompletion();
     __syncthreads();
     if (warp_idx == 0) {
       cute::TMEM::Allocator1Sm allocator;

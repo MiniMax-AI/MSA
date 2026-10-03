@@ -193,9 +193,11 @@ inline int m3_rows_per_block(int n_max) {
 // WIDTH comes from that row's own nvm: per CTA in the block family, per warp in
 // the warp family. A short row in a block-family launch takes the narrowest
 // block width rather than a warp path -- correct, just wider than it needs.
-__global__ __launch_bounds__(kThreads) void m3_topk_kernel(
-    const float* __restrict__ scores, const int* __restrict__ row_n,
-    int* __restrict__ out_ids, int n_max, int row_stride, int rows) {
+__global__ __launch_bounds__(kThreads) void m3_topk_kernel(const float *__restrict__ scores,
+                                                           const int *__restrict__ row_n,
+                                                           int *__restrict__ out_ids, int n_max,
+                                                           int row_stride, int rows,
+                                                           bool pdl = false) {
   __shared__ union Smem {
     SelectSmem s;
     int sel[kRowsPerBlock][kSelK];
@@ -215,6 +217,8 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
     // short-row branch leaves -- so one test below covers all three cases.
     const bool owns_row = (warp < kRowsPerBlock) && (row < rows);
     const int nvm = owns_row ? row_nvm(row_n, out_ids, row, lane) : 0;
+    if (pdl)
+      cudaGridDependencySynchronize();
     if (nvm > 0) {
       warp_rank_row(nvm, row_scores(scores, row, row_stride), u.sel[warp]);
       write_row(out_ids, row, lane, nvm, u.sel[warp]);
@@ -225,6 +229,8 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(
     // which is what keeps the __syncthreads() inside block_rank_row convergent.
     const int row = static_cast<int>(blockIdx.x);
     const int nvm = row_nvm(row_n, out_ids, row, tid);
+    if (pdl)
+      cudaGridDependencySynchronize();
     if (nvm > 0) {
       block_rank_row<0>(nvm, row_scores(scores, row, row_stride), u.s);
       write_row(out_ids, row, tid, nvm, u.s.sel_ids);

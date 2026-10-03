@@ -383,6 +383,7 @@ class BatchDecodeIndexerWithPagedKVCacheWrapper:
             self._num_valid_pages.view(-1),
             out=topk_out.view(-1, _TOP_K),
             compact_grid=True,
+            enable_pdl=True,
         )
         return topk_out
 
