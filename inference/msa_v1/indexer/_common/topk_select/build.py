@@ -8,6 +8,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+import torch
 from torch.utils import cpp_extension
 
 from inference.msa_v1._build_utils import cuda_home
@@ -44,7 +45,10 @@ def load_extension():
     previous_cuda_home = cpp_extension.CUDA_HOME
     previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
     cpp_extension.CUDA_HOME = str(selected_cuda_home)
-    os.environ["TORCH_CUDA_ARCH_LIST"] = "10.0a;10.3a"
+    # Rubin needs its own arch target; the SM100/SM103 pair cannot run there.
+    os.environ["TORCH_CUDA_ARCH_LIST"] = (
+        "10.7a" if torch.cuda.get_device_capability() == (10, 7) else "10.0a;10.3a"
+    )
     try:
         extension = cpp_extension.load(
             name="minimax_msa_v1_indexer_topk",

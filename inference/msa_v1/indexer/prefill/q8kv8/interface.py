@@ -74,7 +74,7 @@ def _check_runtime(device: torch.device) -> tuple[int, int]:
     capability = torch.cuda.get_device_capability(device)
     if capability not in _SUPPORTED_CAPABILITIES:
         raise RuntimeError(
-            "Q8K8 prefill indexer supports only SM100 and SM103, "
+            "Q8K8 prefill indexer supports only SM100, SM103 and SM107, "
             f"got SM{capability[0]}{capability[1]}"
         )
     return capability
@@ -99,6 +99,7 @@ class _PlanState:
     plan_error: torch.Tensor
     task_capacity: int
     num_candidate_q_tiles: int
+    max_page_chunk: int
     total_q: int
     max_cols: int
     num_index_heads: int
@@ -224,6 +225,7 @@ def _compile_device_plan(state: _PlanState) -> tuple[object, object]:
                 _to_cute_tensor(state.plan_error),
                 Int32(state.num_candidate_q_tiles),
                 Int32(state.task_capacity),
+                Int32(state.max_page_chunk),
                 stream,
                 options="--enable-tvm-ffi",
             )
@@ -256,6 +258,7 @@ def _run_device_plan(state: _PlanState) -> None:
             state.plan_error,
             state.num_candidate_q_tiles,
             state.task_capacity,
+            state.max_page_chunk,
         )
 
 
@@ -369,6 +372,24 @@ class _BatchPrefillProxyScoreWrapper:
             _PLAN_TASK_CAPACITY_PAGE_CHUNK,
         )
         task_capacity = q_tile_capacity * page_chunk_capacity
+        # Cap the planner's page chunk so every Q tile splits into at most
+        # clusters // q_tiles tasks: short-query requests then fill the machine
+        # in one wave instead of leaving most clusters idle. Host-known upper
+        # bounds only (no D2H); long-query requests keep the default chunk.
+        if _check_runtime(page_table.device) == (10, 7):
+            chunks_per_q_tile = max(
+                1,
+                _get_num_persistent_clusters(page_table.device) // q_tile_capacity,
+            )
+            max_page_chunk = max(
+                PrefillIndexerPlanBuild.min_page_chunk,
+                min(
+                    PrefillIndexerPlanBuild.large_page_chunk,
+                    _ceil_div(max_cols, chunks_per_q_tile),
+                ),
+            )
+        else:
+            max_page_chunk = PrefillIndexerPlanBuild.large_page_chunk
         num_candidate_q_tiles = batch * _ceil_div(
             max_seqlen_q,
             logical_q_tile,
@@ -394,6 +415,7 @@ class _BatchPrefillProxyScoreWrapper:
             plan_error=torch.empty((1,), dtype=torch.int32, **options),
             task_capacity=task_capacity,
             num_candidate_q_tiles=num_candidate_q_tiles,
+            max_page_chunk=max_page_chunk,
             total_q=total_q,
             max_cols=max_cols,
             num_index_heads=num_index_heads,

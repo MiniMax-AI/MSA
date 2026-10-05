@@ -52,6 +52,7 @@ class PrefillIndexerPlanBuild:
     num_buckets = PrefillIndexerGemmSm100.num_task_buckets
     split_page_chunk = 64
     large_page_chunk = 128
+    min_page_chunk = 8
     split_q_tile_threshold = 60
     descriptor_words = 4
     threads_per_cta = cute.arch.WARP_SIZE
@@ -73,6 +74,7 @@ class PrefillIndexerPlanBuild:
         mPlanError: cute.Tensor,
         num_candidate_q_tiles: cutlass.Int32,
         task_capacity: cutlass.Int32,
+        max_page_chunk: cutlass.Int32,
         stream: cuda.CUstream = None,
     ) -> None:
         self.kernel(
@@ -83,6 +85,7 @@ class PrefillIndexerPlanBuild:
             mTaskCounts,
             mPlanError,
             task_capacity,
+            max_page_chunk,
         ).launch(
             grid=(num_candidate_q_tiles, 1, 1),
             block=(self.threads_per_cta, 1, 1),
@@ -139,6 +142,7 @@ class PrefillIndexerPlanBuild:
         mTaskCounts: cute.Tensor,
         mPlanError: cute.Tensor,
         task_capacity: cutlass.Int32,
+        max_page_chunk: cutlass.Int32,
     ) -> None:
         lane_idx = cute.arch.lane_idx()
         candidate_idx, _, _ = cute.arch.block_idx()
@@ -193,6 +197,10 @@ class PrefillIndexerPlanBuild:
             page_chunk = cutlass.Int32(self.split_page_chunk)
             if num_q_tiles >= cutlass.Int32(self.split_q_tile_threshold):
                 page_chunk = cutlass.Int32(self.large_page_chunk)
+            # Host-computed cap keeps the task count near the resident cluster count
+            # when few Q tiles would otherwise leave most clusters idle.
+            if page_chunk > max_page_chunk:
+                page_chunk = max_page_chunk
             if page_chunk > num_pages:
                 page_chunk = num_pages
             page_begin = cutlass.Int32(0)
