@@ -1335,10 +1335,12 @@ def combine(
     has_split_counts = split_counts is not None
     has_output_scale = output_scale is not None
     min_blocks_per_mp = 3 if has_output_scale and use_pdl else 0
-    # Rubin (SM107) has the SMEM headroom for the deeper 4-stage O_partial
-    # ring; Blackwell keeps stages=2 (see the occupancy note below).
+    # Rubin (SM107) takes a 3-stage O_partial ring: 4 stages with the
+    # min_blocks_per_mp=3 PDL launch hit unspecified launch failures once K1
+    # needs more than one wave, and 3 stages measured fastest.
+    # Blackwell keeps stages=2 (see the occupancy note below).
     capability = torch.cuda.get_device_capability(o_out.device)
-    stages = 4 if capability == (10, 7) else 2
+    stages = 3 if capability == (10, 7) else 2
 
     key = (
         "combine",
@@ -1382,7 +1384,7 @@ def combine(
                 # throughput 76.35% -> 88.64%. Runtime latency within noise
                 # (kernel already at HBM bandwidth ceiling in practice) but the
                 # cleaner SOL profile matters for downstream NCU comparison.
-                # Rubin: stages=4 (selected above).
+                # Rubin: stages=3 (selected above).
                 stages=stages,
             )
             div = 128 // partial_dtype.width

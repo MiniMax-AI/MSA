@@ -104,7 +104,7 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
       return cudaFuncSetAttribute(sm100_fmha_fwd_device_kernel<Traits>,
                                   cudaFuncAttributeMaxDynamicSharedMemorySize, get_smem_size());
     }
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 13050
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 13040
     int oversized_limit = 0;
     status = cudaDeviceGetAttribute(&oversized_limit, cudaDevAttrOversizedSharedMemoryPerBlock,
                                     device_id);

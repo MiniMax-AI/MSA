@@ -95,9 +95,9 @@ def _target_arch(device=None) -> str:
         supported_arches=("100a", "103a", "107a"),
     )
     if arch == "107a":
-        if _cuda_version() < (13, 5):
+        if _cuda_version() < (13, 4):
             raise RuntimeError(
-                "Q8KV4 decode attention on SM107 requires CUDA 13.5 or newer"
+                "Q8KV4 decode attention on SM107 requires CUDA 13.4 or newer"
             )
         if _cutlass_version() < (4, 8):
             raise RuntimeError(

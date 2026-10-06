@@ -7,7 +7,7 @@ automatically; this page documents that routing and the package's own API.
 
 ## Requirements
 
-- CUDA Toolkit 12.9 or newer for SM100/SM103, 13.5 or newer for SM107. The fast dequantization
+- CUDA Toolkit 12.9 or newer for SM100/SM103, 13.4 or newer for SM107. The fast dequantization
   path uses the QMUL4 instruction, which `ptxas` accepts from CUDA 13.4 on; older toolkits build
   an FP16 dequantization fallback automatically (about 1.3x slower on B300). SM107 always uses
   the fallback.
