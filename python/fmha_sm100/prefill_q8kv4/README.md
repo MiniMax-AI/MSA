@@ -15,7 +15,7 @@ sparse prefill.
 
 - CUDA Toolkit 13.4 or newer (the dequantization uses the QMUL4 instruction; there is no
   fallback path) and an SM100 or SM103 GPU.
-- CUTLASS headers: the repository submodule (4.3) or any newer release through `CUTLASS_ROOT`.
+- CUTLASS headers: the repository submodule (4.8) or any newer release through `CUTLASS_ROOT`.
 - The CuTe-DSL sparse stack (`nvidia-cutlass-dsl`, `quack-kernels`) for the CSR builder and the
   combine.
 - The kernel is JIT-compiled on first use into `MINFER_FMHA_CACHE_DIR` (or

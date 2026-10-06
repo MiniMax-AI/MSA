@@ -11,8 +11,8 @@ automatically; this page documents that routing and the package's own API.
   path uses the QMUL4 instruction, which `ptxas` accepts from CUDA 13.4 on; older toolkits build
   an FP16 dequantization fallback automatically (about 1.3x slower on B300). SM107 always uses
   the fallback.
-- CUTLASS headers: the repository submodule (4.3) serves SM100/SM103; SM107 needs CUTLASS 4.8 or
-  newer, pointed to by `CUTLASS_ROOT`.
+- CUTLASS headers: the repository submodule provides 4.8 for SM100/SM103/SM107. A newer checkout
+  can be selected through `CUTLASS_ROOT`.
 - Kernels are JIT-compiled on first use into `MINFER_FMHA_CACHE_DIR` (or `TORCH_EXTENSIONS_DIR`,
   or `~/.cache/minfer/fmha_sm100`), one binary per GQA ratio, split mode and block-scale shift.
 
