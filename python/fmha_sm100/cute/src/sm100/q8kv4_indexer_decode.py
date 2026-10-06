@@ -22,13 +22,14 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync
 from cutlass.cute.typing import Float32, Int32, Int64
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
 
 import cuda.bindings.driver as cuda
 
 from src.common import utils as common_utils
 
-# QMUL4 is public PTX from CUDA 13.4; older DSL backends take the exact FP16 path.
+# QMUL4 is public PTX from CUDA 13.4; older DSL backends and SM107, whose ptxas
+# rejects it, take the exact FP16 path.
 _HAS_QMUL4 = cutlass.CUDA_VERSION.major > 13 or (
     cutlass.CUDA_VERSION.major == 13 and cutlass.CUDA_VERSION.minor >= 4
 )
@@ -135,6 +136,10 @@ class Q8KV4DecodeIndexerSm100:
         used_tmem_cols = self.acc_tmem_cols + self.k_stages * self.k_stage_tmem_cols
         self.tmem_cols = max(32, 1 << (used_tmem_cols - 1).bit_length())
         self.grid_ctas = sm_count * self.target_ctas_per_sm
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        rubin_arch = getattr(arch.__class__, "sm_107", None)
+        is_rubin = rubin_arch is not None and arch.is_family_of(rubin_arch)
+        self.use_qmul4 = _HAS_QMUL4 and not is_rubin
 
     @cute.jit
     def __call__(
@@ -794,7 +799,7 @@ class Q8KV4DecodeIndexerSm100:
             for word in cutlass.range_constexpr(packed_words):
                 group = word * values_per_word // self.scale_group
                 scale = rScales[group // word_bytes] >> Int32(8 * (group % word_bytes))
-                if cutlass.const_expr(_HAS_QMUL4):
+                if cutlass.const_expr(self.use_qmul4):
                     lo, hi = _e2m1x8_scaled_to_e4m3x8(rPacked[word], scale)
                 else:
                     lo, hi = common_utils.cvt_fp4x8_e2m1_scaled_e4m3x8(rPacked[word], scale)

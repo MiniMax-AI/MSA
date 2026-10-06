@@ -29,7 +29,7 @@ class Q8KV8PrefillIndexerSm100:
     K head, so heads simply extend the Q (M) dimension of every task.
     """
 
-    supported_compute_capabilities = frozenset({(10, 0), (10, 3)})
+    supported_compute_capabilities = frozenset({(10, 0), (10, 3), (10, 7)})
     head_dim = 128
     q_tile = 256
     k_tile = 128
@@ -51,7 +51,7 @@ class Q8KV8PrefillIndexerSm100:
     ) -> None:
         if compute_capability not in self.supported_compute_capabilities:
             raise ValueError(
-                "compute_capability must be SM100 or SM103, "
+                "compute_capability must be SM100, SM103 or SM107, "
                 f"got SM{compute_capability[0]}{compute_capability[1]}"
             )
         if num_persistent_clusters <= 0:

@@ -62,7 +62,7 @@ _TMA_ALIGNMENT = 16
 # seq_lens[lo:hi] only need int32 alignment.
 _SCALAR_ALIGNMENT = torch.int32.itemsize
 _PREFILL_TASK_CAPACITY_PAGE_CHUNK = 4
-_SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3)})
+_SUPPORTED_CAPABILITIES = frozenset({(10, 0), (10, 3), (10, 7)})
 # Kernels plus this interface, which fixes the compiled argument alignments.
 _CODEGEN_SOURCES = (
     "q8_indexer_interface.py",
@@ -87,7 +87,7 @@ def _require_supported_device(device: torch.device) -> tuple[int, int]:
     capability = torch.cuda.get_device_capability(device)
     if capability not in _SUPPORTED_CAPABILITIES:
         raise RuntimeError(
-            "Q8KV4/Q8KV8 indexers support only SM100 and SM103, "
+            "Q8KV4/Q8KV8 indexers support only SM100, SM103 and SM107, "
             f"got SM{capability[0]}{capability[1]}"
         )
     return capability
