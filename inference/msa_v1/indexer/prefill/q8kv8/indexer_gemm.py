@@ -636,6 +636,7 @@ class PrefillIndexerGemmSm100:
                             k_producer_state.advance()
                             physical_page = next_physical_page
                     else:
+                        physical_page = cutlass.Int32(0)
                         for tile_idx in cutlass.range(page_count, unroll=1):
                             logical_page = page_begin + tile_idx
                             physical_page = mPageTable[batch_idx, logical_page]
