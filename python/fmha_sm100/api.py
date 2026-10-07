@@ -14,6 +14,8 @@ from typing import Optional, Tuple, Union
 __all__ = [
     "fmha_sm100_plan", "fmha_sm100", "sparse_topk_select",
     "_fmha_sm100_plan", "_fmha_sm100",
+    "WorkspaceGrowthError", "prime_workspace_cache",
+    "seal_workspace_cache", "workspace_cache_sealed",
 ]
 
 import numpy as np
@@ -68,6 +70,20 @@ class _BuffTag(IntEnum):
 _workspace_cache = [[None] * _BuffTag.Total for _ in range(16)]
 # _workspace_cache_per_plan = []
 
+class WorkspaceGrowthError(RuntimeError):
+    """A graph-mode fmha_sm100 workspace buffer had to grow AFTER the cache
+    was sealed.
+
+    CUDA graphs (the serving engine's decode/verify graphs and the MSA
+    prefill piecewise graphs) bake these workspace addresses at capture time;
+    growing the buffer relocates it and leaves every captured graph holding
+    a dangling pointer (the old block returns to the caching allocator, and
+    the next ``torch.cuda.graph`` capture's ``empty_cache()`` unmaps it).
+    Raising converts that silent dangling-pointer class into an observable
+    error that the attention backend can latch off (F3 tripwire).
+    """
+
+
 def _new_ws_cache():
     pass
     # global _workspace_cache
@@ -75,12 +91,46 @@ def _new_ws_cache():
     #     print("new")
     #     _workspace_cache_per_plan.append([[None] * _BuffTag.Total for _ in range(16)])
 
+_workspace_sealed = False
+
+def workspace_cache_sealed() -> bool:
+    """True once ``seal_workspace_cache()`` ran."""
+    return _workspace_sealed
+
+def seal_workspace_cache():
+    """Freeze every ``_workspace_cache`` tag at its current size.
+
+    After sealing, ``_alloc_workspace_buf`` still returns the cached buffer
+    but RAISES ``WorkspaceGrowthError`` instead of reallocating on a grow
+    request. Allocate-on-first-touch of a never-touched tag stays legal
+    (a fresh buffer cannot dangle in any previously captured graph).
+    """
+
+    global _workspace_sealed
+    _workspace_sealed = True
+
+def prime_workspace_cache(tag, size, device, dtype):
+    """Allocate ``tag``'s buffer at AT LEAST ``size`` elements (idempotent).
+
+    Must run BEFORE ``seal_workspace_cache()`` and before the first
+    CUDA-graph capture that could bake this buffer's address. After sealing,
+    a bigger request surfaces the tripwire (WorkspaceGrowthError) instead of
+    silently relocating a pointer that captured graphs replay by address.
+    """
+
+    _alloc_workspace_buf(tag, size, device, dtype)
+
 def _alloc_workspace_buf(tag, size, device, dtype):
     global _workspace_cache
     device_id = torch.device(device).index
     buf = _workspace_cache[device_id][tag]
     if buf is not None and buf.shape[0] >= size:
         return buf
+    if _workspace_sealed and buf is not None:
+        raise WorkspaceGrowthError(
+            f"fmha_sm100 workspace[{_BuffTag(tag).name}] growth refused after "
+            f"seal: have {buf.shape[0]} elems, need {size}"
+        )
     buf = torch.empty(size, dtype=dtype, device=device)
     _workspace_cache[device_id][tag] = buf
     return buf
