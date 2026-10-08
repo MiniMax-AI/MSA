@@ -32,7 +32,7 @@ block size=128、TopK=16。调用入口见[训练接口](#31-msa-v1-训练)。
 | 算子 | 支持的输入格式 | 输出 | 用途与约束 |
 | --- | --- | --- | --- |
 | Prefill Attention | BF16 Q/K/V；Q8KV8；Q8KV4 | BF16 O，可选 FP32 LSE | Paged sparse causal attention，支持变长 chunk prefill |
-| Decode Attention | BF16 Q/K/V；Q8KV8；Q8KV4 | BF16 O | Paged sparse decode / MTP；BF16 和 Q8KV8 需安装可选 FlashInfer 依赖 |
+| Decode Attention | BF16 Q/K/V；Q8KV8；Q8KV4 | 默认 BF16 O；Q8KV4 可选 MXFP8 O | Paged sparse decode / MTP；BF16 和 Q8KV8 需安装可选 FlashInfer 依赖 |
 | Prefill Indexer（含 TopK） | BF16 Q/K；FP8 E4M3 Q/K | INT32 logical page indices | BF16 和 FP8 均支持 1/2/4 个本地 index heads |
 | Decode Indexer（含 TopK） | BF16 Q/K；FP8 E4M3 Q/K；FP8 E4M3 Q + NVFP4 K | INT32 logical page indices | 1/2/4 个本地 index heads，每请求 1–16 个 query |
 | NVFP4 → FP8 转换 | Packed E2M1 数据 + E4M3 scale | FP8 E4M3 数据 | Dense 转换或仅转换 TopK 选中的 paged K/V |

@@ -7,7 +7,7 @@ using namespace cute;
 
 cudaError_t {{ func_name }}(const FMHACutlassSM100Params &p) {
   using Element = cutlass::bfloat16_t;
-  using ElementOut = cutlass::bfloat16_t;
+  using ElementOut = {% if output_mxfp8 %}cutlass::float_e4m3_t{% else %}cutlass::bfloat16_t{% endif %};
   using TileShapeQK = Shape<cute::Int<{{ tile_q }}>, cute::Int<{{ tile_kv }}>, cute::Int<128>>;
   using TileShapePV = Shape<cute::Int<{{ tile_q }}>, cute::Int<128>, cute::Int<{{ tile_kv }}>>;
   using FmhaThreadShape = Shape<{{ thread_shape }}>;
@@ -31,5 +31,5 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params &p) {
       p.kv_page_stride, p.total_page_num, p.kv_block_indexes_ptr, p.kv_block_num, p.pack_factor,
       p.q_tokens_per_batch, p.q_stride_n_original, p.q_stride_h_original, p.h_r_original,
       p.total_qo_len_orig, p.o_direct_ptr, p.num_qo_heads_orig, p.tma_direct_o_enabled, p.num_ctas,
-      p.kv_split_count_ptr, p.merge_counter_ptr, p.merge_item_base);
+      p.kv_split_count_ptr, p.merge_counter_ptr, p.merge_item_base, p.o_sf_ptr);
 }

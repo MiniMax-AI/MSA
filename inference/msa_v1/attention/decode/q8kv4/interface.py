@@ -178,6 +178,7 @@ def _prepare_decode_plan(
     num_kv_heads: int,
     num_kv_splits: int | None = None,
     usable_sm_count: int | None = None,
+    output_mode: str = "bf16",
 ):
     """Prepare the opaque reusable schedule used by the public wrapper."""
     batch_size, q_len_per_req = _normalize_decode_shape(batch_size, q_len_per_req)
@@ -198,6 +199,8 @@ def _prepare_decode_plan(
     )
     if selected_splits not in (1, 2, 4, 8):
         raise ValueError("num_kv_splits must be one of 1, 2, 4, or 8")
+    if output_mode == "mxfp8" and num_kv_splits is not None and selected_splits > 1:
+        raise ValueError("MXFP8 output does not support explicit legacy multi-split")
 
     return _make_backend_plan(
         batch_size,
@@ -208,7 +211,9 @@ def _prepare_decode_plan(
         usable_sm_count=sm_count,
         device=device_idx,
         split_mode=(
-            _split_mode(
+            "streamk"
+            if output_mode == "mxfp8" and num_kv_splits is None
+            else _split_mode(
                 num_q_heads // num_kv_heads,
                 batch_size * q_len_per_req * num_kv_heads,
                 sm_count,
@@ -244,6 +249,7 @@ def _run_backend(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
     out: torch.Tensor,
+    out_scale: torch.Tensor,
     sm_scale: float,
 ):
     return _get_cpp().run_decode(
@@ -257,6 +263,7 @@ def _run_backend(
         k_scale.view(torch.uint8),
         v_scale.view(torch.uint8),
         out,
+        out_scale,
         sm_scale,
     )
 
@@ -273,6 +280,8 @@ class _PlanState:
     num_kv_heads: int
     sm_scale: float
     out: torch.Tensor
+    out_scale: torch.Tensor
+    output_mode: str
 
 
 class BatchDecodeWithPagedKVCacheWrapper:
@@ -293,6 +302,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         num_kv_splits: int | None = None,
         usable_sm_count: int | None = None,
         sm_scale: float | None = None,
+        output_mode: str = "bf16",
     ) -> None:
         """Prepare a reusable request plan outside CUDA Graph capture."""
         for name, tensor in (
@@ -306,6 +316,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise TypeError(f"{name} must be torch.int32")
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("plan() must be called outside CUDA Graph capture")
+        if output_mode not in ("bf16", "mxfp8"):
+            raise ValueError("output_mode must be 'bf16' or 'mxfp8'")
         if page_table.ndim != 2 or page_table.shape[0] <= 0:
             raise ValueError("page_table must have shape [batch, max_pages]")
         batch_size, q_len_per_req = _normalize_decode_shape(
@@ -346,7 +358,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             num_kv_heads=num_kv_heads,
             num_kv_splits=num_kv_splits,
             usable_sm_count=usable_sm_count,
+            output_mode=output_mode,
         )
+        num_tokens = batch_size * q_len_per_req
         self._plan_state = _PlanState(
             backend_plan=backend_plan,
             page_table=page_table,
@@ -358,10 +372,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
             num_kv_heads=num_kv_heads,
             sm_scale=scale,
             out=torch.empty(
-                (batch_size * q_len_per_req, num_q_heads, _HEAD_DIM),
-                dtype=torch.bfloat16,
+                (batch_size * q_len_per_req, num_q_heads, _HEAD_DIM)
+                if output_mode == "bf16"
+                else (num_tokens, num_q_heads * _HEAD_DIM),
+                dtype=torch.bfloat16 if output_mode == "bf16" else torch.float8_e4m3fn,
                 device=page_table.device,
             ),
+            out_scale=torch.zeros(
+                ((num_tokens + 127) // 128) * 128 * num_q_heads * 4
+                if output_mode == "mxfp8" else 0,
+                dtype=torch.uint8,
+                device=page_table.device,
+            ),
+            output_mode=output_mode,
         )
 
     def run(
@@ -371,7 +394,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         *,
         kv_cache_sf: tuple[torch.Tensor, torch.Tensor],
         out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        out_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run one layer using metadata and workspace prepared by :meth:`plan`."""
         state = self._plan_state
         if state is None:
@@ -427,11 +451,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
         out_tensor = state.out if out is None else out
         _check_cuda_contiguous(out_tensor, name="out", alignment=_DATA_ALIGNMENT)
         _check_same_device(q, out_tensor, name="out")
-        if out_tensor.dtype != torch.bfloat16 or out_tensor.shape != state.out.shape:
+        if out_tensor.dtype != state.out.dtype or out_tensor.shape != state.out.shape:
             raise ValueError(
-                f"out must be torch.bfloat16 with shape {tuple(state.out.shape)}"
+                f"out must be {state.out.dtype} with shape {tuple(state.out.shape)}"
             )
-        return _run_backend(
+        if state.output_mode == "bf16" and out_scale is not None:
+            raise ValueError("out_scale is only valid in MXFP8 output mode")
+        scale_tensor = state.out_scale if out_scale is None else out_scale
+        if state.output_mode == "mxfp8":
+            _check_cuda_contiguous(scale_tensor, name="out_scale", alignment=_DATA_ALIGNMENT)
+            _check_same_device(q, scale_tensor, name="out_scale")
+            if scale_tensor.dtype != torch.uint8 or scale_tensor.shape != state.out_scale.shape:
+                raise ValueError(
+                    f"out_scale must be torch.uint8 with shape {tuple(state.out_scale.shape)}"
+                )
+        result = _run_backend(
             q,
             k_cache,
             v_cache,
@@ -442,5 +476,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             k_scale=k_scale,
             v_scale=v_scale,
             out=out_tensor,
+            out_scale=scale_tensor,
             sm_scale=state.sm_scale,
         )
+        return (result, scale_tensor) if state.output_mode == "mxfp8" else result

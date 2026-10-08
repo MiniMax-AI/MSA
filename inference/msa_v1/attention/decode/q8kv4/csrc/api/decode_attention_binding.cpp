@@ -21,5 +21,6 @@ PYBIND11_MODULE(_minimax_msa_v1_attention_decode_q8kv4_cpp, module) {
 
   module.def("run_decode", &run_decode, py::arg("q"), py::arg("k"), py::arg("v"), py::arg("plan"),
              py::arg("seq_lens"), py::arg("page_table"), py::arg("topk_indices"),
-             py::arg("k_scale"), py::arg("v_scale"), py::arg("out"), py::arg("sm_scale"));
+             py::arg("k_scale"), py::arg("v_scale"), py::arg("out"), py::arg("out_scale"),
+             py::arg("sm_scale"));
 }

@@ -4,6 +4,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cuda_fp8.h>
 
 #include "cute/arch/cluster_sm90.hpp"
 #include "cute/arch/copy.hpp"
@@ -407,6 +408,74 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
     }
   }
 
+  CUTLASS_DEVICE static uint16_t load_bf16_output(Storage const &storage, int row, int col,
+                                                   bool swizzled) {
+    uint16_t const *src = reinterpret_cast<uint16_t const *>(storage.smem_o.data);
+    if (!swizzled) {
+      return src[row * Traits::kHeadDim + col];
+    }
+    int const byte_col = col * 2;
+    int const smem_row = (byte_col / 128) * Traits::kHeadGroup + row;
+    int const byte_offset = (smem_row * 128 + (byte_col & 127)) ^ ((smem_row & 7) * 16);
+    return src[byte_offset / 2];
+  }
+
+  CUTLASS_DEVICE static void quantize_o_smem(Storage const &storage, Params const &params,
+                                             int q_token_global, int kv_head_idx,
+                                             int thread_idx, bool swizzled) {
+    constexpr int kThreads = cutlass::NumThreadsPerWarp * Traits::kNumCorrectionWarps;
+    constexpr int kThreadsPerRow = kThreads / Traits::kHeadGroup;
+    constexpr int kElementsPerThread = Traits::kHeadDim / kThreadsPerRow;
+    constexpr int kThreadsPerScale = 32 / kElementsPerThread;
+    static_assert(kElementsPerThread == 8 || kElementsPerThread == 16);
+    int const row = thread_idx / kThreadsPerRow;
+    int const col = (thread_idx % kThreadsPerRow) * kElementsPerThread;
+    int const head = kv_head_idx * Traits::kHeadGroup + row;
+    if (head >= params.num_qo_heads_orig) {
+      return;
+    }
+    int64_t const output_row =
+        static_cast<int64_t>(q_token_global) * params.num_qo_heads_orig + head;
+    float values[kElementsPerThread];
+    float local_max = 0.f;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kElementsPerThread; ++i) {
+      values[i] = __uint_as_float(static_cast<uint32_t>(load_bf16_output(storage, row, col + i, swizzled))
+                                  << 16);
+      local_max = fmaxf(local_max, fabsf(values[i]));
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int mask = 1; mask < kThreadsPerScale; mask *= 2) {
+      local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, mask));
+    }
+    float const raw_scale = local_max * (1.f / 448.f);
+    uint8_t const sf = __nv_cvt_float_to_e8m0(raw_scale, __NV_SATFINITE, cudaRoundPosInf);
+    __nv_fp8_e8m0 sf_value;
+    sf_value.__x = sf;
+    float const scale = static_cast<float>(sf_value);
+    float const inv_scale = scale != 0.f ? 1.f / scale : 0.f;
+    int const sf_col = col / 32;
+    // FlashInfer layout_128x4: [M/128, K/128, M%32, M%128/32, K/32%4].
+    int64_t const sf_offset =
+        (static_cast<int64_t>(q_token_global) / 128) * params.num_qo_heads_orig * 512 +
+        head * 512 + (q_token_global % 32) * 16 + ((q_token_global % 128) / 32) * 4 + sf_col;
+    if ((thread_idx % kThreadsPerScale) == 0) {
+      static_cast<uint8_t *>(params.o_sf_ptr)[sf_offset] = sf;
+    }
+    uint64_t bits[2] = {0, 0};
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kElementsPerThread; ++i) {
+      cutlass::float_e4m3_t const quantized(values[i] * inv_scale);
+      bits[i / 8] |= static_cast<uint64_t>(quantized.storage) << ((i % 8) * 8);
+    }
+    uint64_t *dst = reinterpret_cast<uint64_t *>(static_cast<uint8_t *>(params.o_ptr) +
+                                                 output_row * Traits::kHeadDim + col);
+    dst[0] = bits[0];
+    if constexpr (kElementsPerThread == 16) {
+      dst[1] = bits[1];
+    }
+  }
+
   // Balanced schedule: the workspace holds the slots of an item contiguously ([item][slot]), each
   // slot one 16 x 256 B partial O block followed by its 16 row LSEs, so the merge fetches a slot
   // with one bulk copy. The legacy split path keeps its [slot][packed row][head] layout and the
@@ -541,7 +610,14 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
       copy_o_smem_to_workspace(storage, params, batch_idx, kv_head_idx, q_token_idx, kv_split_idx,
                                warp_group_lane);
     } else {
-      copy_o_smem_to_global(storage, params, batch_idx, kv_head_idx, q_token_idx, warp_group_lane);
+      if constexpr (Traits::kOutputMxfp8) {
+        quantize_o_smem(storage, params,
+                        fmha_fwd_q_token_global_index<Traits>(params, batch_idx, q_token_idx),
+                        kv_head_idx, warp_group_lane, true);
+      } else {
+        copy_o_smem_to_global(storage, params, batch_idx, kv_head_idx, q_token_idx,
+                              warp_group_lane);
+      }
     }
   }
 
@@ -662,10 +738,16 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
       Sm100FmhaNamedBarrier::sync(128, kMergeBarrierId);
     }
     int const head_base = item.kv_head_idx * Traits::kHeadGroup;
-    uint16_t *out_row =
-        static_cast<uint16_t *>(params.o_ptr) +
-        (static_cast<int64_t>(item.q_token_global) * params.num_qo_heads_orig + head_base + row) *
-            Traits::kHeadDim;
+    uint16_t *out_row;
+    if constexpr (Traits::kOutputMxfp8) {
+      out_row = reinterpret_cast<uint16_t *>(storage.smem_o.data) +
+                row * Traits::kHeadDim;
+    } else {
+      out_row = static_cast<uint16_t *>(params.o_ptr) +
+                (static_cast<int64_t>(item.q_token_global) * params.num_qo_heads_orig +
+                 head_base + row) *
+                    Traits::kHeadDim;
+    }
     CUTLASS_PRAGMA_UNROLL
     for (int pass = 0; pass < kPasses; ++pass) {
       int const col = col_base + pass * kPassElements;
@@ -746,6 +828,11 @@ template <class Traits> struct Sm100FmhaCorrectionTmaWarpspecialized {
       if constexpr (kPassElements == 16) {
         out_vec[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
       }
+    }
+    if constexpr (Traits::kOutputMxfp8) {
+      Sm100FmhaNamedBarrier::sync(128, kMergeBarrierId);
+      quantize_o_smem(storage, params, item.q_token_global, item.kv_head_idx, thread_idx,
+                      false);
     }
   }
 

@@ -55,7 +55,8 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 
 at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
                             at::Tensor seq_lens, at::Tensor page_table, at::Tensor topk_indices,
-                            at::Tensor k_scale, at::Tensor v_scale, at::Tensor out, float sm_scale);
+                            at::Tensor k_scale, at::Tensor v_scale, at::Tensor out,
+                            at::Tensor out_scale, float sm_scale);
 
 std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tensor kv_segment_lens,
                                            int num_qo_heads, int num_kv_heads, int num_kv_splits,
@@ -65,6 +66,7 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
 
 at::Tensor run_decode(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
                       at::Tensor seq_lens, at::Tensor page_table, at::Tensor topk_indices,
-                      at::Tensor k_scale, at::Tensor v_scale, at::Tensor out, float sm_scale);
+                      at::Tensor k_scale, at::Tensor v_scale, at::Tensor out,
+                      at::Tensor out_scale, float sm_scale);
 
 } // namespace minimax::msa_v1::attention::decode::q8kv4

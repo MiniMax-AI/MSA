@@ -6,7 +6,7 @@
 
 namespace cutlass::fmha::collective {
 
-template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
+template <int HeadGroup = 16, bool OutputMxfp8 = false> struct Sm100FmhaQ8Kv4BaseTraits {
   static_assert(HeadGroup == 8 || HeadGroup == 16, "Q8KV4 decode supports GQA 8 or 16.");
   static constexpr int kTileQ = HeadGroup;
   static constexpr int kTileKv = 128;
@@ -15,6 +15,7 @@ template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
   static constexpr int kHeadDim = 128;
   static constexpr int kPageSize = 128;
   static constexpr int kHeadGroup = HeadGroup;
+  static constexpr bool kOutputMxfp8 = OutputMxfp8;
   static constexpr int kScaleGroupSize = 16;
 
   static constexpr int kNumThreads = 512;
@@ -109,8 +110,8 @@ template <int HeadGroup = 16> struct Sm100FmhaQ8Kv4BaseTraits {
                 "split plan Q tile must map to FMHA forward decode Q tiles.");
 };
 
-template <int TopK, bool EnableSplitKv, int HeadGroup = 16>
-struct Sm100FmhaQ8Kv4SparseTraits : Sm100FmhaQ8Kv4BaseTraits<HeadGroup> {
+template <int TopK, bool EnableSplitKv, int HeadGroup = 16, bool OutputMxfp8 = false>
+struct Sm100FmhaQ8Kv4SparseTraits : Sm100FmhaQ8Kv4BaseTraits<HeadGroup, OutputMxfp8> {
   static constexpr int kSparseTopK = TopK;
   static constexpr int kSparseKvTokens = TopK * Sm100FmhaQ8Kv4BaseTraits<HeadGroup>::kPageSize;
   static constexpr bool kEnableSplitKvPath = EnableSplitKv;
@@ -119,13 +120,13 @@ struct Sm100FmhaQ8Kv4SparseTraits : Sm100FmhaQ8Kv4BaseTraits<HeadGroup> {
 };
 
 template <bool IsSplitKV, SparseAttnMode kSparseAttnMode, bool IsQ8KV4, int SparseTopK = 16,
-          int FixedQTokensPerBatch = 0, int HeadGroup = 16>
+          int FixedQTokensPerBatch = 0, int HeadGroup = 16, bool OutputMxfp8 = false>
 struct Sm100FmhaQ8Kv4TraitSelector {
   static_assert(IsQ8KV4, "this SM100 forward decode path is specialized for Q8KV4.");
   static_assert(kSparseAttnMode == SparseAttnMode::Sparse,
                 "Q8KV4 decode only supports sparse attention.");
   static_assert(FixedQTokensPerBatch == 0, "Q8KV4 decode query length remains a runtime scalar.");
-  using type = Sm100FmhaQ8Kv4SparseTraits<SparseTopK, IsSplitKV, HeadGroup>;
+  using type = Sm100FmhaQ8Kv4SparseTraits<SparseTopK, IsSplitKV, HeadGroup, OutputMxfp8>;
 };
 
 } // namespace cutlass::fmha::collective

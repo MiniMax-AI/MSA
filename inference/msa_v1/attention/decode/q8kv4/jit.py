@@ -303,17 +303,18 @@ class JitSpec:
     dequant_mode: str
     target_arch: str
     gqa_ratio: int = 16
+    output_mode: str = "bf16"
 
     @property
     def uri(self) -> str:
         return (
-            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.dequant_mode}_"
+            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}_{self.dequant_mode}_"
             f"{self.target_arch}_{_source_digest()}"
         )
 
     def build_and_load(self):
         cache_dir = _cache_dir(
-            f"{self.variant_name}_gqa{self.gqa_ratio}",
+            f"{self.variant_name}_gqa{self.gqa_ratio}_{self.output_mode}",
             self.target_arch,
             self.dequant_mode,
         )
@@ -334,6 +335,7 @@ class JitSpec:
             "sparse_mode": "Sparse",
             "sparse_topk": 16,
             "fixed_q_tokens_per_batch": 0,
+            "output_mxfp8": self.output_mode == "mxfp8",
         }
         inst_template = jinja2.Template(
             (_TEMPLATES / "decode_attention_inst.cu.jinja").read_text()
@@ -373,11 +375,14 @@ def gen_jit_spec(
     split_kv: bool = False,
     gqa_ratio: int = 16,
     device=None,
+    output_mode: str = "bf16",
 ) -> JitSpec:
     if int(topk) != 16:
         raise ValueError(f"Q8KV4 decode attention requires TopK 16, got {topk}")
     if gqa_ratio not in (8, 16):
         raise ValueError("Q8KV4 decode attention requires GQA ratio 8 or 16")
+    if output_mode not in ("bf16", "mxfp8"):
+        raise ValueError("output_mode must be 'bf16' or 'mxfp8'")
     arch = _validate_gqa_arch(gqa_ratio, device)
     return JitSpec(
         _SPARSE_VARIANTS[bool(split_kv)],
@@ -385,6 +390,7 @@ def gen_jit_spec(
         _dequant_mode(arch),
         arch,
         gqa_ratio,
+        output_mode,
     )
 
 
@@ -402,10 +408,12 @@ class _VariantManager:
         self._lock = threading.Lock()
 
     def get(
-        self, *, topk: int, split_kv: bool, gqa_ratio: int = 16, device=None
+        self, *, topk: int, split_kv: bool, gqa_ratio: int = 16,
+        output_mode: str = "bf16", device=None
     ) -> _VariantWrapper:
         spec = gen_jit_spec(
-            topk=topk, split_kv=split_kv, gqa_ratio=gqa_ratio, device=device
+            topk=topk, split_kv=split_kv, gqa_ratio=gqa_ratio,
+            output_mode=output_mode, device=device
         )
         cached = self._loaded.get(spec.uri)
         if cached is not None:
@@ -429,9 +437,11 @@ def get_fmha_fwd_variant(
     split_kv: bool = False,
     gqa_ratio: int = 16,
     device=None,
+    output_mode: str = "bf16",
 ):
     return _variant_manager.get(
-        topk=topk, split_kv=split_kv, gqa_ratio=gqa_ratio, device=device
+        topk=topk, split_kv=split_kv, gqa_ratio=gqa_ratio,
+        output_mode=output_mode, device=device
     )
 
 

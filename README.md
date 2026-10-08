@@ -35,7 +35,7 @@ See the [training interfaces](#31-msa-v1-training) for entry points.
 | Operator | Supported input formats | Outputs | Use and constraints |
 | --- | --- | --- | --- |
 | Prefill Attention | BF16 Q/K/V; Q8KV8; Q8KV4 | BF16 O, optional FP32 LSE | Paged sparse causal attention with variable-length chunk prefill |
-| Decode Attention | BF16 Q/K/V; Q8KV8; Q8KV4 | BF16 O | Paged sparse decode / MTP; BF16 and Q8KV8 require the optional FlashInfer dependency |
+| Decode Attention | BF16 Q/K/V; Q8KV8; Q8KV4 | BF16 O by default; Q8KV4 optionally emits MXFP8 O | Paged sparse decode / MTP; BF16 and Q8KV8 require the optional FlashInfer dependency |
 | Prefill Indexer (including TopK) | BF16 Q/K; FP8 E4M3 Q/K | INT32 logical page indices | BF16 and FP8 support 1/2/4 local index heads |
 | Decode Indexer (including TopK) | BF16 Q/K; FP8 E4M3 Q/K; FP8 E4M3 Q + NVFP4 K | INT32 logical page indices | 1/2/4 local index heads and 1–16 queries per request |
 | NVFP4 → FP8 conversion | Packed E2M1 data + E4M3 scales | FP8 E4M3 data | Dense conversion or conversion of only TopK-selected paged K/V |

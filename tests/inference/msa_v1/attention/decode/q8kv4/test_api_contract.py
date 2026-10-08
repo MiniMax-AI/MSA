@@ -42,10 +42,11 @@ def test_plan_and_run_signatures_use_canonical_names() -> None:
         "num_kv_splits",
         "usable_sm_count",
         "sm_scale",
+        "output_mode",
     )
     assert tuple(
         inspect.signature(BatchDecodeWithPagedKVCacheWrapper.run).parameters
-    ) == ("self", "q", "paged_kv_cache", "kv_cache_sf", "out")
+    ) == ("self", "q", "paged_kv_cache", "kv_cache_sf", "out", "out_scale")
 
 
 def test_run_requires_plan_and_aligned_data(monkeypatch) -> None:
@@ -148,6 +149,7 @@ def test_jit_spec_contains_only_compile_time_configuration(monkeypatch) -> None:
         "dequant_mode",
         "target_arch",
         "gqa_ratio",
+        "output_mode",
     )
     assert no_split.variant_name == "decode_attention_q8kv4_topk16"
     assert no_split.dequant_mode == "fp16_fallback"
@@ -156,6 +158,9 @@ def test_jit_spec_contains_only_compile_time_configuration(monkeypatch) -> None:
     native_eight = jit.gen_jit_spec(topk=16, split_kv=False, gqa_ratio=8)
     assert native_eight.uri != no_split.uri
     assert native_eight.gqa_ratio == 8
+    mxfp8 = jit.gen_jit_spec(output_mode="mxfp8")
+    assert mxfp8.uri != no_split.uri
+    assert mxfp8.output_mode == "mxfp8"
     with pytest.raises(ValueError, match="GQA ratio"):
         jit.gen_jit_spec(gqa_ratio=12)
     monkeypatch.setattr(jit, "_target_arch", lambda device=None: "107a")

@@ -48,11 +48,13 @@ try:
         split_kv=False,
         device=None,
         gqa_ratio=16,
+        output_mode="bf16",
     ):
         return get_fmha_fwd_variant(
             topk=int(topk),
             split_kv=bool(split_kv),
             gqa_ratio=int(gqa_ratio),
+            output_mode=str(output_mode),
             device=None if device is None else int(device),
         )._fn
 

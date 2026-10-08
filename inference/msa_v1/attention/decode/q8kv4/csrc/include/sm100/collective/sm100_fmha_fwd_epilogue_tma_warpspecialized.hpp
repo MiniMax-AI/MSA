@@ -12,6 +12,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized : Sm100FmhaCorrectionTmaWarpspecia
 
   struct Arguments {
     void *o_ptr = nullptr;
+    void *o_sf_ptr = nullptr;
     void *o_direct_ptr = nullptr;
     int total_qo_len_orig = 0;
     int num_qo_heads_orig = 0;

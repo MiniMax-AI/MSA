@@ -11,7 +11,8 @@ void FMHAVariantRun_{{ variant_name }}(
     ffi::TensorView qo_segment_lens, ffi::TensorView kv_segment_lens,
     ffi::TensorView qo_segment_offsets, ffi::TensorView kv_segment_offsets,
     ffi::TensorView packed_work_range, ffi::TensorView packed_work_info,
-    Optional<ffi::TensorView> maybe_o, double sm_scale, int64_t max_qo_len,
+    Optional<ffi::TensorView> maybe_o, Optional<ffi::TensorView> maybe_o_sf,
+    double sm_scale, int64_t max_qo_len,
     Optional<ffi::TensorView> maybe_qo_offsets, int64_t num_kv_splits,
     Optional<ffi::TensorView> maybe_kv_tile_begin_indices,
     Optional<ffi::TensorView> maybe_kv_tile_end_indices,
@@ -53,6 +54,10 @@ void FMHAVariantRun_{{ variant_name }}(
   params.packed_work_range_ptr = static_cast<uint64_t *>(packed_work_range.data_ptr());
   params.packed_work_info_ptr = static_cast<uint64_t *>(packed_work_info.data_ptr());
   params.o_ptr = o_ptr;
+  params.o_sf_ptr = maybe_o_sf.has_value() ? maybe_o_sf.value().data_ptr() : nullptr;
+  {% if output_mxfp8 %}
+  TVM_FFI_ICHECK_NE(params.o_sf_ptr, nullptr) << "MXFP8 output requires a scale tensor";
+  {% endif %}
   params.mask_mode_code = 1;
   params.sm_scale = sm_scale;
   params.num_qo_heads = num_qo_heads;
@@ -123,13 +128,13 @@ void FMHAVariantRun_{{ variant_name }}(
     params.q_stride_n = packed_num_qo_heads * head_dim_qk;
     params.q_stride_h = head_dim_qk;
 
-    if (maybe_o.has_value() && static_cast<int>(maybe_o.value().size(1)) > packed_num_qo_heads) {
+    if (maybe_o.has_value() && {% if output_mxfp8 %}true{% else %}static_cast<int>(maybe_o.value().size(1)) > packed_num_qo_heads{% endif %}) {
       params.o_direct_ptr = o_ptr;
-      params.num_qo_heads_orig = static_cast<int>(maybe_o.value().size(1));
+      params.num_qo_heads_orig = {% if output_mxfp8 %}num_qo_heads{% else %}static_cast<int>(maybe_o.value().size(1)){% endif %};
       params.o_ptr = nullptr;
 
-      params.tma_direct_o_enabled = qo_len_uniform && (params.max_qo_len > 0);
-      params.total_qo_len_orig = static_cast<int>(maybe_o.value().size(0));
+      params.tma_direct_o_enabled = {% if output_mxfp8 %}false{% else %}qo_len_uniform && (params.max_qo_len > 0){% endif %};
+      params.total_qo_len_orig = {% if output_mxfp8 %}static_cast<int>(q.size(0)){% else %}static_cast<int>(maybe_o.value().size(0)){% endif %};
     }
   }
 

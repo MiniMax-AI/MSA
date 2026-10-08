@@ -187,6 +187,11 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
     if (params.o_direct_ptr == nullptr || params.num_qo_heads_orig <= 0) {
       return cudaErrorInvalidValue;
     }
+    if constexpr (Traits::kOutputMxfp8) {
+      if (params.o_sf_ptr == nullptr) {
+        return cudaErrorInvalidValue;
+      }
+    }
     if (params.head_dim_qk != Traits::kHeadDim || params.head_dim_vo != Traits::kHeadDim) {
       return cudaErrorInvalidValue;
     }
@@ -279,7 +284,6 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
     attrs[0].val.clusterDim.x = kClusterSize;
     attrs[0].val.clusterDim.y = 1;
     attrs[0].val.clusterDim.z = 1;
-
     cudaLaunchConfig_t launch_config{};
     launch_config.gridDim = get_grid_shape(params);
     launch_config.blockDim = get_block_shape();

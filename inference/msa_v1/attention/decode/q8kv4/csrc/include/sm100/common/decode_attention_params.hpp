@@ -14,6 +14,7 @@ struct FMHACutlassSM100Params {
   uint64_t *packed_work_range_ptr;
   uint64_t *packed_work_info_ptr;
   void *o_ptr;
+  void *o_sf_ptr = nullptr;
   int mask_mode_code;
   float sm_scale;
   int num_qo_heads;

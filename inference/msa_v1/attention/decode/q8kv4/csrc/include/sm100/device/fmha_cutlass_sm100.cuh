@@ -23,12 +23,14 @@ template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQ
               cutlass::fmha::collective::SparseAttnMode::Off,
           bool IsQ8KV4 = false, int SparseTopK = 16, int FixedQTokensPerBatch = 0>
 struct FwdRunner {
+  static constexpr bool kOutputMxfp8 = cute::is_same_v<DTypeOut, cutlass::float_e4m3_t>;
   using Traits = typename cutlass::fmha::collective::Sm100FmhaQ8Kv4TraitSelector<
       IsSplitKV, kSparseAttnMode, IsQ8KV4, SparseTopK, FixedQTokensPerBatch,
-      pack_factor_of<ActiveMask>::value>::type;
+      pack_factor_of<ActiveMask>::value, kOutputMxfp8>::type;
   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
       DTypeIn, float, float, TileShapeQK, TileShapePV, void, void, void, ActiveMask, ThreadShape,
-      IsSplitKV, KVPageSize, kSparseAttnMode, IsQ8KV4, SparseTopK, FixedQTokensPerBatch>;
+      IsSplitKV, KVPageSize, kSparseAttnMode, IsQ8KV4, SparseTopK, FixedQTokensPerBatch,
+      kOutputMxfp8>;
   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<Traits>;
   using ProblemShape = cute::tuple<VariableLength, VariableLength, int,
                                    cute::tuple<cute::tuple<int, int>, int>, PerBatchOffset>;
@@ -53,6 +55,7 @@ struct FwdRunner {
     arguments.problem_shape = problem_shape;
     arguments.mainloop.load.fmha = params;
     arguments.epilogue.o_ptr = params.o_ptr;
+    arguments.epilogue.o_sf_ptr = params.o_sf_ptr;
     arguments.epilogue.o_direct_ptr = params.o_direct_ptr;
     arguments.epilogue.total_qo_len_orig = params.total_qo_len_orig;
     arguments.epilogue.num_qo_heads_orig = params.num_qo_heads_orig;
@@ -129,7 +132,7 @@ run_fmha_fwd(void *workspace_buffer, DTypeIn *q, DTypeIn *k, DTypeIn *v, IdType 
              int h_r_original = 0, int total_qo_len_orig = 0, void *o_direct = nullptr,
              int num_qo_heads_orig = 0, bool tma_direct_o_enabled = false, int num_ctas = 0,
              IdType *kv_split_count_indices = nullptr, int *merge_counters = nullptr,
-             int64_t merge_item_base = 0) {
+             int64_t merge_item_base = 0, void *o_sf = nullptr) {
   FMHACutlassSM100Params params{};
   params.workspace_buffer_ptr = workspace_buffer;
   params.q_ptr = q;
@@ -181,6 +184,7 @@ run_fmha_fwd(void *workspace_buffer, DTypeIn *q, DTypeIn *k, DTypeIn *v, IdType 
   params.q_stride_h_original = q_stride_h_original;
   params.total_qo_len_orig = total_qo_len_orig;
   params.o_direct_ptr = o_direct;
+  params.o_sf_ptr = o_sf;
   params.num_qo_heads_orig = num_qo_heads_orig;
   params.num_ctas = num_ctas;
   params.tma_direct_o_enabled = tma_direct_o_enabled;

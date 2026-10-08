@@ -311,11 +311,12 @@ public:
     return fn;
   }
   tvm::ffi::Function get_fmha_fwd_sparse_variant(int topk, bool split_kv, int device,
-                                                 int gqa_ratio) {
+                                                 int gqa_ratio, bool output_mxfp8) {
     uint64_t const split_key = split_kv ? 1 : 0;
     uint64_t const key = (static_cast<uint64_t>(device) << 33) |
                          (static_cast<uint64_t>(gqa_ratio) << 17) |
-                         (static_cast<uint64_t>(topk) << 1) | split_key;
+                         (static_cast<uint64_t>(topk) << 2) |
+                         (static_cast<uint64_t>(output_mxfp8) << 1) | split_key;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto it = fmha_fwd_sparse_variant_cache_.find(key);
@@ -324,7 +325,8 @@ public:
     }
     auto jit_fn = tvm::ffi::Function::GetGlobalRequired(
         "msa_v1.attention.decode.q8kv4.jit_get_fmha_fwd_sparse_variant");
-    auto fn = jit_fn((int64_t)topk, split_kv, (int64_t)device, (int64_t)gqa_ratio)
+    auto fn = jit_fn((int64_t)topk, split_kv, (int64_t)device, (int64_t)gqa_ratio,
+                     output_mxfp8 ? "mxfp8" : "bf16")
                   .cast<tvm::ffi::Function>();
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -577,7 +579,7 @@ PlanInfo _make_decode_plan_impl(at::Tensor qo_segment_lens, at::Tensor kv_segmen
 at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan,
                             at::Tensor seq_lens, at::Tensor page_table, at::Tensor topk_indices,
                             at::Tensor k_scale, at::Tensor v_scale, at::Tensor out,
-                            float sm_scale) {
+                            at::Tensor out_scale, float sm_scale) {
   c10::cuda::CUDAGuard device_guard(q.device());
   int device = q.get_device();
   int64_t nnz_qo = q.size(0);
@@ -609,6 +611,9 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
   // Balanced schedule: split items merge in the kernel and whole items store directly, so the
   // reduction launch is skipped.
   bool const in_kernel_merge = plan.stream_k;
+  bool const output_mxfp8 = out_scale.numel() != 0;
+  TORCH_CHECK(!output_mxfp8 || !use_split_kv || in_kernel_merge,
+              "MXFP8 output requires Stream-K for multiple splits");
   auto &mgr = VariantManager::instance();
   int64_t run_kv_page_stride = page_table.size(1);
 
@@ -620,7 +625,8 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
         torch_to_tvm(plan.qo_segment_lens), torch_to_tvm(seq_lens),
         torch_to_tvm(plan.qo_segment_offsets), torch_to_tvm(plan.kv_segment_offsets),
         torch_to_tvm(plan.packed_work_range), torch_to_tvm(plan.packed_work_info),
-        torch_to_tvm(out), (double)sm_scale, (int64_t)max_qo_len, tensor_or_null(plan.qo_offset),
+        torch_to_tvm(out), tensor_or_null(out_scale), (double)sm_scale, (int64_t)max_qo_len,
+        tensor_or_null(plan.qo_offset),
         run_num_kv_splits,
         in_kernel_split_kv ? tvm::ffi::Tensor(nullptr) : tensor_or_null(plan.kv_tile_begin_indices),
         in_kernel_split_kv ? tvm::ffi::Tensor(nullptr) : tensor_or_null(plan.kv_tile_end_indices),
@@ -661,7 +667,8 @@ at::Tensor _run_decode_impl(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &
 
   if (fmha_fwd_sparse_candidate) {
     auto variant_fn =
-        mgr.get_fmha_fwd_sparse_variant(fmha_fwd_runtime_topk, use_split_kv, device, pack_factor);
+        mgr.get_fmha_fwd_sparse_variant(fmha_fwd_runtime_topk, use_split_kv, device, pack_factor,
+                                        output_mxfp8);
     call_fmha_variant(variant_fn, fmha_fwd_run_kv_splits, fmha_fwd_in_kernel_split,
                       fmha_fwd_uniform_full_pages);
   } else {
@@ -709,10 +716,11 @@ std::unique_ptr<PlanInfo> make_decode_plan(at::Tensor qo_segment_lens, at::Tenso
 
 at::Tensor run_decode(at::Tensor q, at::Tensor k, at::Tensor v, PlanInfo &plan_info,
                       at::Tensor seq_lens, at::Tensor page_table, at::Tensor topk_indices,
-                      at::Tensor k_scale, at::Tensor v_scale, at::Tensor out, float sm_scale) {
+                      at::Tensor k_scale, at::Tensor v_scale, at::Tensor out,
+                      at::Tensor out_scale, float sm_scale) {
   ensure_initialized();
   return _run_decode_impl(q, k, v, plan_info, seq_lens, page_table, topk_indices, k_scale, v_scale,
-                          out, sm_scale);
+                          out, out_scale, sm_scale);
 }
 
 } // namespace minimax::msa_v1::attention::decode::q8kv4

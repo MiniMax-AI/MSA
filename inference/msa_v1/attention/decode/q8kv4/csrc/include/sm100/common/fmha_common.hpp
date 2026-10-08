@@ -55,6 +55,7 @@ template <class Traits> struct Sm100FmhaFwdKernelParams {
   void const *k_scale_ptr = nullptr;
   void const *v_scale_ptr = nullptr;
   void *o_ptr = nullptr;
+  void *o_sf_ptr = nullptr;
   void *workspace_o_ptr = nullptr;
   float *workspace_lse_ptr = nullptr;
 
@@ -460,6 +461,7 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     dst.k_scale_ptr = src.k_scale_ptr;
     dst.v_scale_ptr = src.v_scale_ptr;
     dst.o_ptr = src.o_direct_ptr != nullptr ? src.o_direct_ptr : src.o_ptr;
+    dst.o_sf_ptr = src.o_sf_ptr;
     dst.workspace_o_ptr = src.workspace_o_ptr;
     dst.workspace_lse_ptr = src.workspace_lse_ptr;
     dst.packed_work_range_ptr = src.packed_work_range_ptr;
@@ -527,8 +529,11 @@ template <class Traits> struct FMHACutlassSM100ParamsBuilder {
     if (status != cudaSuccess) {
       return status;
     }
-    status = build_o_desc(src, dst.tma);
-    return status;
+    if constexpr (Traits::kOutputMxfp8) {
+      return cudaSuccess;
+    } else {
+      return build_o_desc(src, dst.tma);
+    }
   }
 };
 

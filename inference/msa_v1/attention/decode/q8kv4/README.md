@@ -5,7 +5,8 @@
 ## Purpose
 
 Paged sparse causal decode attention for SM100, SM103, and SM107. Q uses E4M3, K/V use packed E2M1
-with E4M3 scales, and the output uses BF16.
+with E4M3 scales. The default output uses BF16; an optional Stream-K mode emits
+MXFP8 activation and scales for a compatible output projection.
 GQA=8 and GQA=16 are supported on B200/B300; SM107 retains GQA=16 support.
 Dispatch uses the actual `Hq/Hkv` ratio.
 
@@ -35,6 +36,17 @@ out = wrapper.run(
 `plan()` accepts request-level metadata, and `run()` accepts Q/K/V tensors and quantization
 scales for the current layer. Callers may pass a preallocated `out` to `run()`.
 
+To emit MXFP8, pass `output_mode="mxfp8"` to `plan()`. In this mode `run()` returns
+`(data, scales)`: `data` is E4M3 `[B * q_len_per_req, Hq * 128]`, and `scales` is a
+one-dimensional `torch.uint8` UE8M0 tensor in FlashInfer's 128x4 swizzled layout. Its
+length is `ceil(B * q_len_per_req / 128) * Hq * 512`. The quantization contract is BF16
+attention output followed by FP32 MXFP8 quantization in groups of 32 elements. Pass
+preallocated `out` and `out_scale` when capturing a CUDA Graph. The default
+`output_mode="bf16"` retains the original output shape and return type.
+The wrapper's scale buffer is zero-initialized at `plan()` time. If supplying a separate
+`out_scale`, initialize its padded scale rows to zero before capture; the kernel writes only
+scales for valid output rows.
+
 ## Data contract
 
 - `q`: `[B * q_len_per_req, Hq, 128]`, E4M3.
@@ -48,7 +60,7 @@ scales for the current layer. Callers may pass a preallocated `out` to `run()`.
   be the final valid entry.
 - `page_table`: `[B, max_pages]`, mapping logical pages to physical pages.
 - `seq_lens`: `[B]`, final KV lengths including the current decode/MTP query chunk.
-- `out`: `[B * q_len_per_req, Hq, 128]`, BF16.
+- `out`: `[B * q_len_per_req, Hq, 128]`, BF16 by default; see the MXFP8 mode above.
 
 All tensors must be contiguous and reside on the same CUDA device. `topk_indices`, `page_table`,
 and `seq_lens` use `torch.int32`; Q, K/V, scales, and output require 16-byte aligned addresses.
@@ -70,6 +82,9 @@ and `seq_lens` use `torch.int32`; Q, K/V, scales, and output require 16-byte ali
   automatically. All support this reuse. Each wrapper owns independent workspace that can be
   released when the wrapper is destroyed. Concurrent streams or CUDA Graphs must use separate
   wrappers.
+- MXFP8 mode uses Stream-K when the split count is automatic. An explicit split count greater
+  than one selects the legacy multi-split path and is rejected in MXFP8 mode; no helper
+  reduction kernel is added.
 - Processes may share `TORCH_EXTENSIONS_DIR` on a filesystem supporting POSIX file locks.
   Each process uses its own wrapper; cold builds serialize publication of the same artifact.
 - SM100/SM103 require CUDA Toolkit 12.9 or newer; SM107 requires CUDA Toolkit 13.5 or newer.

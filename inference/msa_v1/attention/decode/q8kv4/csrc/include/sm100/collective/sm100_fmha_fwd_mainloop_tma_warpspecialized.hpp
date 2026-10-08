@@ -507,16 +507,17 @@ template <class ElementOrTraits, class ElementQK = void, class ElementPV = void,
           class StrideK = void, class StrideV = void, class Mask = void, class ThreadShape = void,
           bool IsSplitKV_ = false, int KVPageSize = -1,
           SparseAttnMode kSparseAttnMode = SparseAttnMode::Off, bool IsQ8KV4_ = true,
-          int SparseTopK = 16, int FixedQTokensPerBatch = 0>
+          int SparseTopK = 16, int FixedQTokensPerBatch = 0, bool OutputMxfp8 = false>
 struct Sm100FmhaFwdMainloopTmaWarpspecialized
     : Sm100FmhaFwdQ8Kv4MainloopTmaWarpspecialized<typename Sm100FmhaQ8Kv4TraitSelector<
           IsSplitKV_, kSparseAttnMode, IsQ8KV4_, SparseTopK, FixedQTokensPerBatch,
-          pack_factor_of<Mask>::value>::type> {
+          pack_factor_of<Mask>::value, OutputMxfp8>::type> {
   static_assert(IsQ8KV4_, "fwd_decode currently provides only the q8kv4 mainloop specialization.");
 
   using Q8Kv4Traits =
       typename Sm100FmhaQ8Kv4TraitSelector<IsSplitKV_, kSparseAttnMode, IsQ8KV4_, SparseTopK,
-                                           FixedQTokensPerBatch, pack_factor_of<Mask>::value>::type;
+                                           FixedQTokensPerBatch, pack_factor_of<Mask>::value,
+                                           OutputMxfp8>::type;
   using Base = Sm100FmhaFwdQ8Kv4MainloopTmaWarpspecialized<Q8Kv4Traits>;
   using FmhaTraits = typename Base::FmhaTraits;
 
