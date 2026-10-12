@@ -170,6 +170,9 @@ for Tree Indexer usage.
 
 ### 3.2 MSA v1 inference
 
+Cache data must be contiguous along the last (dim) storage dimension. Q8KV4 scales
+must be contiguous within each page. See the [cache layout requirements](inference/msa_v1/README.md#cache-views).
+
 Decode indexers also expose `BatchDecodeIndexerPlan`: construct and bind it outside capture.
 Its `update()` can run inside a Graph to refresh length metadata shared by layers in the same step.
 

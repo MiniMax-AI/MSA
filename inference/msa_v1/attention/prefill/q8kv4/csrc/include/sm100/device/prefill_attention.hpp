@@ -28,6 +28,11 @@ struct PrefillArguments {
   int num_q_heads = 0;
   int num_kv_heads = 0;
   int physical_pages = 0;
+  // Byte distance between consecutive pages; pages may sit inside wider per-page rows.
+  int64_t kv_page_stride = 0;
+  int64_t kv_head_stride = 0;
+  int64_t kv_token_stride = 0;
+  int64_t scale_page_stride = 0;
   int max_pages = 0;
   int total_rows = 0;
   int qsplit_stride = 0;

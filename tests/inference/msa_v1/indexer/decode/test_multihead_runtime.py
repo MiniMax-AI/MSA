@@ -9,6 +9,8 @@ import weakref
 import pytest
 import torch
 
+from tests.inference.msa_v1.cache_layout import cache_view, scale_cache_view
+
 
 def _synchronize(stream=None):
     watchdog = threading.Timer(30.0, lambda: os._exit(124))
@@ -45,6 +47,9 @@ def test_multihead_runtime(kind, heads):
         )
         q, k, *tail = values
         scale, table, seq = tail if kind == "q8kv4" else (None, *tail)
+        k = cache_view(k, "token" if batch == 3 else "combined")
+        if scale is not None:
+            scale = scale_cache_view(scale, "page")
         kwargs = {"k_scale": scale} if scale is not None else {}
         wrapper = api.BatchDecodeIndexerWithPagedKVCacheWrapper()
         wrapper.plan(table, seq, num_index_heads=heads)

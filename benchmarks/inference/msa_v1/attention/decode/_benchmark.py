@@ -92,7 +92,14 @@ def _make_query(shape, *, generator, device):
 
 
 def _cache_tensors(packed_shape, scale_shape, generator, device):
-    if KV_FORMAT in ("bf16", "q8kv8"):
+    if KV_FORMAT == "bf16":
+        shape = (*packed_shape[:-1], HEAD_DIM)
+        # Stage K on the host while generating V to avoid overlapping K storage
+        # with both the FP32 random temporary and BF16 V. Preserve RNG ordering.
+        k_host = _make_query(shape, generator=generator, device=device).cpu()
+        v = _make_query(shape, generator=generator, device=device)
+        return k_host.to(device=device), v, None, None
+    if KV_FORMAT == "q8kv8":
         shape = (*packed_shape[:-1], HEAD_DIM)
         return (
             _make_query(shape, generator=generator, device=device),

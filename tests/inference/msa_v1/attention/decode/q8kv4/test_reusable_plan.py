@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -17,6 +19,7 @@ from tests.inference.msa_v1.attention.decode.q8kv4.reference import (
 )
 from tests.inference.msa_v1.attention.decode.q8kv4.runtime import compile_modules
 from tests.inference.msa_v1.attention.decode.runtime import run_cuda
+from tests.inference.msa_v1.cache_layout import cache_view, scale_cache_view
 from tests.inference.msa_v1.decode.metadata import make_decode_topk
 
 pytestmark = pytest.mark.gpu
@@ -141,6 +144,16 @@ def test_independent_plans_release_workspace_and_run_concurrently(
         for index in range(2)
     ]
     expected = [decode_attention_reference(item) for item in inputs]
+    inputs = [
+        replace(
+            item,
+            packed_k=cache_view(item.packed_k, layout, alignment_bytes=32),
+            packed_v=cache_view(item.packed_v, layout, alignment_bytes=32),
+            k_scale=scale_cache_view(item.k_scale, "page"),
+            v_scale=scale_cache_view(item.v_scale, "page"),
+        )
+        for item, layout in zip(inputs, ("token", "combined"), strict=True)
+    ]
     outputs = [torch.empty_like(item.q, dtype=torch.bfloat16) for item in inputs]
     torch.cuda.synchronize()
     allocated_before = torch.cuda.memory_allocated()

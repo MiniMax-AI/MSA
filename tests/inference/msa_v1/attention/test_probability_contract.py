@@ -327,6 +327,11 @@ def _verify_cpp(root, scores, maxima, scales, reference, reference_p):
     de_body = de_body.split("float scale_softmax_log2) {", 1)[1].split(
         "    store_transposed_smem_8b_16x128(", 1
     )[0]
+    # This probe uses the GQA16 fragment; exclude the GQA8 shared-memory store.
+    de_common, de_branches = de_body.split(
+        "    if constexpr (Traits::kHeadGroup == 8) {", 1
+    )
+    de_body = de_common + de_branches.split("    } else {", 1)[1]
     source = (
         r"""
     #include <cuda_runtime.h>

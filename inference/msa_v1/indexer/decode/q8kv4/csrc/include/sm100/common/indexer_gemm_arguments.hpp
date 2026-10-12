@@ -22,6 +22,10 @@ struct IndexerGemmArguments {
   int query_length = 0;
   int max_pages = 0;
   int physical_pages = 0;
+  // Byte distance between consecutive pages; pages may sit inside wider per-page rows.
+  int64_t packed_k_page_stride = 0;
+  int64_t packed_k_token_stride = 0;
+  int64_t k_scale_page_stride = 0;
   int sm_count = 0;
 };
 

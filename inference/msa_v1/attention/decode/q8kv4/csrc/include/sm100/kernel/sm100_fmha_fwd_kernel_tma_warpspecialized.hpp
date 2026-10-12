@@ -227,8 +227,13 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
     if (params.total_page_num <= 0 || params.batch_size <= 0) {
       return cudaErrorInvalidValue;
     }
-    if (params.k_stride_h != Traits::kPageSize * (Traits::kHeadDim / 2) ||
-        params.v_stride_h != Traits::kPageSize * (Traits::kHeadDim / 2)) {
+    if (params.k_stride_n != params.v_stride_n || params.k_stride_h != params.v_stride_h ||
+        params.k_stride_t != params.v_stride_t || params.k_stride_n <= 0 ||
+        params.k_stride_h <= 0 || params.k_stride_t <= 0 || params.k_stride_n % 32 ||
+        params.k_stride_h % 32 || params.k_stride_t % 32 ||
+        params.scale_stride_page < int64_t(params.num_kv_heads) * Traits::kPageSize *
+                                       (Traits::kHeadDim / Traits::kScaleGroupSize) ||
+        params.scale_stride_page % 16) {
       return cudaErrorInvalidValue;
     }
 

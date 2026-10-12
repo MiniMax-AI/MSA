@@ -24,6 +24,33 @@ void check_same_device(torch::Tensor const &reference, torch::Tensor const &tens
               " must be on the same device as the planned metadata");
 }
 
+void check_cache_layout(torch::Tensor const &tensor, char const *name, int alignment) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(tensor.dim() >= 2, name, " must have a page dimension");
+  TORCH_CHECK(tensor.stride(-1) == 1, name, " last dimension must have unit stride");
+  for (int64_t d = 0; d < tensor.dim() - 1; ++d) {
+    TORCH_CHECK(tensor.size(d) == 1 || (tensor.stride(d) > 0 &&
+                                        tensor.stride(d) * tensor.element_size() % alignment == 0),
+                name, " axis ", d, " must have positive byte stride aligned to ", alignment);
+  }
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0, name,
+              " data pointer must be aligned to ", alignment);
+}
+
+void check_page_strided(torch::Tensor const &tensor, char const *name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(tensor.dim() >= 2, name, " must have a page dimension");
+  int64_t packed = 1;
+  for (int64_t d = tensor.dim() - 1; d >= 1; --d) {
+    TORCH_CHECK(tensor.size(d) == 1 || tensor.stride(d) == packed, name,
+                " must be packed below the page dimension");
+    packed *= tensor.size(d);
+  }
+  int64_t const page_stride_bytes = tensor.stride(0) * tensor.element_size();
+  TORCH_CHECK(tensor.stride(0) >= packed && page_stride_bytes % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+              name, " page stride must cover one page and keep 16-byte alignment");
+}
 int checked_batch(int64_t batch_size) {
   TORCH_CHECK(batch_size > 0 && batch_size <= std::numeric_limits<int>::max(),
               "batch_size must be positive and fit in int32");
@@ -72,17 +99,14 @@ torch::Tensor indexer_gemm_run(torch::Tensor q, torch::Tensor packed_k_cache, to
   using Traits = IndexerGemmTraits;
   check_metadata(page_table, seq_lens);
   check_cuda_contiguous(q, "q");
-  check_cuda_contiguous(packed_k_cache, "packed_k_cache");
-  check_cuda_contiguous(k_scale, "k_scale");
+  check_cache_layout(packed_k_cache, "packed_k_cache", 16);
+  check_page_strided(k_scale, "k_scale");
   check_cuda_contiguous(output, "out");
   check_same_device(page_table, q, "q");
   check_same_device(page_table, packed_k_cache, "packed_k_cache");
   check_same_device(page_table, k_scale, "k_scale");
   check_same_device(page_table, output, "out");
   TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0, "q must be 16-byte aligned");
-  TORCH_CHECK(reinterpret_cast<uintptr_t>(packed_k_cache.data_ptr()) % 16 == 0 &&
-                  reinterpret_cast<uintptr_t>(k_scale.data_ptr()) % 16 == 0,
-              "K and scale must be 16-byte aligned");
 
   TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "q must have dtype torch.float8_e4m3fn");
   TORCH_CHECK(packed_k_cache.scalar_type() == at::kByte,
@@ -128,6 +152,11 @@ torch::Tensor indexer_gemm_run(torch::Tensor q, torch::Tensor packed_k_cache, to
   arguments.batch = batch;
   arguments.max_pages = max_pages;
   arguments.physical_pages = static_cast<int>(packed_k_cache.size(0));
+  // Singleton axes do not address another element, but TMA still validates their strides.
+  arguments.packed_k_page_stride =
+      arguments.physical_pages == 1 ? Traits::kPackedKBytes : packed_k_cache.stride(0);
+  arguments.packed_k_token_stride = packed_k_cache.stride(1);
+  arguments.k_scale_page_stride = k_scale.stride(0) * k_scale.element_size();
   arguments.sm_count = static_cast<int>(sm_count);
 
   cudaStream_t const stream = at::cuda::getCurrentCUDAStream().stream();

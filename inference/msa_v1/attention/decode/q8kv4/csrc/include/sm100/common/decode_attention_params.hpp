@@ -23,10 +23,12 @@ struct FMHACutlassSM100Params {
   int head_dim_vo;
   int q_stride_n;
   int q_stride_h;
-  int k_stride_n;
-  int k_stride_h;
-  int v_stride_n;
-  int v_stride_h;
+  int64_t k_stride_n;
+  int64_t k_stride_h;
+  int64_t k_stride_t;
+  int64_t v_stride_n;
+  int64_t v_stride_h;
+  int64_t v_stride_t;
   int batch_size;
   int total_qo_len;
   int total_kv_len;
@@ -63,6 +65,8 @@ struct FMHACutlassSM100Params {
   // dtype=fp8_e4m3.
   void *k_scale_ptr = nullptr;
   void *v_scale_ptr = nullptr;
+  // Byte distance between consecutive pages of k/v scales; pages may sit inside wider rows.
+  int64_t scale_stride_page = 0;
   // Balanced (stream-K) schedule: per work entry, the number of KV segments of its item; and one
   // self-resetting arrival counter per (q token, KV head) item for the in-kernel merge.
   int *kv_split_count_ptr = nullptr;

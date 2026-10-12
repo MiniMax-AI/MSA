@@ -56,3 +56,17 @@ Callers may pass preallocated `out` and `lse` tensors to `run()`.
 - The wrapper does not silently copy, reorder, or convert runtime K/V tensors.
 - All inputs must reside on the same CUDA device and satisfy the validated shape, stride, and
   alignment requirements.
+
+## Cache layout
+
+Non-contiguous cache support is verified on SM100/SM103; it is not yet verified on SM107.
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+K/V strides must match.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

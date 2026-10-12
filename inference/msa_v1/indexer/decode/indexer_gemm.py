@@ -90,11 +90,12 @@ class DecodeIndexerGemmSm100:
             raise TypeError("out must be Float32")
 
         physical_pages = mKCache.shape[0]
+        # Keep page and token as separate modes even when the logical M axis is flattened.
         mK_mk = cute.make_tensor(
             mKCache.iterator,
             cute.make_layout(
-                (physical_pages * self.page_size, self.head_dim),
-                stride=(self.head_dim, 1),
+                ((self.page_size, physical_pages), self.head_dim),
+                stride=((mKCache.stride[1], mKCache.stride[0]), 1),
             ),
         )
         mQ_nkb = cute.make_tensor(

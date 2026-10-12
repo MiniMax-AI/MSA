@@ -56,15 +56,15 @@ template <class Traits> struct IndexerGemmRunner {
     params.output_ptr = arguments.output_ptr;
     params.sm_count = arguments.sm_count;
 
-    uint64_t packed_dimensions[3] = {static_cast<uint64_t>(Traits::kHeadDim),
-                                     static_cast<uint64_t>(Traits::kHeadDim / 2),
+    uint64_t packed_dimensions[3] = {static_cast<uint64_t>(Traits::kHeadDim / 2),
+                                     static_cast<uint64_t>(Traits::kPageTokens),
                                      static_cast<uint64_t>(arguments.physical_pages)};
-    uint64_t packed_strides[2] = {static_cast<uint64_t>(Traits::kHeadDim),
-                                  static_cast<uint64_t>(Traits::kPackedKBytes)};
-    uint32_t packed_box[3] = {static_cast<uint32_t>(Traits::kHeadDim),
-                              static_cast<uint32_t>(Traits::kHeadDim / 2), 1u};
+    uint64_t packed_strides[2] = {static_cast<uint64_t>(arguments.packed_k_token_stride),
+                                  static_cast<uint64_t>(arguments.packed_k_page_stride)};
+    uint32_t packed_box[3] = {static_cast<uint32_t>(Traits::kHeadDim / 2),
+                              static_cast<uint32_t>(Traits::kPageTokens), 1u};
     status = encode_tma(params.packed_k, const_cast<void *>(arguments.packed_k_ptr),
-                        packed_dimensions, packed_strides, packed_box, CU_TENSOR_MAP_SWIZZLE_128B);
+                        packed_dimensions, packed_strides, packed_box, CU_TENSOR_MAP_SWIZZLE_64B);
     if (status != cudaSuccess) {
       return status;
     }
@@ -72,7 +72,7 @@ template <class Traits> struct IndexerGemmRunner {
     uint64_t scale_dimensions[3] = {static_cast<uint64_t>(Traits::kScaleBytes / 8), 8u,
                                     static_cast<uint64_t>(arguments.physical_pages)};
     uint64_t scale_strides[2] = {static_cast<uint64_t>(Traits::kScaleBytes / 8),
-                                 static_cast<uint64_t>(Traits::kScaleBytes)};
+                                 static_cast<uint64_t>(arguments.k_scale_page_stride)};
     uint32_t scale_box[3] = {static_cast<uint32_t>(Traits::kScaleBytes / 8), 8u, 1u};
     return encode_tma(params.k_scale, const_cast<void *>(arguments.k_scale_ptr), scale_dimensions,
                       scale_strides, scale_box, CU_TENSOR_MAP_SWIZZLE_NONE);

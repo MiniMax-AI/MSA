@@ -192,8 +192,7 @@ template <class Traits> struct Sm100FmhaLoadTmaWarpspecialized {
         uint32_t const pred = static_cast<uint32_t>(lane_predicate);
 
         Sm100FmhaTma::load_4d_predicated(kv_desc, storage.smem_kv.raw_ptr(stage), full_barrier, 0,
-                                         is_v ? page.token_in_page : page.token_in_page / 2,
-                                         kv_head_idx, physical_page, pred);
+                                         page.token_in_page, kv_head_idx, physical_page, pred);
         Sm100FmhaTma::load_4d_predicated(scale_desc, storage.smem_kv.scale_ptr(stage), full_barrier,
                                          0, page.token_in_page / Traits::kScaleGroupSize,
                                          kv_head_idx, physical_page, pred);

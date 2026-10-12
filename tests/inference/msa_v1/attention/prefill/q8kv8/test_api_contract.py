@@ -11,6 +11,7 @@ from inference.msa_v1.attention.prefill import q8kv8 as q8kv8_package
 from inference.msa_v1.attention.prefill.q8kv8 import (
     BatchPrefillWithPagedKVCacheWrapper,
 )
+from tests.inference.msa_v1.cache_layout import cache_view
 
 
 def _make_single_page_inputs() -> tuple[torch.Tensor, ...]:
@@ -128,6 +129,8 @@ def test_run_validates_dtype_shape_device_and_contiguity() -> None:
         wrapper.run(q, (k_cache[:, :, :, :64].contiguous(), v_cache))
     with pytest.raises(TypeError, match="k_cache must be torch.float8_e4m3fn"):
         wrapper.run(q, (k_cache.to(torch.bfloat16), v_cache))
+    with pytest.raises(ValueError, match="strides must match"):
+        wrapper.run(q, (cache_view(k_cache, "token"), v_cache))
     if torch.cuda.device_count() > 1:
         k_other_device = torch.empty_like(k_cache, device="cuda:1")
         with pytest.raises(ValueError, match="k_cache must be on"):
@@ -141,9 +144,9 @@ def test_plan_is_rejected_during_cuda_graph_capture() -> None:
     with (
         pytest.warns(UserWarning, match="CUDA Graph is empty"),
         pytest.raises(RuntimeError, match=r"plan\(\) must be called outside"),
+        torch.cuda.graph(graph),
     ):
-        with torch.cuda.graph(graph):
-            _plan_single_page(wrapper, topk, cu_seqlens, page_table)
+        _plan_single_page(wrapper, topk, cu_seqlens, page_table)
 
 
 @pytest.mark.parametrize("flags", [(None, None), (False, False), (True, False), (False, True), (True, True)])

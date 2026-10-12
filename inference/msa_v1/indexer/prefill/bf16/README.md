@@ -51,7 +51,7 @@ the current layer. Callers may pass a preallocated output to `run()`.
 | `page_table` | `[B,max_pages]` | `torch.int32` |
 | `out` | `[H,total_q,16]` | `torch.int32` |
 
-All inputs and outputs must be contiguous, 16-byte aligned, and on the same CUDA device.
+All inputs and outputs must be on the same CUDA device. Q, metadata, and output must be contiguous and 16-byte aligned.
 Cumulative lengths start at zero and are nondecreasing; the final Q offset equals `total_q`,
 and each request's KV length must cover its query length. `max_seqlen_q`/`max_seqlen_k` are
 host upper bounds on per-request lengths. The KV bound is at most 8192×128, and the page table
@@ -92,3 +92,14 @@ python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark --suite ful
 
 The benchmark measures the public `run()` path inside CUDA Graphs. `--verify` checks all
 valid historical scores and TopK outputs against an independent reference outside timing.
+
+## Cache layout
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

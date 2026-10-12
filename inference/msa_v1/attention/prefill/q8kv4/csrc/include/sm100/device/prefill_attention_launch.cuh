@@ -13,20 +13,47 @@
 namespace minimax::msa_v1::attention::prefill::q8kv4 {
 namespace {
 
-cudaError_t encode_page_head_tma(cute::TmaDescriptor &descriptor, uint8_t const *base,
-                                 int physical_pages, int num_kv_heads, int tile_rows) {
-  cuuint64_t const global_dimensions[2] = {
+// Scale pages are packed; only the distance between pages is dynamic.
+cudaError_t encode_scale_tma(cute::TmaDescriptor &descriptor, uint8_t const *base,
+                             int physical_pages, int num_kv_heads, int tile_rows,
+                             int64_t page_stride) {
+  cuuint64_t const global_dimensions[3] = {
       128,
-      static_cast<cuuint64_t>(physical_pages) * num_kv_heads * tile_rows,
+      static_cast<cuuint64_t>(num_kv_heads) * tile_rows,
+      static_cast<cuuint64_t>(physical_pages),
   };
-  cuuint64_t const global_strides[1] = {128};
-  cuuint32_t const box_dimensions[2] = {
+  cuuint64_t const global_strides[2] = {128, static_cast<cuuint64_t>(page_stride)};
+  cuuint32_t const box_dimensions[3] = {
       128,
       static_cast<cuuint32_t>(tile_rows),
+      1,
   };
-  cuuint32_t const element_strides[2] = {1, 1};
+  cuuint32_t const element_strides[3] = {1, 1, 1};
   CUresult const result = cuTensorMapEncodeTiled(
-      reinterpret_cast<CUtensorMap *>(&descriptor), CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+      reinterpret_cast<CUtensorMap *>(&descriptor), CU_TENSOR_MAP_DATA_TYPE_UINT8, 3,
+      const_cast<uint8_t *>(base), global_dimensions, global_strides, box_dimensions,
+      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+      CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return result == CUDA_SUCCESS ? cudaSuccess : cudaErrorInvalidValue;
+}
+
+// Preserve each data axis independently; only the packed channel axis is contiguous.
+cudaError_t encode_page_head_tma(cute::TmaDescriptor &descriptor, uint8_t const *base,
+                                 int physical_pages, int num_kv_heads, int64_t page_stride,
+                                 int64_t head_stride, int64_t token_stride) {
+  cuuint64_t const global_dimensions[4] = {
+      64,
+      128,
+      static_cast<cuuint64_t>(num_kv_heads),
+      static_cast<cuuint64_t>(physical_pages),
+  };
+  cuuint64_t const global_strides[3] = {static_cast<cuuint64_t>(token_stride),
+                                        static_cast<cuuint64_t>(head_stride),
+                                        static_cast<cuuint64_t>(page_stride)};
+  cuuint32_t const box_dimensions[4] = {64, 128, 1, 1};
+  cuuint32_t const element_strides[4] = {1, 1, 1, 1};
+  CUresult const result = cuTensorMapEncodeTiled(
+      reinterpret_cast<CUtensorMap *>(&descriptor), CU_TENSOR_MAP_DATA_TYPE_UINT8, 4,
       const_cast<uint8_t *>(base), global_dimensions, global_strides, box_dimensions,
       element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
       CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
@@ -83,23 +110,26 @@ cudaError_t launch_prefill_attention(PrefillArguments const &arguments, cudaStre
   cute::TmaDescriptor tma_packed_v{};
   cute::TmaDescriptor tma_k_scale{};
   cute::TmaDescriptor tma_v_scale{};
-  cudaError_t status = encode_page_head_tma(tma_packed_k, arguments.packed_k_ptr,
-                                            arguments.physical_pages, arguments.num_kv_heads, 64);
+  cudaError_t status = encode_page_head_tma(
+      tma_packed_k, arguments.packed_k_ptr, arguments.physical_pages, arguments.num_kv_heads,
+      arguments.kv_page_stride, arguments.kv_head_stride, arguments.kv_token_stride);
   if (status != cudaSuccess) {
     return status;
   }
   status = encode_page_head_tma(tma_packed_v, arguments.packed_v_ptr, arguments.physical_pages,
-                                arguments.num_kv_heads, 64);
+                                arguments.num_kv_heads, arguments.kv_page_stride,
+                                arguments.kv_head_stride, arguments.kv_token_stride);
   if (status != cudaSuccess) {
     return status;
   }
-  status = encode_page_head_tma(tma_k_scale, arguments.k_scale_ptr, arguments.physical_pages,
-                                arguments.num_kv_heads, 8);
+
+  status = encode_scale_tma(tma_k_scale, arguments.k_scale_ptr, arguments.physical_pages,
+                            arguments.num_kv_heads, 8, arguments.scale_page_stride);
   if (status != cudaSuccess) {
     return status;
   }
-  status = encode_page_head_tma(tma_v_scale, arguments.v_scale_ptr, arguments.physical_pages,
-                                arguments.num_kv_heads, 8);
+  status = encode_scale_tma(tma_v_scale, arguments.v_scale_ptr, arguments.physical_pages,
+                            arguments.num_kv_heads, 8, arguments.scale_page_stride);
   if (status != cudaSuccess) {
     return status;
   }

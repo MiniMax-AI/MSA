@@ -56,3 +56,18 @@ out, lse = wrapper.run(
 - `cu_seqlens_k` 是 KV 长度的唯一来源。
 - `plan()` 必须在 CUDA Graph capture 外调用；capture 时应预分配 `out` 和 `lse`。
 - NVFP4 dequant 要求 CUDA Toolkit 13.4 或更高版本。
+
+## Cache 布局
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
+Scale 每页内部的 `[Hkv, 128, 8]` 必须紧密排列。
+仅页间 stride 可以包含填充；它必须覆盖完整一页，且为 16 字节的倍数。Scale 起始地址须
+16 字节对齐。数据与 scale 可以使用不同的 page stride。Scale 不支持 token/head 间填充
+或外层维度置换。
+K/V 的 stride 须一致；K/V scale 的 stride 也须一致。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

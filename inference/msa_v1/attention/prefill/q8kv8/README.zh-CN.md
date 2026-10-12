@@ -60,3 +60,16 @@ out, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
 - `Hq / Hkv` 支持 1、2、4、8 或 16；默认 `Hq=64`、`Hkv=4`。
 - `cu_seqlens_k` 是 KV 长度的唯一来源；接口不接收 K/V scale。
 - `plan()` 必须在 CUDA Graph capture 外调用；capture 时应预分配 `out` 和 `lse`。
+
+## Cache 布局
+
+非连续 cache 的支持已在 SM100/SM103 上验证，尚未在 SM107 上验证。
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
+K/V 的 stride 须一致。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

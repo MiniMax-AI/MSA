@@ -34,6 +34,7 @@ except ModuleNotFoundError as error:
 
 logger = logging.getLogger(__name__)
 
+from inference.msa_v1._cache_layout import normalize_cache_singletons
 from inference.msa_v1.attention.prefill._common.dsl import copy_utils
 from inference.msa_v1.attention.prefill._common.dsl import (
     blackwell_helpers as sm100_helpers,
@@ -3359,8 +3360,8 @@ def _compile_kernel(
     q_flat = q.reshape(-1, _HEAD_DIM)
     o_partial_flat = o_partial.reshape(-1, _HEAD_DIM)
     compile_args = (
-        _to_cute_tensor(k_cache),
-        _to_cute_tensor(v_cache),
+        _to_cute_tensor(normalize_cache_singletons(k_cache)),
+        _to_cute_tensor(normalize_cache_singletons(v_cache)),
         _to_cute_tensor(k2q_q_indices),
         _to_cute_tensor(qsplit_indices),
         _to_cute_tensor(k2q_row_ptr),
@@ -3418,6 +3419,8 @@ def run_pagekv(
     ``True`` on any other configuration raises ``NotImplementedError``.
     """
 
+    k_cache = normalize_cache_singletons(k_cache)
+    v_cache = normalize_cache_singletons(v_cache)
     qsplit_indices = schedule.qsplit_indices
     scheduler_metadata = schedule.scheduler_metadata
     work_count = schedule.work_count

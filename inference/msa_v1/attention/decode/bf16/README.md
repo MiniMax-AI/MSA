@@ -51,7 +51,7 @@ concurrent calls.
 | `out` | Same shape as `q` | `torch.bfloat16` |
 
 All tensors must reside on the same CUDA device. Q, metadata, and output must be contiguous.
-K/V may be strided across pages and heads; their token and head-dimension strides must be 128 and 1, and K/V shapes and strides must match. Q/K/V and output require 16-byte alignment.
+K/V shapes and strides must match; the last dimension must have unit stride. Q/K/V and output require 16-byte alignment.
 Each KV head serves 8 or 16 Q heads. Sequence lengths include the Q-token query chunk, shared
 by all requests. Query position is `seq_lens[b] - Q + t`.
 
@@ -93,3 +93,16 @@ python -m benchmarks.inference.msa_v1.attention.decode.bf16.benchmark --suite fu
 
 The benchmark reports CUDA Graph latency for the public `run()` path, excluding planning, allocation, compilation, and warmup. It checks the complete output against an independent reference.
 Pass `--disable-pdl` to measure the same path with programmatic dependent launch disabled.
+
+## Cache layout
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+Each outer element stride must fit in signed int32 (`<= 2**31 - 1`), as required by FlashInfer.
+K/V strides must match.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

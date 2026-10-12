@@ -54,9 +54,8 @@ void ldsm_unpack_fp4_transpose_16x16_x1(uint32_t &out0, uint32_t &out1, void con
 
 CUTLASS_DEVICE
 int packed_fp4_swizzled_offset(int token, int packed_byte) {
-  int const linear_segment = (token & 1) * 4 + packed_byte / 16;
-  int const swizzled_segment = linear_segment ^ ((token >> 1) & 7);
-  return (token >> 1) * 128 + swizzled_segment * 16 + (packed_byte & 15);
+  int const swizzled_segment = (packed_byte / 16) ^ ((token >> 1) & 3);
+  return token * 64 + swizzled_segment * 16 + (packed_byte & 15);
 }
 
 CUTLASS_DEVICE

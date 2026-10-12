@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from inference.msa_v1._cache_layout import check_cache_layout
+from inference.msa_v1.attention.prefill._common.atten_fwd_sm100 import run_pagekv
 from inference.msa_v1.attention.prefill._common.combine import (
     combine,
 )
@@ -14,8 +16,6 @@ from inference.msa_v1.attention.prefill._common.metadata import (
     AttentionMetadata,
     prepare,
 )
-from inference.msa_v1.attention.prefill._common.atten_fwd_sm100 import run_pagekv
-
 
 _HEAD_DIM = 128
 _DEFAULT_NUM_Q_HEADS = 64
@@ -133,7 +133,6 @@ class _BatchPrefillWithPagedKVCacheWrapperBase:
 
     storage_dtype = torch.float8_e4m3fn
     op_name = "Q8KV8"
-    allow_strided_kv = False
     supported_gqa_group_sizes = tuple(sorted(_SUPPORTED_GQA_GROUP_SIZES))
 
     def __init__(
@@ -268,13 +267,7 @@ class _BatchPrefillWithPagedKVCacheWrapperBase:
         k_cache, v_cache = paged_kv_cache
         _check_cuda_contiguous(q, name="q")
         for name, tensor in (("k_cache", k_cache), ("v_cache", v_cache)):
-            if not tensor.is_cuda:
-                raise ValueError(f"{name} must be a CUDA tensor")
-            if not self.allow_strided_kv and not tensor.is_contiguous():
-                raise ValueError(f"{name} must be contiguous")
-            if tensor.stride(-1) != 1:
-                raise ValueError(f"{name} must have unit stride in head_dim")
-            _check_16_byte_aligned(tensor, name=name)
+            check_cache_layout(tensor, name=name)
         for name, tensor in (("q", q), ("k_cache", k_cache), ("v_cache", v_cache)):
             _check_same_device(state.page_table, tensor, name=name)
             if tensor.dtype != self.storage_dtype:
@@ -292,6 +285,8 @@ class _BatchPrefillWithPagedKVCacheWrapperBase:
                 )
         if k_cache.shape != v_cache.shape:
             raise ValueError("k_cache and v_cache must have the same shape")
+        if k_cache.stride() != v_cache.stride():
+            raise ValueError("k_cache and v_cache strides must match")
 
         out_tensor = state.out if out is None else out
         lse_tensor = state.lse if lse is None else lse

@@ -154,6 +154,9 @@ Tree Indexer 的用法见
 
 ### 3.2 MSA v1 推理
 
+Cache 数据的最后一个存储维度（dim）须连续。Q8KV4 scale 须页内连续。
+详见 [cache 布局要求](inference/msa_v1/README.zh-CN.md#cache-view)。
+
 MSA v1 推理算子统一使用 `plan()` / `run()` 生命周期。`plan()` 接收请求级 metadata，
 `run()` 接收逐层数据。进入 CUDA Graph capture 前必须完成 `plan()` 和所需 warmup；
 capture 期间应使用预分配输出。Decode indexer 另提供显式 `BatchDecodeIndexerPlan`：

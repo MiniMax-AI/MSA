@@ -33,7 +33,7 @@ the public `replan()` outside CUDA Graph capture.
 ## Data contract
 
 - `num_index_heads` defaults to 1 and accepts 1/2/4. Heads select TopK independently and share K cache.
-- Q/K and output must be contiguous CUDA tensors on the same device.
+- Q and output must be contiguous CUDA tensors; K must reside on the same device.
 - H=1 also retains the output head dimension.
 
 - `q`: `[total_q, H, 128]`, E4M3.
@@ -73,3 +73,16 @@ useful compute throughput with production weights. Pass
 `--baseline <baseline-h1.json>` to check differences against the baseline.
 See the [shared benchmark contract](../../../../../datas/inference/README.md)
 for metric definitions.
+
+## Cache layout
+
+Non-contiguous cache support is verified on SM100/SM103; it is not yet verified on SM107.
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

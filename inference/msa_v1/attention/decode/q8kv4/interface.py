@@ -10,6 +10,8 @@ from dataclasses import dataclass
 
 import torch
 
+from inference.msa_v1._cache_layout import check_cache_layout
+
 logger = logging.getLogger(__name__)
 
 from inference.msa_v1._build_utils import cuda_home
@@ -23,6 +25,25 @@ _DEFAULT_NUM_KV_HEADS = 4
 _PAGE_SIZE = 128
 _TOPK = 16
 _DATA_ALIGNMENT = 16
+
+
+def _check_page_strided_scale(tensor: torch.Tensor, *, name: str) -> None:
+    """Keep each scale page packed while allowing aligned gaps between pages."""
+    if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    if tensor.ndim < 2:
+        raise ValueError(f"{name} must have a page dimension")
+    packed = 1
+    for size, stride in zip(reversed(tensor.shape[1:]), reversed(tensor.stride()[1:])):
+        if size != 1 and stride != packed:
+            raise ValueError(f"{name} must be packed below the page dimension")
+        packed *= size
+    if tensor.data_ptr() % 16:
+        raise ValueError(f"{name} must have a 16-byte aligned data pointer")
+    if tensor.stride(0) < packed or tensor.stride(0) * tensor.element_size() % 16:
+        raise ValueError(
+            f"{name} page stride must cover one page and be 16-byte aligned"
+        )
 
 
 def _device_index(device) -> int:
@@ -380,7 +401,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ),
             out_scale=torch.zeros(
                 ((num_tokens + 127) // 128) * 128 * num_q_heads * 4
-                if output_mode == "mxfp8" else 0,
+                if output_mode == "mxfp8"
+                else 0,
                 dtype=torch.uint8,
                 device=page_table.device,
             ),
@@ -406,14 +428,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError("kv_cache_sf must be a (K scale, V scale) tuple")
         k_cache, v_cache = paged_kv_cache
         k_scale, v_scale = kv_cache_sf
+        _check_cuda_contiguous(q, name="q", alignment=_DATA_ALIGNMENT)
+        _check_same_device(state.page_table, q, name="q")
         for name, tensor in (
-            ("q", q),
             ("k_cache", k_cache),
             ("v_cache", v_cache),
             ("k_scale", k_scale),
             ("v_scale", v_scale),
         ):
-            _check_cuda_contiguous(tensor, name=name, alignment=_DATA_ALIGNMENT)
+            if name.endswith("scale"):
+                _check_page_strided_scale(tensor, name=name)
+            else:
+                check_cache_layout(tensor, name=name, alignment=32)
             _check_same_device(state.page_table, tensor, name=name)
 
         expected_q_shape = (
@@ -447,6 +473,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 raise TypeError(f"{name} must be torch.float8_e4m3fn")
             if tuple(tensor.shape) != expected_scale_shape:
                 raise ValueError(f"{name} must have shape {expected_scale_shape}")
+        if v_cache.stride() != k_cache.stride() or v_scale.stride() != k_scale.stride():
+            raise ValueError("K/V cache strides and K/V scale strides must match")
 
         out_tensor = state.out if out is None else out
         _check_cuda_contiguous(out_tensor, name="out", alignment=_DATA_ALIGNMENT)
@@ -459,9 +487,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError("out_scale is only valid in MXFP8 output mode")
         scale_tensor = state.out_scale if out_scale is None else out_scale
         if state.output_mode == "mxfp8":
-            _check_cuda_contiguous(scale_tensor, name="out_scale", alignment=_DATA_ALIGNMENT)
+            _check_cuda_contiguous(
+                scale_tensor, name="out_scale", alignment=_DATA_ALIGNMENT
+            )
             _check_same_device(q, scale_tensor, name="out_scale")
-            if scale_tensor.dtype != torch.uint8 or scale_tensor.shape != state.out_scale.shape:
+            if (
+                scale_tensor.dtype != torch.uint8
+                or scale_tensor.shape != state.out_scale.shape
+            ):
                 raise ValueError(
                     f"out_scale must be torch.uint8 with shape {tuple(state.out_scale.shape)}"
                 )

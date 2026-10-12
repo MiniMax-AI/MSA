@@ -66,3 +66,17 @@ on unsupported architectures or input types.
 - `Hq / Hkv` may be 1, 2, 4, 8, or 16; the defaults are `Hq=64` and `Hkv=4`.
 - `cu_seqlens_k` is the only source of KV lengths; the API does not accept K/V scales.
 - Call `plan()` outside CUDA Graph capture and preallocate `out` and `lse` during capture.
+
+## Cache layout
+
+Non-contiguous cache support is verified on SM100/SM103; it is not yet verified on SM107.
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+K/V strides must match.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

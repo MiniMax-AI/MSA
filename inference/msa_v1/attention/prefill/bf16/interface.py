@@ -12,7 +12,6 @@ class BatchPrefillWithPagedKVCacheWrapper(_BatchPrefillWithPagedKVCacheWrapperBa
 
     storage_dtype = torch.bfloat16
     op_name = "BF16"
-    allow_strided_kv = True
     supported_gqa_group_sizes = (8, 16)
 
 

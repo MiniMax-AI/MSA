@@ -113,59 +113,36 @@ CUTLASS_DEVICE void run_load_warps(Storage &storage, Params const &params, int w
   int const num_groups = (q_count + kQueriesPerGroup - 1) / kQueriesPerGroup;
 
   if (physical_page >= 0 && physical_page < arguments.physical_pages) {
-    int const page_head = physical_page * arguments.num_kv_heads + head_kv;
-    if (warp_idx == WarpSpecialization::kLoadKWarp && cute::elect_one_sync()) {
-      cute::prefetch_tma_descriptor(&params.tma_packed_k);
-      cute::prefetch_tma_descriptor(&params.tma_k_scale);
-      cute::set_barrier_transaction_bytes(storage.k_tma_full, kPackedKvBytes + kScaleBytes);
-      uint32_t const smem_data_address =
-          static_cast<uint32_t>(__cvta_generic_to_shared(&storage.k_raw[0][0]));
-      uint32_t const smem_scale_address =
-          static_cast<uint32_t>(__cvta_generic_to_shared(&storage.k_scale[0][0]));
-      uint32_t const barrier_address =
-          static_cast<uint32_t>(__cvta_generic_to_shared(&storage.k_tma_full));
-      uint64_t const data_descriptor = reinterpret_cast<uint64_t>(&params.tma_packed_k);
-      uint64_t const scale_descriptor = reinterpret_cast<uint64_t>(&params.tma_k_scale);
-      asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                   ".mbarrier::complete_tx::bytes"
-                   " [%0], [%1, {%2, %3}], [%4];"
-                   :
-                   : "r"(smem_data_address), "l"(data_descriptor), "r"(0), "r"(page_head * 64),
-                     "r"(barrier_address)
-                   : "memory");
-      asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                   ".mbarrier::complete_tx::bytes"
-                   " [%0], [%1, {%2, %3}], [%4];"
-                   :
-                   : "r"(smem_scale_address), "l"(scale_descriptor), "r"(0), "r"(page_head * 8),
-                     "r"(barrier_address)
-                   : "memory");
-    } else if (warp_idx == WarpSpecialization::kLoadVWarp && cute::elect_one_sync()) {
-      cute::prefetch_tma_descriptor(&params.tma_packed_v);
-      cute::prefetch_tma_descriptor(&params.tma_v_scale);
-      cute::set_barrier_transaction_bytes(storage.v_tma_full, kPackedKvBytes + kScaleBytes);
-      uint32_t const smem_data_address =
-          static_cast<uint32_t>(__cvta_generic_to_shared(&storage.v_raw[0][0]));
-      uint32_t const smem_scale_address =
-          static_cast<uint32_t>(__cvta_generic_to_shared(&storage.v_scale[0][0]));
-      uint32_t const barrier_address =
-          static_cast<uint32_t>(__cvta_generic_to_shared(&storage.v_tma_full));
-      uint64_t const data_descriptor = reinterpret_cast<uint64_t>(&params.tma_packed_v);
-      uint64_t const scale_descriptor = reinterpret_cast<uint64_t>(&params.tma_v_scale);
-      asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                   ".mbarrier::complete_tx::bytes"
-                   " [%0], [%1, {%2, %3}], [%4];"
-                   :
-                   : "r"(smem_data_address), "l"(data_descriptor), "r"(0), "r"(page_head * 64),
-                     "r"(barrier_address)
-                   : "memory");
-      asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-                   ".mbarrier::complete_tx::bytes"
-                   " [%0], [%1, {%2, %3}], [%4];"
-                   :
-                   : "r"(smem_scale_address), "l"(scale_descriptor), "r"(0), "r"(page_head * 8),
-                     "r"(barrier_address)
-                   : "memory");
+    if (warp_idx == WarpSpecialization::kLoadKWarp || warp_idx == WarpSpecialization::kLoadVWarp) {
+      bool const is_v = warp_idx == WarpSpecialization::kLoadVWarp;
+      if (cute::elect_one_sync()) {
+        auto const *descriptor = is_v ? &params.tma_packed_v : &params.tma_packed_k;
+        auto *barrier = is_v ? &storage.v_tma_full : &storage.k_tma_full;
+        uint8_t *data = is_v ? &storage.v_raw[0][0] : &storage.k_raw[0][0];
+        cute::prefetch_tma_descriptor(descriptor);
+        auto const *scale_descriptor = is_v ? &params.tma_v_scale : &params.tma_k_scale;
+        uint8_t *scale = is_v ? &storage.v_scale[0][0] : &storage.k_scale[0][0];
+        cute::prefetch_tma_descriptor(scale_descriptor);
+        cute::set_barrier_transaction_bytes(*barrier, kPackedKvBytes + kScaleBytes);
+        asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.tile"
+                     ".mbarrier::complete_tx::bytes"
+                     " [%0], [%1, {%2, %3, %4, %5}], [%6];"
+                     :
+                     : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(data))),
+                       "l"(reinterpret_cast<uint64_t>(descriptor)), "r"(0), "r"(0), "r"(head_kv),
+                       "r"(physical_page),
+                       "r"(static_cast<uint32_t>(__cvta_generic_to_shared(barrier)))
+                     : "memory");
+        asm volatile("cp.async.bulk.tensor.3d.shared::cluster.global.tile"
+                     ".mbarrier::complete_tx::bytes"
+                     " [%0], [%1, {%2, %3, %4}], [%5];"
+                     :
+                     : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(scale))),
+                       "l"(reinterpret_cast<uint64_t>(scale_descriptor)), "r"(0), "r"(head_kv * 8),
+                       "r"(physical_page),
+                       "r"(static_cast<uint32_t>(__cvta_generic_to_shared(barrier)))
+                     : "memory");
+      }
     }
   }
 

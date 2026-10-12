@@ -25,6 +25,27 @@ _CASES = correctness_cases(active_inference_suite())
 _SHARDS = tuple(_CASES[start : start + 8] for start in range(0, len(_CASES), 8))
 
 
+def test_benchmark_cache_rng_preserved(monkeypatch):
+    from benchmarks.inference.msa_v1.attention.decode import _benchmark
+
+    monkeypatch.setattr(_benchmark, "KV_FORMAT", "bf16")
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(9107)
+    state = generator.get_state()
+    shape = (5, 4, 128, 128)
+    expected_k = _benchmark._make_query(shape, generator=generator, device=device)
+    expected_v = _benchmark._make_query(shape, generator=generator, device=device)
+    expected_state = generator.get_state()
+    generator.set_state(state)
+    k, v, k_scale, v_scale = _benchmark._cache_tensors(
+        (5, 4, 128, 64), (5, 4, 128, 8), generator, device
+    )
+    assert torch.equal(k, expected_k)
+    assert torch.equal(v, expected_v)
+    assert torch.equal(generator.get_state(), expected_state)
+    assert k_scale is None and v_scale is None
+
+
 @pytest.mark.parametrize("query_length", range(1, 17))
 @pytest.mark.parametrize("heads", (1, 2, 4))
 @pytest.mark.parametrize("enable_pdl", (False, True))

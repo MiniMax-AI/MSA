@@ -5,10 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+import cutlass.cute as cute  # noqa: PLR0402
 import torch
+from cutlass.cute.runtime import from_dlpack
 
+from inference.msa_v1._cache_layout import (
+    check_cache_layout,
+    normalize_cache_singletons,
+)
 from inference.msa_v1.aot_cache import compile_or_load
 from inference.msa_v1.attention.prefill._common.dsl.compile_utils import (
     compile_with_timing,
@@ -19,7 +23,6 @@ from inference.msa_v1.indexer.prefill.bf16.indexer_gemm import (
     M3IndexerGemmSm100,
 )
 from inference.msa_v1.indexer.prefill.bf16.schedule import M3IndexerScheduleSm100
-
 
 _HEAD_DIM = 128
 _PAGE_SIZE = 128
@@ -262,7 +265,7 @@ def _compile_gemm(
         lambda: compile_with_timing(
             kernel,
             _to_cute_tensor(q_flat),
-            _to_cute_tensor(k_tma_view, leading_dim=1),
+            _to_cute_tensor(normalize_cache_singletons(k_tma_view), leading_dim=1),
             _to_cute_tensor(state.page_table),
             _to_cute_tensor(state.proxy_scores),
             _to_cute_tensor(state.cu_seqlens_q),
@@ -377,8 +380,9 @@ class BatchPrefillIndexerWithPagedKVCacheWrapper:
         """Return forced-tail TopK logical page indices for one layer."""
 
         state = self._require_plan()
+        _check_cuda_contiguous(q, name="q")
+        check_cache_layout(paged_k_cache, name="paged_k_cache")
         for name, tensor in (("q", q), ("paged_k_cache", paged_k_cache)):
-            _check_cuda_contiguous(tensor, name=name)
             _check_same_device(state.page_table, tensor, name=name)
             if tensor.dtype != torch.bfloat16:
                 raise TypeError(f"{name} must be torch.bfloat16")
@@ -405,7 +409,7 @@ class BatchPrefillIndexerWithPagedKVCacheWrapper:
             )
 
         q_flat = q.view(state.total_q * state.num_index_heads, _HEAD_DIM)
-        k_tma_view = paged_k_cache[:, 0].permute(1, 2, 0)
+        k_tma_view = normalize_cache_singletons(paged_k_cache[:, 0].permute(1, 2, 0))
         compiled = _compile_gemm(q_flat, k_tma_view, state)
         with torch.cuda.nvtx.range("PrefillIndexerBF16ProxyScore"):
             compiled(

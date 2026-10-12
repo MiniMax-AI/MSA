@@ -71,3 +71,12 @@ See the repository [README](../../README.md),
 [inference data manifests](../../datas/inference/README.md) for shared cases, commands, and measurement methods.
 
 BF16 decode indexing supports H=1/2/4 and Q=1–16; BF16 decode attention supports GQA=8/16. See the [BF16 indexer](indexer/decode/bf16/README.md) and [BF16 attention](attention/decode/bf16/README.md) for input layouts, metadata and lifecycle requirements. BF16 attention uses the same optional FlashInfer 0.6.17 dependency as Q8KV8.
+
+## Cache views
+
+BF16, Q8KV8, and Q8KV4 attention/indexer cache data must be contiguous along the
+last (dim) storage dimension. See each operator README for alignment and K/V matching
+requirements. Q8KV4 scale pages must remain tightly packed; only their page stride
+may vary, covering a full page with 16-byte pointer/page-stride alignment. Data and scale
+page strides may differ. Q8KV4 prefill indexer is not provided. Changing captured cache addresses,
+shapes, or strides requires CUDA Graph recapture.

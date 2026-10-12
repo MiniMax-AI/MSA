@@ -65,3 +65,11 @@ cubin；通过 `python -m pip install -e '.[flashinfer]'` 安装固定的
 [inference data manifests](../../datas/inference/README.zh-CN.md)。
 
 BF16 decode indexer 支持 H=1/2/4、Q=1–16；BF16 decode attention 支持 GQA=8/16。输入布局、metadata 和生命周期约束见 [BF16 indexer](indexer/decode/bf16/README.zh-CN.md) 与 [BF16 attention](attention/decode/bf16/README.zh-CN.md)。BF16 attention 与 Q8KV8 使用相同的可选 FlashInfer 0.6.17 依赖。
+
+## Cache view
+
+BF16、Q8KV8、Q8KV4 attention/indexer 的 cache 数据最后一个存储维度（dim）须连续。
+对齐与 K/V 匹配要求见对应算子 README。
+Q8KV4 scale 须页内紧密排列；仅页间 stride 可变，须覆盖完整一页，且起始地址与 page
+stride 须 16 字节对齐。数据与 scale 的 page stride 可以不同。不提供 Q8KV4 prefill indexer。已 capture 的 cache 地址、shape 或 stride 改变时，
+须重新 capture CUDA Graph。

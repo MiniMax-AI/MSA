@@ -58,8 +58,8 @@ wrapper 的 scale buffer 在 `plan()` 时清零。若传入独立的 `out_scale`
 - `seq_lens`：`[B]`，包含当前 decode/MTP query chunk 的最终 KV 长度。
 - `out`：默认 `[B * q_len_per_req, Hq, 128]`，BF16；MXFP8 模式见上文。
 
-所有 tensor 必须 contiguous 且位于同一 CUDA device。`topk_indices`、`page_table` 和
-`seq_lens` 的 dtype 为 `torch.int32`；Q、K/V、scale 和输出的起始地址必须 16-byte aligned。
+所有 tensor 必须位于同一 CUDA device；Q、metadata 和输出必须 contiguous。`topk_indices`、`page_table` 和
+`seq_lens` 的 dtype 为 `torch.int32`；Q 和输出的起始地址须 16-byte 对齐，K/V 须 32-byte 对齐，scale 须 16-byte 对齐。
 
 ## 运行约束
 
@@ -95,3 +95,20 @@ python -m benchmarks.inference.msa_v1.attention.decode.q8kv4.benchmark --suite f
 
 完整正确性测试包含 GQA=8 和 GQA=16。benchmark 测量公开 `run()` 的
 CUDA Graph E2E 延迟；将 `--num-q-heads` 改为 64 可测 GQA=16。
+
+## Cache 布局
+
+非连续 cache 的支持已在 SM100/SM103 上验证，尚未在 SM107 上验证。
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 32 的倍数。
+Scale 每页内部的 `[Hkv, 128, 8]` 必须紧密排列。
+仅页间 stride 可以包含填充；它必须覆盖完整一页，且为 16 字节的倍数。Scale 起始地址须
+16 字节对齐。数据与 scale 可以使用不同的 page stride。Scale 不支持 token/head 间填充
+或外层维度置换。
+K/V 的 stride 须一致；K/V scale 的 stride 也须一致。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

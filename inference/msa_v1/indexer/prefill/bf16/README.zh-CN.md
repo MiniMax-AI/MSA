@@ -51,7 +51,7 @@ K cache。调用方可以向 `run()` 传入预分配输出。
 | `page_table` | `[B,max_pages]` | `torch.int32` |
 | `out` | `[H,total_q,16]` | `torch.int32` |
 
-所有输入和输出须 contiguous、16-byte 对齐且位于同一 CUDA device。累积长度从 0
+所有输入和输出须位于同一 CUDA device；Q、metadata 和输出须 contiguous、16-byte 对齐。累积长度从 0
 开始且非递减，Q 的末项等于 `total_q`，每个请求的 KV 长度须覆盖 query 长度。
 `max_seqlen_q`/`max_seqlen_k` 是各请求长度的 host 上界；KV 上界最多为 8192×128，
 page table 必须覆盖该上界。默认 `num_index_heads=4`，支持 H=1/2/4。
@@ -89,3 +89,13 @@ python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark --suite ful
 
 Benchmark 测量 CUDA Graph 中公开 `run()` 路径的耗时。`--verify` 在计时之外使用独立
 reference，全量检查有效历史 scores 和 TopK 输出。
+
+## Cache 布局
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

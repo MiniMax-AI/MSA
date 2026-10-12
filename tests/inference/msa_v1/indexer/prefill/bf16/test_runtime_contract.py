@@ -2,11 +2,13 @@
 
 import gc
 import weakref
+from dataclasses import replace
 from functools import partial
 
 import pytest
 import torch
 
+from inference.msa_v1 import aot_cache
 from inference.msa_v1.indexer._common.topk_select.build import load_extension
 from inference.msa_v1.indexer.prefill.bf16 import (
     BatchPrefillIndexerWithPagedKVCacheWrapper,
@@ -17,6 +19,7 @@ from inference.msa_v1.indexer.prefill.bf16.interface import (
     _compile_gemm,
 )
 from tests.inference.msa_v1.attention.decode.runtime import run_cuda
+from tests.inference.msa_v1.cache_layout import CACHE_LAYOUTS, cache_view
 from tests.inference.msa_v1.indexer.prefill.bf16.real_cases import (
     make_real_prefill_inputs,
 )
@@ -56,7 +59,10 @@ def _check(case, inputs, scores, out):
 
 
 @pytest.mark.parametrize("heads", (1, 2, 4))
-def test_graph_replan_and_independent_owners(heads):
+@pytest.mark.parametrize(
+    "layout", (*CACHE_LAYOUTS, "singleton_zero", "singleton_unaligned")
+)
+def test_graph_replan_and_independent_owners(heads, layout, monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     cases = (
@@ -65,12 +71,25 @@ def test_graph_replan_and_independent_owners(heads):
     )
     owners = []
     cache_keys = None
+    singleton_first = layout.startswith("singleton")
+    if singleton_first:
+        monkeypatch.setattr(aot_cache, "_AOT_DISABLE", True)
+        _GEMM_COMPILE_CACHE.clear()
     load_extension()
-    for case in cases:
+    for case_index, case in enumerate(cases):
         inputs = make_real_prefill_inputs(
             case, num_index_heads=heads, device=torch.device("cuda")
         )
-        inputs.page_table[1, :3].copy_(inputs.page_table[0, :3])
+        contiguous_cache = inputs.k_cache
+        if singleton_first and case_index == 0:
+            inputs = replace(inputs, k_cache=cache_view(contiguous_cache[:1], layout))
+            inputs.page_table.zero_()
+        else:
+            current_layout = "combined" if singleton_first else layout
+            inputs = replace(
+                inputs, k_cache=cache_view(contiguous_cache, current_layout)
+            )
+            inputs.page_table[1, :3].copy_(inputs.page_table[0, :3])
         wrapper = BatchPrefillIndexerWithPagedKVCacheWrapper()
         wrapper.plan(
             inputs.cu_seqlens_q,
@@ -82,10 +101,16 @@ def test_graph_replan_and_independent_owners(heads):
             num_index_heads=heads,
         )
         state = wrapper._plan_state
+        initial_cache = inputs.k_cache if singleton_first else contiguous_cache
+        _compile_gemm(
+            inputs.q.view(-1, 128), initial_cache[:, 0].permute(1, 2, 0), state
+        )
+        contiguous_keys = (set(_GEMM_COMPILE_CACHE), set(_SCHEDULE_COMPILE_CACHE))
         _compile_gemm(
             inputs.q.view(-1, 128), inputs.k_cache[:, 0].permute(1, 2, 0), state
         )
         keys = (set(_GEMM_COMPILE_CACHE), set(_SCHEDULE_COMPILE_CACHE))
+        assert keys == contiguous_keys
         if cache_keys is not None:
             assert keys == cache_keys
         cache_keys = keys
@@ -107,6 +132,8 @@ def test_graph_replan_and_independent_owners(heads):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             wrapper.run(inputs.q, inputs.k_cache, out=out)
+        state.proxy_scores.fill_(float("nan"))
+        out.fill_(-123)
         owners.append((wrapper, inputs, out, graph))
     assert (
         owners[0][0]._plan_state.proxy_scores.data_ptr()

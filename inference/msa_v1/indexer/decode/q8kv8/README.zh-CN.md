@@ -69,7 +69,7 @@ plan 与 wrapper 必须在相关 Graph 的生命周期内保持存活。Graph �
 - 输出：`[H, B * Q, 16]`，`torch.int32` logical page indices。有效项位于前缀，最后
   一个有效项为 local page。
 
-所有输入 tensor 必须在同一 CUDA 设备上且 contiguous。每个历史 page 的分数为该页 token 与对应 Q head 点积的最大值；各 head 独立选择历史候选，输出不足 16 项的位置填 `-1`。
+所有输入 tensor 必须在同一 CUDA 设备上；Q 和 metadata 必须 contiguous。每个历史 page 的分数为该页 token 与对应 Q head 点积的最大值；各 head 独立选择历史候选，输出不足 16 项的位置填 `-1`。
 
 ## 运行约束
 
@@ -118,3 +118,13 @@ Graph update、Graph run 和 Graph update+run。`--layers` 是显式指定的算
 K 的复用距离至少为 2×L2。两种缓存条件分别报告。
 host+device 计时若三次尝试后仍超过 CV=3%，结果会标记为无效，命令返回失败；
 独立有效的 Graph 计时仍保存在输出文件中。
+
+## Cache 布局
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

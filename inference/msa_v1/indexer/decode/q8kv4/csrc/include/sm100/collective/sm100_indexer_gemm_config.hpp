@@ -73,7 +73,7 @@ template <class Traits> struct IndexerGemmConfig {
 #endif
 
   CUTE_DEVICE static int swizzled_page_offset(int token, int quarter) {
-    return (token >> 1) * 128 + ((((token & 1) * 4 + quarter) ^ ((token >> 1) & 7)) * 16);
+    return token * 64 + ((quarter ^ ((token >> 1) & 3)) * 16);
   }
 
   CUTE_DEVICE static uint32_t broadcast_scale_byte(uint2 value, int index) {

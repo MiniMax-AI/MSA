@@ -68,8 +68,10 @@ void FMHAVariantRun_{{ variant_name }}(
   params.q_stride_h = q.stride(1);
   params.k_stride_n = k.stride(0);
   params.k_stride_h = k.stride(1);
+  params.k_stride_t = k.stride(2);
   params.v_stride_n = v.stride(0);
   params.v_stride_h = v.stride(1);
+  params.v_stride_t = v.stride(2);
   params.batch_size = qo_segment_lens.size(0);
   params.total_qo_len = q.size(0);
   params.total_kv_len = is_paged ? 0 : k.size(0);
@@ -142,6 +144,8 @@ void FMHAVariantRun_{{ variant_name }}(
       maybe_k_scale.has_value() ? static_cast<void *>(maybe_k_scale.value().data_ptr()) : nullptr;
   params.v_scale_ptr =
       maybe_v_scale.has_value() ? static_cast<void *>(maybe_v_scale.value().data_ptr()) : nullptr;
+  params.scale_stride_page =
+      maybe_k_scale.has_value() ? maybe_k_scale.value().stride(0) : 0;
 
   cudaError_t status = {{ func_name }}(params);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)

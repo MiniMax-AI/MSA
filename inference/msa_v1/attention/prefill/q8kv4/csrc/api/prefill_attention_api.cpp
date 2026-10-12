@@ -28,6 +28,33 @@ void check_same_device(torch::Tensor const &reference, torch::Tensor const &tens
   TORCH_CHECK(tensor.device() == reference.device(), name, " must be on the same device as q");
 }
 
+void check_cache_layout(torch::Tensor const &tensor, char const *name, int alignment) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(tensor.dim() >= 2, name, " must have a page dimension");
+  TORCH_CHECK(tensor.stride(-1) == 1, name, " last dimension must have unit stride");
+  for (int64_t d = 0; d < tensor.dim() - 1; ++d) {
+    TORCH_CHECK(tensor.size(d) == 1 || (tensor.stride(d) > 0 &&
+                                        tensor.stride(d) * tensor.element_size() % alignment == 0),
+                name, " axis ", d, " must have positive byte stride aligned to ", alignment);
+  }
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0, name,
+              " data pointer must be aligned to ", alignment);
+}
+
+void check_page_strided(torch::Tensor const &tensor, char const *name) {
+  TORCH_CHECK(tensor.is_cuda(), name, " must be a CUDA tensor");
+  TORCH_CHECK(tensor.dim() >= 2, name, " must have a page dimension");
+  int64_t packed = 1;
+  for (int64_t d = tensor.dim() - 1; d >= 1; --d) {
+    TORCH_CHECK(tensor.size(d) == 1 || tensor.stride(d) == packed, name,
+                " must be packed below the page dimension");
+    packed *= tensor.size(d);
+  }
+  int64_t const page_stride_bytes = tensor.stride(0) * tensor.element_size();
+  TORCH_CHECK(tensor.stride(0) >= packed && page_stride_bytes % 16 == 0 &&
+                  reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0,
+              name, " page stride must cover one page and keep 16-byte alignment");
+}
 int checked_int_dimension(int64_t value, char const *name) {
   TORCH_CHECK(value >= 0 && value <= std::numeric_limits<int>::max(), name, " must fit int32");
   return static_cast<int>(value);
@@ -42,14 +69,12 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
                  torch::Tensor work_count, torch::Tensor o_partial, torch::Tensor lse_partial,
                  double softmax_scale) {
   torch::Tensor tensors[] = {
-      q,           packed_k,       packed_v,           k_scale,
-      v_scale,     page_table,     cu_seqlens_q,       cu_seqlens_k,
+      q,           page_table,     cu_seqlens_q,       cu_seqlens_k,
       k2q_row_ptr, qsplit_indices, scheduler_metadata, work_count,
       o_partial,   lse_partial,
   };
   char const *names[] = {
-      "q",           "packed_k",       "packed_v",           "k_scale",
-      "v_scale",     "page_table",     "cu_seqlens_q",       "cu_seqlens_k",
+      "q",           "page_table",     "cu_seqlens_q",       "cu_seqlens_k",
       "k2q_row_ptr", "qsplit_indices", "scheduler_metadata", "work_count",
       "o_partial",   "lse_partial",
   };
@@ -59,6 +84,18 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
     check_cuda_contiguous(tensors[i], names[i]);
     check_same_device(q, tensors[i], names[i]);
   }
+  torch::Tensor caches[] = {packed_k, packed_v, k_scale, v_scale};
+  char const *cache_names[] = {"packed_k", "packed_v", "k_scale", "v_scale"};
+  for (std::size_t i = 0; i < 4; ++i) {
+    if (i < 2) {
+      check_cache_layout(caches[i], cache_names[i], 16);
+    } else {
+      check_page_strided(caches[i], cache_names[i]);
+    }
+    check_same_device(q, caches[i], cache_names[i]);
+  }
+  TORCH_CHECK(packed_v.strides() == packed_k.strides() && v_scale.strides() == k_scale.strides(),
+              "K/V cache strides and K/V scale strides must match");
 
   TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "q must have dtype torch.float8_e4m3fn");
   TORCH_CHECK(packed_k.scalar_type() == at::kByte && packed_v.scalar_type() == at::kByte,
@@ -141,6 +178,13 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
   arguments.num_q_heads = num_q_heads;
   arguments.num_kv_heads = num_kv_heads;
   arguments.physical_pages = checked_int_dimension(packed_k.size(0), "physical_pages");
+  // Normalize only unused singleton-axis metadata; all addressed axes retain their strides.
+  arguments.kv_page_stride = arguments.physical_pages == 1
+                                 ? int64_t(num_kv_heads) * kPageSize * (kHeadDim / 2)
+                                 : packed_k.stride(0);
+  arguments.kv_head_stride = num_kv_heads == 1 ? kPageSize * (kHeadDim / 2) : packed_k.stride(1);
+  arguments.kv_token_stride = packed_k.stride(2);
+  arguments.scale_page_stride = k_scale.stride(0) * k_scale.element_size();
   arguments.max_pages = checked_int_dimension(page_table.size(1), "max_pages");
   arguments.total_rows = checked_int_dimension(k2q_row_ptr.size(1) - 1, "total_rows");
   arguments.qsplit_stride = checked_int_dimension(qsplit_indices.size(1), "qsplit_stride");

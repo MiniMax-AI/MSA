@@ -46,7 +46,7 @@ assert indices.shape == (2, 4, 16)
 | `out` | `[H,B*Q,16]` | `torch.int32` |
 
 `plan()` 默认 `num_index_heads=1`、`query_length=8`；page table 容量为 1–8192 页。
-所有 tensor 必须 contiguous 且位于同一 CUDA device，Q/K 须 16-byte 对齐。
+所有 tensor 必须位于同一 CUDA device；Q、metadata 和输出必须 contiguous，Q/K 须 16-byte 对齐。
 所有请求共用 Q；长度包含当前 query chunk，满足 `Q <= seq_lens[b] <= max_pages*128`。
 
 历史页评分为该页各 token 的 Q/K 点积最大值，乘以 `1/sqrt(128)`。
@@ -75,3 +75,13 @@ python -m benchmarks.inference.msa_v1.indexer.decode.plan --precision bf16 --num
 生产 suite 使用共享 case 权重，low-latency suite 使用等权重。有效 MBU 按各 dtype
 存储字节数计算必要流量，并覆盖公开评分与 TopK 调用；它是流量模型指标，不是实测
 DRAM 利用率。BF16 与 FP8 的 MBU 接近并不意味着绝对延迟相同。
+
+## Cache 布局
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

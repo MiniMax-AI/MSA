@@ -54,7 +54,7 @@ capture 外调用，并在首次 capture 前完成一次 `run()` warmup；captur
 - FlashInfer 路径的 `plan()` 会校验 GPU metadata，并可能同步到 host；metadata 内容变化后必须重新 `plan()`，已有 Graph 需要重新 capture。
 - 首次 capture 前完成一次 `run()` warmup，capture 时预分配 `out`。不同并发 stream/Graph 使用独立 wrapper。
 - Q、K/V 和输出的起始地址必须 16-byte aligned，所有张量位于同一 GPU。
-- `Hq/Hkv` 支持 8 或 16，均使用 FlashInfer；默认仍为 `64/4`。K/V 最后两维必须连续，head/page 维允许非连续且 K/V stride 必须一致。
+- `Hq/Hkv` 支持 8 或 16，均使用 FlashInfer；默认仍为 `64/4`。K/V 仅最后一维必须连续，K/V stride 必须一致。
 
 在仓库根目录安装可选依赖，保持项目 CuTe DSL 4.5.2：
 
@@ -75,3 +75,15 @@ python -m pytest tests/inference/msa_v1/attention/decode/q8kv8 -q -s --msa-infer
 python -m pytest tests/inference/dequant/nvfp4_to_fp8/test_sparse_flashinfer.py -q -s
 python -m benchmarks.inference.msa_v1.attention.decode.q8kv8.benchmark --suite full --num-q-heads 32 --num-kv-heads 4
 ```
+
+## Cache 布局
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
+FlashInfer 要求每个外层元素 stride 可由有符号 int32 表示（`<= 2**31 - 1`）。
+K/V 的 stride 须一致。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

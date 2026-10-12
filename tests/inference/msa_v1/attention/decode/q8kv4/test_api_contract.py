@@ -14,6 +14,7 @@ from inference.msa_v1.attention.decode.q8kv4 import (
     interface,
     jit,
 )
+from tests.inference.msa_v1.cache_layout import cache_view
 
 
 def test_public_package_exports_only_wrapper() -> None:
@@ -93,9 +94,22 @@ def test_run_requires_plan_and_aligned_data(monkeypatch) -> None:
             )[1:].view(tensor.shape)
             assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 != 0
             invalid = {**data, name: misaligned}
+            alignment = 32 if name.endswith("cache") else 16
             with pytest.raises(
-                ValueError, match=f"{name} must have a 16-byte aligned address"
+                ValueError, match=f"{name} must have a {alignment}-byte aligned"
             ):
+                wrapper.run(
+                    invalid["q"],
+                    (invalid["k_cache"], invalid["v_cache"]),
+                    kv_cache_sf=(invalid["k_scale"], invalid["v_scale"]),
+                    out=invalid["out"],
+                )
+        for name in ("k_cache", "k_scale"):
+            invalid = {
+                **data,
+                name: cache_view(data[name], "page", alignment_bytes=32),
+            }
+            with pytest.raises(ValueError, match="strides must match"):
                 wrapper.run(
                     invalid["q"],
                     (invalid["k_cache"], invalid["v_cache"]),

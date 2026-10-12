@@ -61,3 +61,18 @@ Callers may pass preallocated `out` and `lse` tensors to `run()`.
 - `cu_seqlens_k` is the only source of KV lengths.
 - Call `plan()` outside CUDA Graph capture and preallocate `out` and `lse` during capture.
 - NVFP4 dequantization requires CUDA Toolkit 13.4 or newer.
+
+## Cache layout
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+Each scale page must have tightly packed `[Hkv, 128, 8]` storage. Only the page stride may include padding; it must cover a complete page and
+be a multiple of 16 bytes. Scale pointers must be 16-byte aligned. Data and scale may
+have different page strides. Scale token/head padding or outer-axis permutations are not supported.
+K/V strides must match; K/V scale strides must also match.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

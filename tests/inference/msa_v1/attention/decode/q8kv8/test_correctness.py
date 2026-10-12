@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import gc
 import weakref
+from dataclasses import replace
 
 import pytest
 import torch
 
+from inference.msa_v1.attention.decode import bf16
 from inference.msa_v1.attention.decode.q8kv8 import (
     BatchDecodeWithPagedKVCacheWrapper,
 )
@@ -22,6 +24,7 @@ from tests.inference.msa_v1.attention.decode.q8kv8.runtime import (
     run_decode,
 )
 from tests.inference.msa_v1.attention.decode.runtime import run_cuda
+from tests.inference.msa_v1.cache_layout import CACHE_LAYOUTS, cache_view
 
 pytestmark = pytest.mark.gpu
 
@@ -56,7 +59,9 @@ def _make_inputs(
     )
 
 
-def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
+def _assert_close(
+    actual: torch.Tensor, expected: torch.Tensor, *, tolerance=0.05
+) -> None:
     actual_fp32 = actual.float()
     expected_fp32 = expected.float()
     assert bool(torch.isfinite(actual_fp32).all())
@@ -65,15 +70,31 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
         actual_fp32.flatten(), expected_fp32.flatten(), dim=0
     )
     assert float(cosine) >= 0.999
-    torch.testing.assert_close(actual_fp32, expected_fp32, atol=0.05, rtol=0.05)
+    torch.testing.assert_close(
+        actual_fp32, expected_fp32, atol=tolerance, rtol=tolerance
+    )
 
 
 @pytest.mark.parametrize("gqa_ratio", (8, 16), ids=("gqa8", "gqa16"))
 @pytest.mark.parametrize("num_kv_heads", (1, 2, 4))
-def test_full_output_matches_independent_reference(gqa_ratio, num_kv_heads) -> None:
+@pytest.mark.parametrize("layout", CACHE_LAYOUTS)
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_full_output_matches_independent_reference(
+    gqa_ratio, num_kv_heads, layout, dtype
+) -> None:
     device = _require_backend()
     inputs = _make_inputs(device, gqa_ratio=gqa_ratio, num_kv_heads=num_kv_heads)
-    wrapper = BatchDecodeWithPagedKVCacheWrapper()
+    inputs = replace(
+        inputs,
+        q=inputs.q.to(dtype),
+        k_cache=inputs.k_cache.to(dtype),
+        v_cache=inputs.v_cache.to(dtype),
+    )
+    wrapper = (
+        bf16.BatchDecodeWithPagedKVCacheWrapper()
+        if dtype == torch.bfloat16
+        else BatchDecodeWithPagedKVCacheWrapper()
+    )
     wrapper.plan(
         inputs.topk_indices,
         inputs.page_table,
@@ -82,18 +103,44 @@ def test_full_output_matches_independent_reference(gqa_ratio, num_kv_heads) -> N
         num_q_heads=gqa_ratio * num_kv_heads,
         num_kv_heads=num_kv_heads,
     )
+    from flashinfer.decode import get_trtllm_gen_fmha_module
+
+    run_decode(wrapper, inputs)
+    misses = get_trtllm_gen_fmha_module.cache_info().misses
+    with pytest.raises(ValueError, match="shapes and strides must match"):
+        wrapper.run(inputs.q, (cache_view(inputs.k_cache, "token"), inputs.v_cache))
+    inputs = replace(
+        inputs,
+        k_cache=cache_view(inputs.k_cache, layout),
+        v_cache=cache_view(inputs.v_cache, layout),
+    )
     actual = run_decode(wrapper, inputs)
-    _assert_close(actual, decode_attention_reference(inputs))
+    assert get_trtllm_gen_fmha_module.cache_info().misses == misses
+    tolerance = 0.03 if dtype == torch.bfloat16 else 0.05
+    _assert_close(actual, decode_attention_reference(inputs), tolerance=tolerance)
+    out = torch.empty_like(actual)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(inputs.q, (inputs.k_cache, inputs.v_cache), out=out)
+    out.fill_(float("nan"))
+    run_cuda("cache layout graph replay", graph.replay)
+    _assert_close(out, decode_attention_reference(inputs), tolerance=tolerance)
     inputs.q.zero_()
     _assert_close(
         run_decode(wrapper, inputs),
         decode_attention_reference(inputs),
+        tolerance=tolerance,
     )
-    inputs.k_cache.view(torch.uint8).fill_(0x7E)
-    inputs.v_cache.view(torch.uint8).fill_(0x7E)
+    if dtype == torch.bfloat16:
+        inputs.k_cache.fill_(448.0)
+        inputs.v_cache.fill_(448.0)
+    else:
+        inputs.k_cache.view(torch.uint8).fill_(0x7E)
+        inputs.v_cache.view(torch.uint8).fill_(0x7E)
     _assert_close(
         run_decode(wrapper, inputs),
         decode_attention_reference(inputs),
+        tolerance=tolerance,
     )
 
 

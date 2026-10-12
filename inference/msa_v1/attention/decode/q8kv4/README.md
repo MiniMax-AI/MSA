@@ -62,8 +62,8 @@ scales for valid output rows.
 - `seq_lens`: `[B]`, final KV lengths including the current decode/MTP query chunk.
 - `out`: `[B * q_len_per_req, Hq, 128]`, BF16 by default; see the MXFP8 mode above.
 
-All tensors must be contiguous and reside on the same CUDA device. `topk_indices`, `page_table`,
-and `seq_lens` use `torch.int32`; Q, K/V, scales, and output require 16-byte aligned addresses.
+All tensors must reside on the same CUDA device. Q, metadata, and output must be contiguous. `topk_indices`, `page_table`,
+and `seq_lens` use `torch.int32`; Q and output require 16-byte aligned addresses; K/V require 32-byte alignment, and scales require 16-byte alignment.
 
 ## Runtime requirements
 
@@ -102,3 +102,20 @@ python -m benchmarks.inference.msa_v1.attention.decode.q8kv4.benchmark --suite f
 
 Full correctness covers GQA=8 and GQA=16. The benchmark measures
 the public `run()` CUDA Graph E2E latency. Use `--num-q-heads 64` to measure GQA=16.
+
+## Cache layout
+
+Non-contiguous cache support is verified on SM100/SM103; it is not yet verified on SM107.
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 32.
+Each scale page must have tightly packed `[Hkv, 128, 8]` storage. Only the page stride may include padding; it must cover a complete page and
+be a multiple of 16 bytes. Scale pointers must be 16-byte aligned. Data and scale may
+have different page strides. Scale token/head padding or outer-axis permutations are not supported.
+K/V strides must match; K/V scale strides must also match.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

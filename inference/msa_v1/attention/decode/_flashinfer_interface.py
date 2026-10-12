@@ -6,6 +6,7 @@ import math
 
 import torch
 
+from inference.msa_v1._cache_layout import check_cache_layout
 from inference.msa_v1.attention.decode._flashinfer import (
     FlashInferPlan,
     _check_cuda_contiguous,
@@ -138,8 +139,12 @@ class _BatchDecodeWithPagedKVCacheWrapperBase:
                     f"{name} must have shape [pages, {state.num_kv_heads}, "
                     f"{_PAGE_SIZE}, {_HEAD_DIM}]"
                 )
-            if tensor.stride(-1) != 1 or tensor.stride(-2) != _HEAD_DIM:
-                raise ValueError(f"{name} token and head-dim axes must be contiguous")
+            check_cache_layout(tensor, name=name)
+            # FlashInfer's runner ABI carries element strides as signed int32.
+            if any(stride > 2**31 - 1 for stride in tensor.stride()[:-1]):
+                raise ValueError(
+                    f"{name} outer strides exceed the FlashInfer int32 ABI"
+                )
             if tensor.shape[0] <= state.max_source_page:
                 raise ValueError(f"{name} does not cover every planned physical page")
         if k_cache.shape != v_cache.shape or k_cache.stride() != v_cache.stride():

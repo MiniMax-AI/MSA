@@ -57,7 +57,10 @@ def test_mxfp8_matches_flashinfer(gqa: int, q_len: int, kv_len: int) -> None:
         output_mode="mxfp8",
     )
     for split in (False, True):
-        jit.get_fmha_fwd_variant(gqa_ratio=gqa, split_kv=split, output_mode="mxfp8")
+        for output_mode in ("bf16", "mxfp8"):
+            jit.get_fmha_fwd_variant(
+                gqa_ratio=gqa, split_kv=split, output_mode=output_mode
+            )
     out_bf16 = run_cuda(
         "BF16 output", lambda: bf16.run(q, (k, v), kv_cache_sf=(sf, sf))
     )
@@ -99,6 +102,10 @@ def test_mxfp8_explicit_single_split_and_empty_segment(
     fused = BatchDecodeWithPagedKVCacheWrapper()
     fused.plan(topk, table, lengths, q_len_per_req=q_len,
                num_q_heads=4 * gqa, num_kv_splits=1, output_mode="mxfp8")
+    for output_mode in ("bf16", "mxfp8"):
+        jit.get_fmha_fwd_variant(
+            gqa_ratio=gqa, split_kv=False, output_mode=output_mode
+        )
     out_bf16 = run_cuda("single-split BF16", lambda: bf16.run(
         q, (k, v), kv_cache_sf=(sf, sf)))
     expected, expected_sf = flashinfer.mxfp8_quantize(
@@ -142,6 +149,10 @@ def test_mxfp8_two_way_streamk_merge() -> None:
     fused = BatchDecodeWithPagedKVCacheWrapper()
     fused.plan(topk, table, lengths, q_len_per_req=8, num_q_heads=64,
                usable_sm_count=64, output_mode="mxfp8")
+    for output_mode in ("bf16", "mxfp8"):
+        jit.get_fmha_fwd_variant(
+            gqa_ratio=16, split_kv=True, output_mode=output_mode
+        )
     out_bf16 = run_cuda("two-way BF16 merge", lambda: bf16.run(
         q, (k, v), kv_cache_sf=(sf, sf)))
     expected, expected_sf = flashinfer.mxfp8_quantize(

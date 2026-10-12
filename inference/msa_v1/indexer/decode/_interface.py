@@ -18,6 +18,7 @@ try:
 except ImportError:  # pragma: no cover
     tvm_ffi = None
 
+from inference.msa_v1._cache_layout import check_cache_layout
 from inference.msa_v1.indexer._common.topk_select import _topk_select
 from inference.msa_v1.indexer.decode.indexer_gemm import DecodeIndexerGemmSm100
 from inference.msa_v1.indexer.decode.plan import BatchDecodeIndexerPlan
@@ -268,6 +269,13 @@ class _BatchDecodeProxyScoreWrapper:
             ),
             assumed_align=16,
         )
+        if k_cache.shape[0] == 1:
+            # An unused singleton stride may be zero or unaligned. Normalize
+            # only that metadata so TMA and the dynamic-stride ABI stay valid.
+            k_cache = k_cache.as_strided(
+                k_cache.shape,
+                (_PAGE_SIZE * k_cache.stride(1), k_cache.stride(1), 1),
+            )
         k_cute = _as_dynamic_tensor(k_cache, assumed_align=16)
         page_table_cute = _as_dynamic_tensor(
             self._page_table,
@@ -352,8 +360,7 @@ class _BatchDecodeProxyScoreWrapper:
             raise ValueError("q must have shape [batch, Q, H, 128]")
         if q.device != self._device:
             raise ValueError("q must be on the planned metadata device")
-        if not k_cache.is_cuda or not k_cache.is_contiguous():
-            raise ValueError("k_cache must be a contiguous CUDA tensor")
+        check_cache_layout(k_cache, name="k_cache")
         if k_cache.dtype is not self._input_dtype:
             raise RuntimeError(f"k_cache must have dtype {self._input_dtype}")
         if (

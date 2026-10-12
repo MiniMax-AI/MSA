@@ -25,8 +25,7 @@ struct WorkTileInfo {
 
 static_assert(sizeof(WorkTileInfo) == 10 * sizeof(int));
 
-template <class QSmemLayout, class KSmemLayout, class VSmemLayout>
-struct SharedStorage {
+template <class QSmemLayout, class KSmemLayout, class VSmemLayout> struct SharedStorage {
   alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<QSmemLayout>> q;
   alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<KSmemLayout>> k;
   alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<VSmemLayout>> v;
@@ -66,8 +65,7 @@ struct SharedStorage {
   float row_max[kScoreStages][128];
 };
 
-template <class TmaQ, class QGmemShape>
-struct KernelParams {
+template <class TmaQ, class QGmemShape> struct KernelParams {
   PrefillArguments arguments;
   TmaQ tma_q;
   QGmemShape q_gmem_shape;
@@ -77,4 +75,4 @@ struct KernelParams {
   cute::TmaDescriptor tma_v_scale;
 };
 
-}  // namespace minimax::msa_v1::attention::prefill::q8kv4::detail
+} // namespace minimax::msa_v1::attention::prefill::q8kv4::detail

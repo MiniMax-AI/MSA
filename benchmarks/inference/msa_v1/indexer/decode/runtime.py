@@ -11,10 +11,15 @@ def check_benchmark_device():
     if "galaxy" in hostname.lower() or hostname in ("2u2g-gen-0176", "2u2g-gen-0300"):
         raise RuntimeError("benchmark excludes B300A and galaxy nodes")
     properties = torch.cuda.get_device_properties("cuda")
-    if "GB300" not in properties.name or "B300A" in properties.name:
-        raise RuntimeError("benchmark requires GB300 NVL, excluding B300A")
-    if torch.cuda.get_device_capability() != (10, 3):
-        raise RuntimeError("benchmark requires SM103")
+    if (
+        not any(model in properties.name for model in ("B200", "GB300"))
+        or "B300A" in properties.name
+    ):
+        raise RuntimeError(
+            "benchmark requires B200/GB200 or GB300 NVL, excluding B300A"
+        )
+    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
+        raise RuntimeError("benchmark requires SM100 or SM103")
     # Establish our context before counting processes; container PIDs differ from host PIDs.
     context_probe = torch.empty(1, device="cuda")
     torch.cuda.synchronize()
@@ -37,7 +42,7 @@ def check_benchmark_device():
         [],
     )
     if not any(link.startswith("NV") and link[2:].isdigit() for link in links):
-        raise RuntimeError("benchmark requires a verified GB300 NVL topology")
+        raise RuntimeError("benchmark requires a verified NVLink topology")
     processes = subprocess.check_output(
         [
             "nvidia-smi",

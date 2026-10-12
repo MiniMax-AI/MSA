@@ -33,7 +33,7 @@ topk_indices = wrapper.run(q, paged_k_cache)
 ## 数据契约
 
 - `num_index_heads` 默认为 1，支持 1/2/4。各 head 独立选择 TopK，共享 K cache。
-- Q/K 和输出必须为同设备 CUDA contiguous tensor。
+- Q 和输出必须为 CUDA contiguous tensor；K 必须位于同一 device。
 - H=1 的输出也保留 head 维。
 
 - `q`：`[total_q, H, 128]`，E4M3。
@@ -71,3 +71,15 @@ Benchmark 使用公开 `run()` 的 CUDA Graph E2E 时间，按生产权重汇总
 
 传入 `--baseline <baseline-h1.json>` 可检查与基线的差异。指标定义见
 [共享 benchmark 契约](../../../../../datas/inference/README.zh-CN.md)。
+
+## Cache 布局
+
+非连续 cache 的支持已在 SM100/SM103 上验证，尚未在 SM107 上验证。
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

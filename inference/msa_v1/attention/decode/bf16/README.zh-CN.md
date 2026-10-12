@@ -49,9 +49,8 @@ assert output.shape == q.shape
 | `seq_lens` | `[B]` | `torch.int32` |
 | `out` | 与 `q` 相同 | `torch.bfloat16` |
 
-所有 tensor 必须在同一 CUDA device。Q、metadata 和输出须 contiguous；K/V 的页与
-head 维度可有 stride，token/head-dim stride 必须为 128/1，K/V 的 shape 和 stride
-须相同。Q/K/V 和输出须 16-byte 对齐。每个 KV head 对应 8 或 16 个 Q head。
+所有 tensor 必须在同一 CUDA device。Q、metadata 和输出须 contiguous；K/V 仅最后一维
+须连续，shape 和 stride 须相同。Q/K/V 和输出须 16-byte 对齐。每个 KV head 对应 8 或 16 个 Q head。
 所有请求共用 Q，序列长度包含 Q-token query chunk，query 位置为 `seq_lens[b] - Q + t`。
 
 TopK 保存 logical page ID，有效前缀后的 padding 为 `-1`。历史页不能重复，可以无序；
@@ -89,3 +88,15 @@ python -m benchmarks.inference.msa_v1.attention.decode.bf16.benchmark --suite fu
 
 Benchmark 报告公开 `run()` 的 CUDA Graph latency，不包含 plan、分配、编译和 warmup，
 并使用独立 reference 检查整个输出。传入 `--disable-pdl` 可测量禁用 PDL 后的同一路径。
+
+## Cache 布局
+
+Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
+Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
+FlashInfer 要求每个外层元素 stride 可由有符号 int32 表示（`<= 2**31 - 1`）。
+K/V 的 stride 须一致。
+字节 stride 等于 tensor 元素 stride 乘以 `element_size()`。广播、重叠和负 stride cache
+不在支持范围内。Q、metadata 和输出的布局要求见上文。
+
+CUDA Graph capture 后，cache 地址、shape
+或 stride 改变时须重新 capture。不同 wrapper 保持独立 workspace。

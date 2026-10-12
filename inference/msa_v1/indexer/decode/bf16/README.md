@@ -48,7 +48,7 @@ concurrent calls.
 | `out` | `[H,B*Q,16]` | `torch.int32` |
 
 `plan()` defaults to `num_index_heads=1` and `query_length=8`; page-table capacity is 1–8192 pages.
-All tensors must be contiguous and reside on the same CUDA device. Q and K require 16-byte
+All tensors must reside on the same CUDA device. Q, metadata, and output must be contiguous. Q and K require 16-byte
 alignment. All requests share Q; lengths include the query chunk and satisfy
 `Q <= seq_lens[b] <= max_pages*128`.
 
@@ -80,3 +80,14 @@ The production suite uses the shared case weights; the low-latency suite uses eq
 Effective MBU counts required traffic using each dtype's storage size and includes the public
 score and TopK call. It is a traffic-model metric, not measured DRAM utilization. BF16 and FP8
 may have similar MBU while their absolute latencies differ.
+
+## Cache layout
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

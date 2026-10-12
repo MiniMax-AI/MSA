@@ -7,13 +7,16 @@ import os
 import time
 from dataclasses import dataclass
 
-import cutlass.cute as cute
+import cutlass.cute as cute  # noqa: PLR0402
 import torch
-
 from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack
 
 from inference.msa_v1._build_utils import cutlass_root
+from inference.msa_v1._cache_layout import (
+    check_cache_layout,
+    normalize_cache_singletons,
+)
 from inference.msa_v1.aot_cache import compile_or_load
 from inference.msa_v1.indexer._common.topk_select import _topk_select
 from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm import (
@@ -23,7 +26,6 @@ from inference.msa_v1.indexer.prefill.q8kv8.plan import (
     PrefillIndexerPlanBuild,
     PrefillIndexerPlanReset,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +301,7 @@ def _compile_kernel(
         )
         compile_args = (
             _to_cute_tensor(q),
-            _to_cute_tensor(paged_k_cache),
+            _to_cute_tensor(normalize_cache_singletons(paged_k_cache)),
             _to_cute_tensor(state.page_table),
             _to_cute_tensor(proxy_scores),
             _to_cute_tensor(state.task_descriptors),
@@ -449,8 +451,9 @@ class _BatchPrefillProxyScoreWrapper:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return FP32 proxy scores and device-side valid-page counts."""
         state = self.plan_state
+        _check_cuda_contiguous(q, name="q")
+        check_cache_layout(paged_k_cache, name="paged_k_cache")
         for name, tensor in (("q", q), ("paged_k_cache", paged_k_cache)):
-            _check_cuda_contiguous(tensor, name=name)
             _check_same_device(state.page_table, tensor, name=name)
             if tensor.dtype != torch.float8_e4m3fn:
                 raise TypeError(f"{name} must have dtype torch.float8_e4m3fn")
@@ -474,6 +477,7 @@ class _BatchPrefillProxyScoreWrapper:
         proxy_scores = state.proxy_scores
         num_valid_pages = state.num_valid_pages
         q_flat = q.view(state.total_q * state.num_index_heads, -1)
+        paged_k_cache = normalize_cache_singletons(paged_k_cache)
         compiled = _compile_kernel(q_flat, paged_k_cache, state, proxy_scores)
         with torch.cuda.nvtx.range("PrefillIndexerQ8KV8ProxyScore"):
             compiled(

@@ -73,7 +73,7 @@ Rebinding and allocation are not supported inside capture.
 - Output: `[H, B * Q, 16]`, `torch.int32` logical page indices. Valid entries form a prefix, and
   the final valid entry is the local page.
 
-All input tensors must be contiguous and on the same CUDA device. A historical page score is the maximum dot product between its tokens and the corresponding Q head. Each head selects historical candidates independently; unused output slots are filled with `-1`.
+All inputs must reside on the same CUDA device. Q and metadata must be contiguous. A historical page score is the maximum dot product between its tokens and the corresponding Q head. Each head selects historical candidates independently; unused output slots are filled with `-1`.
 
 ## Runtime requirements
 
@@ -124,3 +124,14 @@ Standalone update timing uses hot metadata caches. Run and update+run use disjoi
 with a K reuse distance of at least 2×L2. These cache conditions are reported separately.
 If host+device timing still exceeds CV=3% after three attempts, it is marked invalid and
 the command fails. Independently valid Graph timings remain in the output file.
+
+## Cache layout
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.

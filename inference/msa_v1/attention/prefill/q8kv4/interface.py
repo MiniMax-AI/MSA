@@ -14,7 +14,6 @@ from inference.msa_v1.attention.prefill._common.metadata import (
 )
 from inference.msa_v1.attention.prefill.q8kv4.jit import load_extension
 
-
 _HEAD_DIM = 128
 _Q_HEADS_PER_KV = 16
 _PAGE_SIZE = 128
@@ -98,7 +97,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         total_q = int(topk_indices.shape[1])
         num_q_heads = int(topk_indices.shape[0]) * _Q_HEADS_PER_KV
-        options = dict(device=topk_indices.device)
+        options = {"device": topk_indices.device}
         scale = 1.0 / math.sqrt(_HEAD_DIM) if sm_scale is None else float(sm_scale)
         if not math.isfinite(scale) or scale <= 0.0:
             raise ValueError("sm_scale must be finite and positive")
@@ -147,16 +146,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             raise ValueError("paged_kv_cache and kv_cache_sf must be (K, V) pairs")
         k_cache, v_cache = paged_kv_cache
         k_scale, v_scale = kv_cache_sf
-        tensors = {
-            "q": q,
-            "k_cache": k_cache,
-            "v_cache": v_cache,
-            "k_scale": k_scale,
-            "v_scale": v_scale,
-        }
-        for name, tensor in tensors.items():
-            _check_cuda_contiguous(tensor, name=name)
-            _check_same_device(state.page_table, tensor, name=name)
+        _check_cuda_contiguous(q, name="q")
+        _check_same_device(state.page_table, q, name="q")
+        # Cache devices, page strides and alignment are validated by the C++ entry;
+        # repeating them here would add host time to every layer.
 
         if q.dtype != torch.float8_e4m3fn:
             raise TypeError("q must be torch.float8_e4m3fn")

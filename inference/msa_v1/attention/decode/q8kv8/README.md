@@ -57,7 +57,7 @@ capture, and use preallocated outputs during capture.
 - FlashInfer `plan()` validates GPU metadata and may synchronize with the host. Re-plan after metadata contents change and recapture existing Graphs.
 - Warm up `run()` before the first capture and preallocate `out` during capture. Concurrent streams/Graphs use separate wrappers.
 - Q, K/V, and output must have 16-byte aligned addresses and reside on the same GPU.
-- `Hq/Hkv` supports 8 or 16 through FlashInfer; the default remains `64/4`. The final two K/V dimensions must be contiguous; head/page strides may be non-contiguous, with matching K/V strides.
+- `Hq/Hkv` supports 8 or 16 through FlashInfer; the default remains `64/4`. Only the final K/V dimension must be contiguous, with matching K/V strides.
 
 Install the optional dependency from the repository root while retaining CuTe DSL 4.5.2:
 
@@ -78,3 +78,16 @@ python -m pytest tests/inference/msa_v1/attention/decode/q8kv8 -q -s --msa-infer
 python -m pytest tests/inference/dequant/nvfp4_to_fp8/test_sparse_flashinfer.py -q -s
 python -m benchmarks.inference.msa_v1.attention.decode.q8kv8.benchmark --suite full --num-q-heads 32 --num-kv-heads 4
 ```
+
+## Cache layout
+
+Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
+Cache data pointers and non-singleton outer byte strides must be multiples of 16.
+Each outer element stride must fit in signed int32 (`<= 2**31 - 1`), as required by FlashInfer.
+K/V strides must match.
+Byte strides equal tensor element strides multiplied by `element_size()`. Broadcast,
+overlapping, and negative-stride caches are outside the supported contract. Q, metadata,
+and output must follow the layout requirements above.
+
+After CUDA Graph capture, changing a cache
+address, shape, or stride requires recapture. Separate wrappers retain separate workspaces.
