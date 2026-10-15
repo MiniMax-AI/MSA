@@ -152,6 +152,24 @@ def test_prepare_keeps_capacity_for_empty_attention_work() -> None:
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("deterministic", (1, None, "true"))
+def test_prepare_rejects_non_boolean_deterministic(deterministic) -> None:
+    topk = torch.full((4, 1, 16), -1, dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.tensor((0, 1), dtype=torch.int32, device="cuda")
+    with pytest.raises(TypeError, match="deterministic"):
+        attention.prepare(
+            topk,
+            cu_seqlens,
+            cu_seqlens,
+            total_k=1,
+            total_rows=1,
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            deterministic=deterministic,
+        )
+
+
+@pytest.mark.gpu
 def test_prepare_supports_single_batch_single_kv_block() -> None:
     cases = ((1, 1), (2, 127), (7, 128), (33, 64), (129, 128), (257, 96))
     for q_len, k_len in cases:
@@ -650,6 +668,155 @@ def test_prepare_device_schedule_handles_1024_varlen_documents() -> None:
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("deterministic", (False, True))
+def test_prepare_shared_k_physical_csr_membership_and_order(
+    deterministic: bool,
+) -> None:
+    block_size = 128
+    group_sizes = (37, 19, 1)
+    q_lens = []
+    cu_q_host = [0]
+    cu_k_host = [0]
+    roots = []
+    effective_k_lens = []
+    for group_size in group_sizes:
+        root = len(roots)
+        for _ in range(group_size):
+            fragment = len(roots)
+            q_len = (1, 7, 33, 65, 129)[fragment % 5]
+            q_lens.append(q_len)
+            roots.append(root)
+            cu_q_host.append(cu_q_host[-1] + q_len)
+            cu_k_host.append(cu_k_host[-1] + (513, 259, 385)[fragment % 3])
+            effective_k_lens.append(cu_k_host[-1] - cu_k_host[root])
+
+    logical_rows = sum(math.ceil(k_len / block_size) for k_len in effective_k_lens)
+    # Shared rows span many independent prefix threads, not one serial partition.
+    assert logical_rows > 1024
+    padded_blocks = math.ceil((cu_k_host[-1] + len(roots) * block_size) / block_size)
+    total_q = cu_q_host[-1]
+    topk_variants = []
+    references = []
+    for variant in range(2):
+        generator = torch.Generator().manual_seed(173 + variant)
+        topk_host = torch.full((INDEX_HEADS, total_q, 16), -1, dtype=torch.int32)
+        entries = [[[] for _ in range(padded_blocks)] for _ in range(INDEX_HEADS)]
+        for fragment, (q_len, k_len) in enumerate(zip(q_lens, effective_k_lens)):
+            root = roots[fragment]
+            physical_base = (cu_k_host[root] + root * block_size) // block_size
+            for q_local in range(q_len):
+                q_global = cu_q_host[fragment] + q_local
+                q_logical = k_len - q_len + q_local
+                local_block = q_logical // block_size
+                for head in range(INDEX_HEADS):
+                    if (q_global + head) % 29 == 0:
+                        continue
+                    # Leave block zero empty; shuffle discrete earlier blocks,
+                    # preserving unique selections and the local-block-last rule.
+                    candidates = [
+                        block
+                        for block in range(1, local_block)
+                        if (block + q_global + head + variant) % 3 != 0
+                    ]
+                    order = torch.randperm(
+                        len(candidates), generator=generator
+                    ).tolist()
+                    count = min(len(candidates), 2 + (q_global + head + variant) % 10)
+                    blocks = [candidates[index] for index in order[:count]] + [
+                        local_block
+                    ]
+                    topk_host[head, q_global, : len(blocks)] = torch.tensor(blocks)
+                    for block in blocks:
+                        valid_rows = min(
+                            block_size,
+                            k_len - block * block_size,
+                            q_logical - block * block_size + 1,
+                        )
+                        writer_rank = sum(other < block for other in blocks)
+                        packed = valid_rows | (writer_rank << KL_WRITER_RANK_SHIFT)
+                        entries[head][physical_base + block].append((q_global, packed))
+        # Iterating fragments and Q in packed order is the independent reference:
+        # each physical row concatenates entries by global flattened Q, not TopK slot.
+        row_ptr = torch.zeros((INDEX_HEADS, padded_blocks + 1), dtype=torch.int32)
+        for head in range(INDEX_HEADS):
+            for block in range(padded_blocks):
+                row_ptr[head, block + 1] = row_ptr[head, block] + len(
+                    entries[head][block]
+                )
+        topk_variants.append(topk_host.cuda())
+        references.append((row_ptr, entries))
+
+    cu_q = torch.tensor(cu_q_host, dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor(cu_k_host, dtype=torch.int32, device="cuda")
+    fragments = torch.tensor(roots, dtype=torch.int32, device="cuda")
+
+    def prepare(topk):
+        return attention.prepare(
+            topk,
+            cu_q,
+            cu_k,
+            total_k=cu_k_host[-1],
+            total_rows=logical_rows,
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(effective_k_lens),
+            fragment_indices=fragments,
+            deterministic=deterministic,
+        )
+
+    def check_physical_csr(metadata, variant):
+        assert metadata.deterministic is deterministic
+        schedule = metadata.kl_schedule
+        expected_ptr, entries = references[variant]
+        row_ptr = schedule.physical_row_ptr.cpu()
+        torch.testing.assert_close(row_ptr, expected_ptr, atol=0, rtol=0)
+        for head in range(INDEX_HEADS):
+            # Allocation tails are unspecified; only CSR-bounded entries are valid.
+            nnz = int(row_ptr[head, -1])
+            q_indices = schedule.physical_q_indices[head, :nnz].cpu()
+            packed_rows = schedule.physical_valid_rows[head, :nnz].cpu()
+            assert nnz < schedule.physical_q_indices.shape[1]
+            for block in range(padded_blocks):
+                begin = int(row_ptr[head, block])
+                end = int(row_ptr[head, block + 1])
+                expected = entries[head][block]
+                actual_q = q_indices[begin:end]
+                packed = packed_rows[begin:end]
+                if not deterministic:
+                    # Atomic reservations may permute fragments, but Q and its
+                    # valid-row/writer-rank payload must stay paired.
+                    order = actual_q.argsort()
+                    actual_q = actual_q[order]
+                    packed = packed[order]
+                # Never sort deterministic output: expose fragment-order races.
+                assert actual_q.tolist() == [q for q, _ in expected]
+                assert packed.tolist() == [value for _, value in expected]
+                assert (packed & KL_VALID_ROWS_MASK).tolist() == [
+                    value & KL_VALID_ROWS_MASK for _, value in expected
+                ]
+                assert (
+                    (packed >> KL_WRITER_RANK_SHIFT) & KL_WRITER_RANK_MASK
+                ).tolist() == [
+                    (value >> KL_WRITER_RANK_SHIFT) & KL_WRITER_RANK_MASK
+                    for _, value in expected
+                ]
+
+    assert not torch.equal(references[0][0], references[1][0])
+    for variant in (0, 1, 0, 0, 1, 0):
+        check_physical_csr(prepare(topk_variants[variant]), variant)
+
+    topk_input = topk_variants[0].clone()
+    prepare(topk_input)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_metadata = prepare(topk_input)
+    for variant in (0, 1, 1, 0, 0):
+        topk_input.copy_(topk_variants[variant])
+        graph.replay()
+        check_physical_csr(captured_metadata, variant)
+
+
+@pytest.mark.gpu
 def test_prepare_cuda_graph_rebuilds_metadata_from_current_topk() -> None:
     q_lens = (1,)
     k_lens = (4096,)
@@ -705,7 +872,9 @@ def test_prepare_cuda_graph_rebuilds_metadata_from_current_topk() -> None:
 def test_prepare_cuda_graph_capture_and_replay() -> None:
     torch.manual_seed(6)
     batch = 64
-    k_lens, cu_k, metadata = make_single_query_varlen_metadata(batch)
+    k_lens, cu_k, metadata = make_single_query_varlen_metadata(
+        batch, deterministic=True
+    )
     assert int(metadata.schedule.work_count.item()) > 0
     q = torch.randn(
         batch,
@@ -788,6 +957,7 @@ def test_prepare_cuda_graph_capture_and_replay() -> None:
             total_rows=batch,
             max_seqlen_q=1,
             max_seqlen_k=128,
+            deterministic=True,
         )
         out, lse = attention.forward(
             q,

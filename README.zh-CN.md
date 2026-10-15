@@ -136,6 +136,39 @@ dqi, dki = kl.backward(..., indexer_lse, metadata)
 之间复用；TopK 更新后必须重新执行 `prepare()`。若 TopK 会在 CUDA Graph replay 之间
 变化，Graph 必须捕获 `prepare()`，使其在每次 replay 时重新生成 metadata。
 
+`attention.prepare(..., deterministic=False)` 为默认模式：保留 physical KL CSR row
+原有的 atomic reservation 路径，不额外启动有序 fragment-offset kernel。shared-K
+fragment 的顺序可能变化，但数学语义不变。
+
+shared-K KL backward 如需确定性，必须在 **prepare 和 backward 两处** 显式启用。
+`attention.prepare(..., deterministic=True)` 保证每个 physical KL CSR row 内按全局
+Q index 升序排列（包括 shared-K fragment group）；将其 metadata 传给
+`kl.backward(..., deterministic=True)`。输入与执行环境相同时，这一组合保证 dQI、dKI
+在重新构建 metadata 或 CUDA Graph replay 后仍逐位一致，而不只是在复用同一份
+metadata 时一致。调用方无需规范化 CSR 或执行 Python 排序。
+`AttentionMetadata.deterministic` 记录 prepare 模式。如果 shared-K metadata
+（`fragment_indices is not None`）使用默认 False 构建，确定性 KL backward 会抛出
+`ValueError`，提示调用方用 `attention.prepare(..., deterministic=True)` 重新构建。
+不含 fragment 的确定性 KL backward 不要求在 prepare 时启用此选项。
+
+以下示例使用当前 TopK、序列/fragment metadata 及 Attention LSE：
+
+```python
+metadata = attention.prepare(
+    topk_indices, cu_seqlens_q, cu_seqlens_k,
+    total_k=k.shape[0], total_rows=total_rows,
+    max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+    fragment_indices=fragment_indices, deterministic=True,
+)
+out, lse = attention.forward(q, k, v, metadata, return_softmax_lse=True)
+dqi, dki = kl.backward(
+    q, k, lse, qi, ki, indexer_lse, metadata, deterministic=True,
+)
+```
+
+两种模式均支持 SM100/B200 和 SM103/B300，均不改变 indexer 的 TopK 顺序或最后一个有效
+block 为 local block 的约定。
+
 MSA v1 Attention 的 E4M3 概率路径（含 `sparse_attn_p_mode="fp8"` QAT）采用
 `E4M3(P × 448)`，归一化和 backward 概率重建补偿该缩放。LSE 保持原始 logits
 的自然对数语义，QAT 的逻辑 softmax STE 定义不变。该约定不承诺训练与推理最终输出逐位一致。

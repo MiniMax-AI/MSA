@@ -101,7 +101,7 @@ def materialize_metadata(
     )
 
 
-def make_shared_fragment_metadata():
+def make_shared_fragment_metadata(*, deterministic: bool = False):
     """Build the focused two-fragment metadata shared by operator tests."""
 
     from msa_v1 import attention
@@ -131,6 +131,7 @@ def make_shared_fragment_metadata():
         max_seqlen_q=32,
         max_seqlen_k=256,
         fragment_indices=fragments,
+        deterministic=deterministic,
     )
 
     work_count = int(metadata.schedule.work_count.item())
@@ -751,7 +752,7 @@ def make_packed_attention_metadata(
     return topk, metadata
 
 
-def make_single_query_varlen_metadata(batch: int):
+def make_single_query_varlen_metadata(batch: int, *, deterministic: bool = False):
     """Build deterministic one-query documents with distinct K lengths."""
 
     from msa_v1 import attention
@@ -779,6 +780,7 @@ def make_single_query_varlen_metadata(batch: int):
         total_rows=batch,
         max_seqlen_q=1,
         max_seqlen_k=BLOCK_SIZE,
+        deterministic=deterministic,
     )
     return k_lens, cu_k, metadata
 

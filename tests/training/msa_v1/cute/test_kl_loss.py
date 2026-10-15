@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from msa_v1 import attention, kl
+from msa_v1 import attention, indexer, kl
 from tests.training.msa_v1.cute.cases import MsaTestCase
 from tests.training.msa_v1.cute.testing import (
     HEAD_DIM,
@@ -72,6 +72,7 @@ def test_kl_loss_real_cases(
             max_seqlen_q=case.max_seqlen_q,
             max_seqlen_k=case.max_seqlen_kv,
             fragment_indices=fragments,
+            deterministic=True,
         ),
     )
     dqi, dki = launch_and_sync(
@@ -117,9 +118,163 @@ def test_kl_loss_real_cases(
         _assert_gradient_matches_reference(dki, dki_ref)
 
 
+@pytest.mark.parametrize("use_cuda_graph", (False, True), ids=("eager", "cuda-graph"))
+@torch.inference_mode()
+def test_kl_deterministic_across_shared_fragment_metadata_rebuilds(
+    cuda_device: torch.device,
+    use_cuda_graph: bool,
+) -> None:
+    total_q, total_k = 2048, 4096
+    fragment_q, fragment_count = 256, 8
+    temperature = 2.0
+    generator = cuda_generator(cuda_device, 4321)
+    cu_q = torch.arange(
+        0, total_q + 1, fragment_q, dtype=torch.int32, device=cuda_device
+    )
+    k_ends = tuple(range(total_k - total_q + fragment_q, total_k + 1, fragment_q))
+    cu_k = torch.tensor((0, *k_ends), dtype=torch.int32, device=cuda_device)
+    fragments = torch.zeros(fragment_count, dtype=torch.int32, device=cuda_device)
+    total_rows = sum(k_end // 128 for k_end in k_ends)
+
+    # A shared low-rank hidden state correlates teacher/student logits and makes
+    # index gradients sensitive to cancellation and physical CSR reduction order.
+    hidden = torch.randn(
+        total_k, 32, dtype=torch.bfloat16, device=cuda_device, generator=generator
+    )
+
+    def project(heads: int) -> torch.Tensor:
+        weight = (
+            torch.randn(
+                32,
+                heads * HEAD_DIM,
+                dtype=torch.bfloat16,
+                device=cuda_device,
+                generator=generator,
+            )
+            * 0.05
+        )
+        return (hidden @ weight).view(total_k, heads, HEAD_DIM)
+
+    # Every Q fragment is the suffix of its progressively longer shared-K range.
+    q = project(Q_HEADS)[-total_q:].contiguous()
+    k = project(KV_HEADS)
+    v = project(KV_HEADS)
+    qi = project(INDEX_HEADS)[-total_q:].contiguous()
+    ki = project(1)
+    topk, indexer_lse = launch_and_sync(
+        "kl-rebuild-indexer",
+        lambda: indexer.forward(
+            qi,
+            ki,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_k,
+            max_seqlen_q=fragment_q,
+            max_seqlen_kv=total_k,
+            fragment_indices=fragments,
+            lse_temperature=temperature,
+            deterministic=True,
+        ),
+    )
+    assert bool(torch.isfinite(indexer_lse).all().item())
+
+    def rebuild_and_backward():
+        # Do not canonicalize CSR in Python: prepare owns shared-fragment order.
+        metadata = attention.prepare(
+            topk,
+            cu_q,
+            cu_k,
+            total_k=total_k,
+            total_rows=total_rows,
+            max_seqlen_q=fragment_q,
+            max_seqlen_k=total_k,
+            fragment_indices=fragments,
+            deterministic=True,
+        )
+        _, _, teacher_lse = attention.forward(
+            q,
+            k,
+            v,
+            metadata,
+            return_softmax_lse=True,
+            return_temperature_lse=True,
+            lse_temperature_scale=temperature,
+        )
+        dqi, dki = kl.backward(
+            q,
+            k,
+            teacher_lse,
+            qi,
+            ki,
+            indexer_lse,
+            metadata,
+            softmax_scale=HEAD_DIM**-0.5 / temperature,
+            indexer_softmax_scale=HEAD_DIM**-0.5 / temperature,
+            loss_coeff=0.01,
+            deterministic=True,
+        )
+        return teacher_lse, dqi, dki
+
+    baseline = launch_and_sync("kl-rebuild-pipeline", rebuild_and_backward)
+    expected = tuple(tensor.clone() for tensor in baseline)
+    for tensor in expected:
+        assert bool(torch.isfinite(tensor).all().item())
+    for grad in expected[1:]:
+        assert grad.dtype == torch.bfloat16
+        assert bool(torch.count_nonzero(grad).item())
+
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = rebuild_and_backward()
+
+    for _ in range(6):
+        if use_cuda_graph:
+            launch_and_sync("kl-rebuild-graph-replay", graph.replay)
+            actual = captured
+        else:
+            actual = launch_and_sync("kl-rebuild-pipeline", rebuild_and_backward)
+        for reference, repeated in zip(expected, actual):
+            assert bool(torch.isfinite(repeated).all().item())
+            assert torch.equal(reference.view(torch.uint8), repeated.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    "prepare_deterministic", (None, False), ids=("default", "false")
+)
+def test_kl_shared_fragment_deterministic_requires_prepare_opt_in(
+    prepare_deterministic: bool | None,
+) -> None:
+    torch.manual_seed(109)
+    if prepare_deterministic is None:
+        metadata = make_shared_fragment_metadata()
+    else:
+        metadata = make_shared_fragment_metadata(deterministic=prepare_deterministic)
+    assert metadata.deterministic is False
+    q = (torch.randn(64, Q_HEADS, HEAD_DIM, device="cuda") * 0.2).to(torch.bfloat16)
+    k = (torch.randn(256, KV_HEADS, HEAD_DIM, device="cuda") * 0.2).to(torch.bfloat16)
+    qi = (torch.randn(64, INDEX_HEADS, HEAD_DIM, device="cuda") * 0.2).to(
+        torch.bfloat16
+    )
+    ki = (torch.randn(256, 1, HEAD_DIM, device="cuda") * 0.2).to(torch.bfloat16)
+    teacher_lse, indexer_lse, dqi_ref, dki_ref = kl_shared_fragment_reference(
+        q, k, qi, ki, metadata
+    )
+    with pytest.raises(ValueError):
+        kl.backward(
+            q, k, teacher_lse, qi, ki, indexer_lse, metadata, deterministic=True
+        )
+
+    dqi, dki = kl.backward(
+        q, k, teacher_lse, qi, ki, indexer_lse, metadata, deterministic=False
+    )
+    torch.testing.assert_close(dqi, dqi_ref, atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(dki, dki_ref, atol=2e-3, rtol=1e-2)
+
+
 def test_kl_shared_fragment_backward_matches_fp32_reference() -> None:
     torch.manual_seed(109)
-    metadata = make_shared_fragment_metadata()
+    metadata = make_shared_fragment_metadata(deterministic=True)
+    assert metadata.deterministic is True
     q = (torch.randn(64, Q_HEADS, HEAD_DIM, device="cuda") * 0.2).to(torch.bfloat16)
     k = (torch.randn(256, KV_HEADS, HEAD_DIM, device="cuda") * 0.2).to(torch.bfloat16)
     qi = (torch.randn(64, INDEX_HEADS, HEAD_DIM, device="cuda") * 0.2).to(

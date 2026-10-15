@@ -31,6 +31,7 @@ class AttentionMetadata:
     total_rows: int
     max_seqlen_q: int
     max_seqlen_k: int
+    deterministic: bool = False
 
 
 def _validate_cu_seqlens(
@@ -73,6 +74,7 @@ def prepare(
     max_seqlen_k: int,
     fragment_indices: torch.Tensor | None = None,
     prepare_kl_schedule: bool = True,
+    deterministic: bool = False,
 ) -> AttentionMetadata:
     """Build layer-specific CSR and schedules from the current TopK indices.
 
@@ -82,7 +84,13 @@ def prepare(
     The returned metadata belongs to this TopK result and may be shared by its
     corresponding forward, attention backward, and KL backward. A new TopK
     result requires a new call, including during CUDA Graph replay.
+
+    ``deterministic=True`` fixes the shared-K physical KL row order. Use it
+    together with deterministic KL backward; the default retains atomic
+    fragment reservations and does not launch the ordered-offset pass.
     """
+    if type(deterministic) is not bool:
+        raise TypeError("deterministic must be a Python bool")
     if topk_indices.dtype != torch.int32:
         raise TypeError("topk_indices must be torch.int32")
     if not topk_indices.is_cuda:
@@ -123,6 +131,7 @@ def prepare(
         qhead_per_kv=_QHEAD_PER_KV,
         fragment_indices=fragment_indices,
         prepare_kl_schedule=bool(prepare_kl_schedule),
+        deterministic=deterministic,
     )
     return AttentionMetadata(
         topk_indices=topk_indices,
@@ -137,6 +146,7 @@ def prepare(
         total_rows=total_rows,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
+        deterministic=deterministic,
     )
 
 

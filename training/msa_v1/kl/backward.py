@@ -27,7 +27,8 @@ def backward(
     """Run the fused true-varlen MSA v1 sparse KL backward kernel.
 
     Set ``deterministic=True`` to order cross-CTA dQI and dKI FP32
-    accumulation with writer-rank semaphores.
+    accumulation with writer-rank semaphores. Shared-K fragment metadata must
+    also be built with ``attention.prepare(..., deterministic=True)``.
     """
 
     return sparse_kl_bwd_cute(

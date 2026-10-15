@@ -598,6 +598,15 @@ def sparse_kl_bwd_cute(
 
     if type(deterministic) is not bool:
         raise TypeError("deterministic must be a Python bool")
+    if (
+        deterministic
+        and metadata.fragment_indices is not None
+        and not metadata.deterministic
+    ):
+        raise ValueError(
+            "shared-K deterministic KL backward requires "
+            "attention.prepare(..., deterministic=True)"
+        )
     kl_schedule = metadata.kl_schedule
     if (
         not kl_schedule.enabled

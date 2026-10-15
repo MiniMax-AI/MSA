@@ -149,6 +149,42 @@ forward, Attention backward, and KL backward. Run `prepare()` again after TopK
 changes. If TopK changes between CUDA Graph replays, capture `prepare()` so each
 replay rebuilds the metadata.
 
+`attention.prepare(..., deterministic=False)` is the default: it retains the
+original atomic reservation path for physical KL CSR rows and launches no extra
+ordered fragment-offset kernel. Shared-K fragment order may vary; mathematical
+semantics are unchanged.
+
+For deterministic shared-K KL backward, opt in at **both** preparation and
+backward. `attention.prepare(..., deterministic=True)` orders each physical KL
+CSR row by ascending global Q index, including shared-K fragment groups; use its
+metadata with `kl.backward(..., deterministic=True)`. With identical inputs and
+execution environment, this pair provides bitwise-identical dQI and dKI across
+fresh metadata rebuilds and CUDA Graph replays, not just reuse of one metadata
+instance. No caller-side CSR canonicalization or Python sorting is needed.
+`AttentionMetadata.deterministic` records the preparation mode. If shared-K
+metadata (`fragment_indices is not None`) was prepared with the default False,
+deterministic KL backward raises `ValueError` directing the caller to rebuild it
+with `attention.prepare(..., deterministic=True)`. Nonfragment deterministic KL
+backward does not require this preparation opt-in.
+
+For example, using the current TopK, sequence/fragment metadata, and Attention LSE:
+
+```python
+metadata = attention.prepare(
+    topk_indices, cu_seqlens_q, cu_seqlens_k,
+    total_k=k.shape[0], total_rows=total_rows,
+    max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+    fragment_indices=fragment_indices, deterministic=True,
+)
+out, lse = attention.forward(q, k, v, metadata, return_softmax_lse=True)
+dqi, dki = kl.backward(
+    q, k, lse, qi, ki, indexer_lse, metadata, deterministic=True,
+)
+```
+
+Both modes support SM100/B200 and SM103/B300. Neither mode changes the indexer's
+TopK order or its local-block-last contract.
+
 MSA v1 Attention E4M3 probability paths, including `sparse_attn_p_mode="fp8"` QAT,
 use `E4M3(P * 448)` with compensation in normalization and backward probability
 reconstruction. LSE retains the natural-log semantics of the original logits, and

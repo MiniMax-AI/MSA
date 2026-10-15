@@ -46,6 +46,7 @@ def _get_compiled_pipeline(
     *,
     reorder_schedule: bool,
     prepare_kl_schedule: bool,
+    deterministic: bool,
 ) -> object:
     device = tensors[0].device
     has_fragment_indices = tensors[3] is not None
@@ -55,6 +56,7 @@ def _get_compiled_pipeline(
         reorder_schedule,
         prepare_kl_schedule,
         has_fragment_indices,
+        deterministic,
     )
     if key not in _COMPILE_CACHE:
         _COMPILE_CACHE[key] = compile_or_load(
@@ -65,6 +67,7 @@ def _get_compiled_pipeline(
                 *(cutlass.Int32(value) for value in scalar_args),
                 reorder_schedule,
                 prepare_kl_schedule,
+                deterministic,
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                 options="--enable-tvm-ffi",
             ),
@@ -90,12 +93,15 @@ class SparseK2qCsrBuilderSm100:
         qhead_per_kv: int = _QHEAD_PER_KV,
         fragment_indices: torch.Tensor | None = None,
         prepare_kl_schedule: bool = True,
+        deterministic: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         SparseAttentionSchedule,
         SparseAttentionSchedule,
     ]:
+        if type(deterministic) is not bool:
+            raise TypeError("deterministic must be a Python bool")
         self._validate_inputs(
             q2k_indices,
             cu_seqlens_q,
@@ -326,6 +332,7 @@ class SparseK2qCsrBuilderSm100:
             scalar_args,
             reorder_schedule=reorder_schedule,
             prepare_kl_schedule=prepare_kl_schedule,
+            deterministic=deterministic,
         )
         with torch.cuda.nvtx.range("SparseK2qCsr_Pipeline"):
             compiled(*tensors, *scalar_args)

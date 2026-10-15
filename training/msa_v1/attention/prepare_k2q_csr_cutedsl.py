@@ -160,6 +160,7 @@ class SparseK2qCsrPipelineSm100:
         kl_work_capacity: Int32,
         reorder_schedule: cutlass.Constexpr[bool],
         prepare_kl_schedule: cutlass.Constexpr[bool],
+        deterministic: cutlass.Constexpr[bool],
         stream: cuda.CUstream = None,
     ):
         num_q_idx = Int32(_HEAD_KV * _TOPK) * total_q
@@ -247,6 +248,7 @@ class SparseK2qCsrPipelineSm100:
             work_capacity,
             padded_kv_blocks,
             prepare_kl_schedule,
+            deterministic,
         ).launch(
             grid=(_HEAD_KV, 1, 1),
             block=(_PREFIX_THREADS, 1, 1),
@@ -254,6 +256,22 @@ class SparseK2qCsrPipelineSm100:
             stream=stream,
         )
         if const_expr(prepare_kl_schedule):
+            if const_expr(deterministic and mFragmentIndices is not None):
+                self.kl_fragment_offsets_kernel(
+                    mRowCounts,
+                    mCuSeqlensK,
+                    mFragmentIndices,
+                    batch,
+                    max_kv_blocks,
+                ).launch(
+                    grid=(
+                        cute.ceil_div(max_kv_blocks, _KL_SCHEDULE_THREADS),
+                        _HEAD_KV,
+                        batch,
+                    ),
+                    block=(_KL_SCHEDULE_THREADS, 1, 1),
+                    stream=stream,
+                )
             self.kl_physical_prefix_kernel(
                 mKlPhysicalRowCounts,
                 mKlPhysicalRowPtr,
@@ -581,6 +599,7 @@ class SparseK2qCsrPipelineSm100:
         work_capacity: Int32,
         padded_kv_blocks: Int32,
         prepare_kl_schedule: cutlass.Constexpr[bool],
+        deterministic: cutlass.Constexpr[bool],
     ):
         head_idx = cute.arch.block_idx()[0]
         tidx = cute.arch.thread_idx()[0]
@@ -649,11 +668,15 @@ class SparseK2qCsrPipelineSm100:
                         sem="relaxed",
                         scope="gpu",
                     )
-                    # Row counts are dead after this prefix pass. Reuse their
-                    # storage for the row-local offset in the physical CSR row.
-                    mRowCounts[head_idx, batch_idx, kv_block_idx] = (
-                        logical_physical_offset
-                    )
+                    if const_expr(not deterministic):
+                        # Preserve the original atomic fragment reservation path.
+                        mRowCounts[head_idx, batch_idx, kv_block_idx] = (
+                            logical_physical_offset
+                        )
+                    elif const_expr(mFragmentIndices is None):
+                        mRowCounts[head_idx, batch_idx, kv_block_idx] = Int32(0)
+                    # Deterministic shared-K offsets use the original counts in
+                    # a separate pass after all histogram counts have been read.
                     cute.arch.atomic_cas(
                         (
                             mKlPhysicalKOffsets.iterator
@@ -712,6 +735,34 @@ class SparseK2qCsrPipelineSm100:
                         mSchedulerMetadata[work_idx, Int32(5)] = kv_block_idx
                     chunk_idx += Int32(1)
             row_idx += Int32(1)
+
+    @cute.kernel
+    def kl_fragment_offsets_kernel(
+        self,
+        mLogicalRowCounts: cute.Tensor,
+        mCuSeqlensK: cute.Tensor,
+        mFragmentIndices: cute.Tensor,
+        batch: Int32,
+        max_kv_blocks: Int32,
+    ):
+        block_idx, head_idx, group_start = cute.arch.block_idx()
+        kv_block = block_idx * Int32(_KL_SCHEDULE_THREADS) + cute.arch.thread_idx()[0]
+        if kv_block < max_kv_blocks and mFragmentIndices[group_start] == group_start:
+            # One thread owns a physical K block across the entire shared-K
+            # group. Reuse dead logical histogram storage for exclusive offsets;
+            # never let atomic arrival order choose the KL GEMM's Q grouping.
+            group_end = group_start + Int32(1)
+            while group_end < batch and mFragmentIndices[group_end] == group_start:
+                group_end += Int32(1)
+            offset = Int32(0)
+            fragment_idx = group_start
+            while fragment_idx < group_end:
+                k_len = mCuSeqlensK[fragment_idx + Int32(1)] - mCuSeqlensK[group_start]
+                if kv_block * Int32(_BLOCK_K) < k_len:
+                    count = mLogicalRowCounts[head_idx, fragment_idx, kv_block]
+                    mLogicalRowCounts[head_idx, fragment_idx, kv_block] = offset
+                    offset += count
+                fragment_idx += Int32(1)
 
     @cute.kernel
     def kl_physical_prefix_kernel(
