@@ -50,6 +50,8 @@ workspace、FLOPs 和 shape 相关的审计指标。
 - `static_all`：全部 10,562 case 的 schema、长度、FLOPs、唯一性和 selection 引用检查。
 - `msa_v1_smoke`：32 个确定性真实 case，用于 MSA v1 快速正确性检查。
 - `msa_v1_full`：512 个真实 case，用于 MSA v1 全量输出数值正确性检查。
+- `smoke`：原有 96 个确定性真实 case，供 既有路径使用。
+- `full`：原有 1,024 个真实 case，供 既有路径使用。
 - `gemm_topk_e2e`：1,024 个 Indexer 端到端 case。
 - `cuda_graph`：16 个覆盖不同 batch、workspace 和调度不均衡程度的 case。
 - `exhaustive`：全部 10,562 case 的 GPU 结构执行层。
@@ -108,13 +110,15 @@ rotation 建立超过 2 倍 L2 的 reuse distance；5 次 warmup、20 次 replay
 
 ```bash
 python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
-  --suite full --out /path/to/baseline.json
+  --suite full --num-index-heads 1 --out /path/to/baseline.json
 
 python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
-  --suite full --baseline /path/to/baseline.json --out /path/to/candidate.json
+  --suite full --num-index-heads 4 --verify \
+  --baseline /path/to/baseline.json --out /path/to/candidate.json
 ```
 
 `smoke` 用于快速检查；`full` 使用完整的 128-case benchmark selection。
+
 
 Q8KV8 prefill indexer 的 `--num-index-heads` 支持 1/2/4，输出为 `[H, total_q, 16]`。
 有效 FLOPs 为上述单 head 计数乘 H；生产加权吞吐为加权 FLOPs 总和除以加权 E2E

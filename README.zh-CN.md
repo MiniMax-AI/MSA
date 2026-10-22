@@ -53,6 +53,17 @@ CUDA Graph 契约见[推理算子文档](inference/msa_v1/README.zh-CN.md)及其
 所有 varlen 接口都使用真实长度 metadata；TopK 的有效项保持离散无序语义，
 最后一个有效 block 为 local block。
 
+### 1.4 High-TPS 与 draft
+
+| 功能 | 入口 | 支持范围 |
+| --- | --- | --- |
+| TP4 MegaAttention 与 MegaMoE | [high_tps](inference/high_tps/msa_v1/README.zh-CN.md) | MegaAttention Q=1–8；MegaMoE Q=8；单节点 TP4 |
+| DSpark draft backbone | [draft](inference/high_tps/msa_v1/draft/README.zh-CN.md) | TP4、单请求 7 行，embedding + 5 层 decoder + final norm；不含 draft head |
+| 可选 SGLang 插件 | [sglang-msa-mono](integrations/sglang/README.zh-CN.md) | TP4、单请求 Q8 验证；固定外部依赖暂不可公开获取 |
+
+high_tps 与 draft 当前面向 SM100/SM103；各路径的运行验证范围见对应文档。
+draft 的已有运行验证覆盖 SM103，SM100 仅做编译验证；本目录不支持 SM107。
+
 ## 2. 系统要求与安装
 
 | GPU | Architecture | 状态 |
@@ -114,7 +125,7 @@ FlashInfer 源码或 cubin；使用 `python -m pip install -e '.[flashinfer]'` �
 均支持 B200/B300 上的 GQA=8/16 和 BF16 输出，按实际 `Hq/Hkv` 选择实现。
 Q8KV4 decode 另保留 SM107 的 GQA=16 支持，需要 CUDA Toolkit 13.5 或更新版本。
 
-Rubin（SM107）保留 BF16/Q8KV8 prefill attention 和 Q8KV4 decode attention 路径，
+Rubin（SM107）保留 BF16/Q8KV8 prefill attention、Q8KV8 prefill indexer 和 Q8KV4 decode attention 路径，
 通过输入 tensor 所在设备自动选择；具体依赖和限制见各算子 README。其余算子不据此声明 Rubin 支持。
 
 ## 3. 主要接口

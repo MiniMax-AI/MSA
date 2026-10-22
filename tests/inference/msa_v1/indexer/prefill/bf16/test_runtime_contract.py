@@ -58,6 +58,45 @@ def _check(case, inputs, scores, out):
         assert_full_topk_quality(expected, lengths, out[head])
 
 
+@pytest.mark.parametrize("heads", (1, 4))
+@pytest.mark.parametrize("final_length", (1048576, 1048584, 2097152))
+def test_long_context(heads, final_length):
+    case = _case(
+        "long_context",
+        (8, 3, 17),
+        (final_length - 8, 126, final_length // 2 - 17),
+    )
+    inputs = make_real_prefill_inputs(
+        case, num_index_heads=heads, device=torch.device("cuda")
+    )
+    wrapper = BatchPrefillIndexerWithPagedKVCacheWrapper()
+    wrapper.plan(
+        inputs.cu_seqlens_q,
+        inputs.cu_seqlens_k,
+        inputs.page_table,
+        total_q=case.total_q,
+        max_seqlen_q=case.max_query_len,
+        max_seqlen_k=case.max_final_kv,
+        num_index_heads=heads,
+    )
+    state = wrapper._plan_state
+    _compile_gemm(
+        inputs.q.view(-1, 128), inputs.k_cache[:, 0].permute(1, 2, 0), state
+    )
+    load_extension()
+    baseline = None
+    for _ in range(3):
+        state.proxy_scores.fill_(float("nan"))
+        output = run_cuda(
+            "long-context BF16 prefill", partial(wrapper.run, inputs.q, inputs.k_cache)
+        )
+        if baseline is None:
+            _check(case, inputs, state.proxy_scores, output)
+            baseline = output.clone()
+        else:
+            assert torch.equal(baseline, output)
+
+
 @pytest.mark.parametrize("heads", (1, 2, 4))
 @pytest.mark.parametrize(
     "layout", (*CACHE_LAYOUTS, "singleton_zero", "singleton_unaligned")

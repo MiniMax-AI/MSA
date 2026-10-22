@@ -180,7 +180,7 @@ plan:
 
 run:
     q
-    packed k_cache / v_cache
+    k_cache (BF16; Q8KV4 packed; Q8KV8 E4M3) / v_cache
     k_scale / v_scale
     out / lse
 ```
@@ -245,13 +245,14 @@ local_block = query_position // 128
 ## 多 Head Decode Indexer 契约
 
 `plan()` 的 keyword-only `num_index_heads=1` 仅接受 H=1/2/4；Q 为
-`[B, Q, H, 128]` contiguous E4M3，各 head 独立计算并共享 K cache。
+`[B, Q, H, 128]` contiguous tensor；BF16 路径使用 BF16，量化路径使用 E4M3。
+各 head 独立计算并共享 K cache。
 `query_length` 是 keyword-only 参数，支持 Q=1..16 的任意整数，同一 batch 内 Q 相同。
 Q 可以为编译期量；若 Q/H 改变 MMA tile shape 或其他实际 codegen 配置，允许相应静态特化。
 不改变 codegen 的维度保持 runtime；固定静态配置时，batch、KV 长度和 metadata 变化应复用
 编译产物。不得为构造 compile key 读取设备 tensor 内容。
 
-`inference/msa_v1/indexer/decode/q8kv4` 和 `q8kv8` 采用以下公开 wrapper 契约：
+`inference/msa_v1/indexer/decode/bf16`、`q8kv4` 和 `q8kv8` 采用以下公开 wrapper 契约：
 
 ```text
 plan:
@@ -261,7 +262,7 @@ plan:
 
 run:
     q
-    k_cache (Q8KV4 packed; Q8KV8 E4M3)
+    k_cache (BF16; Q8KV4 packed; Q8KV8 E4M3)
     k_scale (Q8KV4 only)
     out: [H, B * Q, 16] contiguous int32
     -> forced-tail TopK logical page indices
@@ -294,7 +295,7 @@ local_block = query_position // 128
   创建匹配的新 plan，并重新 capture 使用旧绑定的 Graph。
   `update()` 在当前 stream 执行且允许 capture；构造和绑定必须在 capture 外。
   跨 stream 消费及再次更新需由调用方用 event 排序，不允许跨 step 复用旧 metadata。
-- Q8KV4 与 Q8KV8 的公开入口均为 `BatchDecodeIndexerWithPagedKVCacheWrapper`；Q8KV8 的
+- BF16、Q8KV4 与 Q8KV8 的公开入口均为 `BatchDecodeIndexerWithPagedKVCacheWrapper`；BF16/Q8KV8 的
   `run()` 不接收 `k_scale`。公开 wrapper 内部顺序执行 proxy score 与 forced-tail TopK，
   不公开 score-only wrapper、模块级 `forward()` 或 GEMM wrapper 名称。
 - 代理分数仅是内部中间量；性能分析可以单独计量私有 proxy-score stage，并按实际瓶颈评估
@@ -303,7 +304,7 @@ local_block = query_position // 128
 
 ## 内部 Indexer TopK Select 契约
 
-`inference/msa_v1/indexer/_common/topk_select` 是 Q8KV4、Q8KV8 和不同本地 index head 数共用的
+`inference/msa_v1/indexer/_common/topk_select` 是 BF16、Q8KV4、Q8KV8 和不同本地 index head 数共用的
 私有 stateless per-row stage，不是 production 公开入口：
 
 ```text

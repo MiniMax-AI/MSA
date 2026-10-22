@@ -1,4 +1,4 @@
-"""Sanitized CP metadata shared by MSA v1 tests and benchmarks."""
+"""Sanitized CP metadata shared by sparse attention packages tests and benchmarks."""
 
 from __future__ import annotations
 
@@ -30,9 +30,10 @@ class SparseSpec:
     block_size: int
     topk_capacity: int
     index_heads: int
+    returns_topk_length: bool
 
 
-MSA_V1_SPEC = SparseSpec("msa_v1", 128, 16, 4)
+MSA_V1_SPEC = SparseSpec("msa_v1", 128, 16, 4, False)
 
 
 @dataclass(frozen=True)
@@ -243,16 +244,14 @@ def _parse_cu_seqlens(value: object, *, context: str) -> tuple[int, ...]:
 
 
 def _parse_real_case(value: object, line_number: int) -> GlobalCpCase:
-    if not isinstance(value, dict) or set(value) != {
-        "case_id",
-        "cu_seqlens",
-        "metrics",
-    }:
+    if not isinstance(value, dict) or set(value) != {"case_id", "cu_seqlens", "metrics"}:
         raise ValueError(f"manifest line {line_number}: unexpected fields")
     case_id = value["case_id"]
     if isinstance(case_id, bool) or not isinstance(case_id, int):
         raise ValueError(f"manifest line {line_number}: case_id must be an integer")
-    cu_seqlens = _parse_cu_seqlens(value["cu_seqlens"], context=f"case_id={case_id}")
+    cu_seqlens = _parse_cu_seqlens(
+        value["cu_seqlens"], context=f"case_id={case_id}"
+    )
     metrics = value["metrics"]
     expected = _shape_metrics(cu_seqlens)
     if not isinstance(metrics, dict) or metrics != expected:
@@ -342,7 +341,9 @@ def _chunk_causal_area(
     chunk_begin = chunk_id * chunk_size
     chunk_end = chunk_begin + chunk_size
     area = 0
-    for document_begin, document_end in zip(global_cu_seqlens, global_cu_seqlens[1:]):
+    for document_begin, document_end in zip(
+        global_cu_seqlens, global_cu_seqlens[1:]
+    ):
         q_begin = max(chunk_begin, document_begin)
         q_end = min(chunk_end, document_end)
         if q_begin >= q_end:
@@ -674,7 +675,11 @@ def _capped_sparse_prefix(
     padding = _padding_prefix(token_count, block_size) - _padding_prefix(
         capacity_tokens, block_size
     )
-    return area + (token_count - capacity_tokens) * capacity_tokens - padding
+    return (
+        area
+        + (token_count - capacity_tokens) * capacity_tokens
+        - padding
+    )
 
 
 def _fragment_sparse_causal_area(
@@ -738,6 +743,13 @@ def make_torch_topk(case: CpRankCase, *, device: object = "cuda"):
         dtype=torch.int32,
         device=device,
     )
+    topk_length = (
+        torch.zeros(
+            (spec.index_heads, case.total_q), dtype=torch.int32, device=device
+        )
+        if spec.returns_topk_length
+        else None
+    )
     slots = torch.arange(spec.topk_capacity, dtype=torch.int32, device=device)
     for fragment_id, fragment in enumerate(case.fragments):
         q_begin = case.cu_seqlens_q[fragment_id]
@@ -758,7 +770,11 @@ def make_torch_topk(case: CpRankCase, *, device: object = "cuda"):
         valid = slots[None, :] < selected[:, None]
         fragment_topk = torch.where(valid, indices, torch.full_like(indices, -1))
         topk[:, q_begin:q_end] = fragment_topk.unsqueeze(0)
-    return topk
+        if topk_length is not None:
+            topk_length[:, q_begin:q_end] = selected.unsqueeze(0)
+    if topk_length is None:
+        return topk
+    return topk, topk_length
 
 
 def pack_source_tensor(tensor: object, ranges: Sequence[TokenRange]):

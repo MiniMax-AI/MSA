@@ -7,7 +7,7 @@ import torch
 from inference.msa_v1.indexer._common.topk_select.build import load_extension
 
 _TOP_K = 16
-_MAXIMUM_COLUMNS = 8192
+MAXIMUM_COLUMNS = 16384
 
 
 def _is_capturing(device: torch.device) -> bool:
@@ -28,8 +28,8 @@ def _check_inputs(
         raise ValueError("scores must have dtype torch.float32")
     if scores.ndim != 2 or scores.shape[0] <= 0:
         raise ValueError("scores must have shape [num_rows, max_cols]")
-    if not 0 < scores.shape[1] <= _MAXIMUM_COLUMNS:
-        raise ValueError(f"max_cols must be in [1, {_MAXIMUM_COLUMNS}]")
+    if not 0 < scores.shape[1] <= MAXIMUM_COLUMNS:
+        raise ValueError(f"max_cols must be in [1, {MAXIMUM_COLUMNS}]")
     if scores.stride(1) != 1:
         raise ValueError("scores must have stride(1) == 1")
     if scores.stride(0) < scores.shape[1]:

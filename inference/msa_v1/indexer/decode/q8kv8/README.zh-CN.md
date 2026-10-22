@@ -62,6 +62,10 @@ plan 与 wrapper 必须在相关 Graph 的生命周期内保持存活。Graph �
 
 ## 数据契约
 
+每个请求的总 KV 长度最多为 2,097,152 tokens（16384 页，每页 128 tokens），
+包含当前 query chunk。支持 batch 内请求长度不同；每个 query 按自己的有效页数选择，
+并始终保留其 local page。
+
 - `q`：`[B, Q, H, 128]`，E4M3。
 - `paged_k_cache`：`[physical_pages, 128, 128]`，E4M3。
 - `page_table`：`[B, max_pages]`，CUDA `torch.int32` logical-to-physical page mapping。
@@ -103,7 +107,7 @@ python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark --suite low
 python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark --suite low-latency --num-index-heads 1 --verify --baseline low_latency.json --out candidate.json
 ```
 
-`--query-length` 可指定 Q=1–16；不同 Q 的结果分别报告。
+`--query-length` 可独立指定 Q=1–16；Q=1/4/8/16 应分别报告，不混合生产权重。
 共享 plan 的测试与分阶段计时：
 
 ```bash

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-msa-mono"
+version = "0.1.0"
+description = "SGLang monokernel plugin: MSA-v1 MegaAttention + token-parallel MoE verify for MiniMax-M3.1 TP4"
+readme = "README.md"
+requires-python = ">=3.10"
+# SGLang and torch come from the serving image; the kernels from this repository.
+dependencies = ["minimax-msa"]
+
+# SGLang loads the package as a general plugin, which registers its specs.
+[project.entry-points."sglang.srt.plugins"]
+msa = "sglang_msa_mono:register_specs"
+
+[tool.setuptools.packages.find]
+include = ["sglang_msa_mono*"]

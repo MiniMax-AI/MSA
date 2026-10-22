@@ -66,6 +66,10 @@ Rebinding and allocation are not supported inside capture.
 
 ## Data contract
 
+The maximum total KV length per request is 2,097,152 tokens (16384 pages of 128 tokens),
+including the current query chunk. Mixed request lengths are supported; selection uses each
+query's valid page count and always includes its local page.
+
 - `q`: `[B, Q, H, 128]`, E4M3.
 - `paged_k_cache`: `[physical_pages, 128, 128]`, E4M3.
 - `page_table`: `[B, max_pages]`, a CUDA `torch.int32` logical-to-physical page mapping.
@@ -108,7 +112,7 @@ python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark --suite low
 python -m benchmarks.inference.msa_v1.indexer.decode.q8kv8.benchmark --suite low-latency --num-index-heads 1 --verify --baseline low_latency.json --out candidate.json
 ```
 
-Use `--query-length` to select Q=1–16. Results for different Q values are reported separately.
+Use `--query-length` to select Q=1–16 independently. Report Q=1/4/8/16 separately without mixing production weights.
 Shared-plan tests and separate timing scopes:
 
 ```bash

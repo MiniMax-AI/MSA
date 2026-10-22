@@ -5,12 +5,14 @@ from __future__ import annotations
 import torch
 
 from inference.msa_v1.indexer._common.topk_select import _topk_select
+from inference.msa_v1.indexer._common.topk_select.interface import (
+    MAXIMUM_COLUMNS as _MAXIMUM_PAGES,
+)
 from inference.msa_v1.indexer.decode.plan import BatchDecodeIndexerPlan
 from inference.msa_v1.indexer.decode.q8kv4.jit import load_extension
 
 _PAGE_SIZE = 128
 _TOP_K = 16
-_MAXIMUM_PAGES = 8192
 
 
 def _check_workspace_buffer(workspace_buffer: torch.Tensor) -> None:

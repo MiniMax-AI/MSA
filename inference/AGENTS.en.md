@@ -47,12 +47,13 @@ Public `run()` accepts preallocated output and auxiliary tensors. Allocation is
 allowed as a convenience path only outside CUDA Graph capture. Plan/workspace
 ownership must not create hidden allocation or synchronization inside `run()`.
 Compile/cache keys contain only stable code-generation properties; request
-sizes and tensor values stay runtime data.
+sizes and tensor values stay runtime data, except for decode Q when it changes
+code generation as described below.
 
 ## MSA v1 acceptance contract
 
 The following correctness and benchmark rules apply to `inference/msa_v1/`.
-They do not replace the training suites.
+They do not silently replace other established model or training suites.
 
 Interface maintenance or file/directory reorganization that preserves kernel
 computation and public data contracts requires only smoke tests for affected
@@ -171,14 +172,14 @@ K scales, and V scales in GMEM.
 
 ## Decode indexer
 
-Q8KV4 and Q8KV8 expose `BatchDecodeIndexerWithPagedKVCacheWrapper`. Planning
+BF16, Q8KV4, and Q8KV8 expose `BatchDecodeIndexerWithPagedKVCacheWrapper`. Planning
 owns the page table, `seq_lens`, scheduler state, and workspace. `run()` owns
 the public proxy-score plus forced-tail TopK path and accepts preallocated
 output for graph capture. Proxy scores are a private intermediate: they may be
 profiled separately for MBU/MFU diagnosis but are not a public performance
 metric.
 
-The public packages are `inference.msa_v1.indexer.decode.q8kv4` and `q8kv8`.
+The public packages are `inference.msa_v1.indexer.decode.bf16`, `q8kv4`, and `q8kv8`.
 The keyword-only `plan()` argument `num_index_heads=1` accepts H=1/2/4.
 The keyword-only `query_length` accepts any integer Q=1..16, shared by all
 requests in the batch. Q may be compile-time: Q/H specialization is allowed when
@@ -195,13 +196,13 @@ With a shared plan, call `update()` after in-place length changes; bound page ta
 updated in place before consumers run. Rebind outside capture when metadata addresses or
 shapes change. Create a matching new plan when B, Q, H, or page capacity changes, and
 recapture Graphs that used the previous bindings.
-The internal TopK stage serves both precisions and all supported local index head counts;
+The internal TopK stage serves all three precisions and all supported local index head counts;
 it does not accept a head-count parameter.
-Q is contiguous E4M3 with shape `[B, Q, H, 128]`; heads compute independently
+Q is contiguous BF16 for the BF16 path and E4M3 for the quantized paths, with shape `[B, Q, H, 128]`; heads compute independently
 and share the K cache. The public result has shape `[H, B * Q, 16]`, dtype
 `int32`, and is contiguous. Valid entries form a prefix; the final valid output
 is the local block and any suffix is `-1`. TopK ordering is score-descending
-apart from the forced local tail contract. Q8KV8 does not expose an unused
+apart from the forced local tail contract. BF16 and Q8KV8 do not expose an unused
 `k_scale` argument. Avoid public aliases, legacy tuples, or historical modes
 that have no production caller and no formal test.
 

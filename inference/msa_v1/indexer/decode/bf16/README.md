@@ -39,6 +39,10 @@ concurrent calls.
 
 ## Data contract
 
+The maximum total KV length per request is 2,097,152 tokens (16384 pages of 128 tokens),
+including the current query chunk. Mixed request lengths are supported; selection uses each
+query's valid page count and always includes its local page.
+
 | Argument | Shape | Dtype |
 | --- | --- | --- |
 | `q` | `[B,Q,H,128]` | `torch.bfloat16` |
@@ -47,7 +51,7 @@ concurrent calls.
 | `seq_lens` | `[B]` | `torch.int32` |
 | `out` | `[H,B*Q,16]` | `torch.int32` |
 
-`plan()` defaults to `num_index_heads=1` and `query_length=8`; page-table capacity is 1–8192 pages.
+`plan()` defaults to `num_index_heads=1` and `query_length=8`; page-table capacity is 1–16384 pages.
 All tensors must reside on the same CUDA device. Q, metadata, and output must be contiguous. Q and K require 16-byte
 alignment. All requests share Q; lengths include the query chunk and satisfy
 `Q <= seq_lens[b] <= max_pages*128`.

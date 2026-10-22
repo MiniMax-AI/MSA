@@ -184,7 +184,9 @@ def _parse_case(value: object) -> InferencePrefillCase:
         query_len * (prefix_len // 128)
         + 128 * (query_len // 128) * ((query_len // 128) - 1) // 2
         + (query_len // 128) * (query_len % 128)
-        for query_len, prefix_len in zip(case.query_lens, case.prefix_lens, strict=True)
+        for query_len, prefix_len in zip(
+            case.query_lens, case.prefix_lens, strict=True
+        )
     )
     if case.useful_flops != historical_page_rows * 2 * 128 * 128:
         raise ValueError(f"{case.case_id}: useful_flops is inconsistent")
@@ -263,11 +265,24 @@ def load_prefill_test_cases(
 @cache
 def load_prefill_benchmark_cases(
     batch_size: int | None = None,
+    *,
+    operator: str | None = None,
 ) -> tuple[InferencePrefillBenchmarkCase, ...]:
     """Load the fixed benchmark selection, optionally for one batch size."""
 
     payload = _load_selection(BENCHMARK_SELECTION_PATH)
-    entries = payload.get("cases")
+    selection = payload
+    if operator is not None:
+        operator_selections = payload.get("operator_selections")
+        if (
+            not isinstance(operator_selections, dict)
+            or operator not in operator_selections
+        ):
+            raise ValueError(f"unknown benchmark operator selection: {operator}")
+        selection = operator_selections[operator]
+        if not isinstance(selection, dict):
+            raise TypeError(f"invalid benchmark operator selection: {operator}")
+    entries = selection.get("cases")
     if not isinstance(entries, list):
         raise TypeError("benchmark selection must contain a cases array")
     case_map = load_prefill_case_map()
@@ -292,7 +307,11 @@ def load_prefill_benchmark_cases(
                 stratum=None if entry.get("stratum") is None else str(entry["stratum"]),
             )
         )
-    expected_count = int(payload["default_case_count"])
+    expected_count = int(
+        payload["default_case_count"]
+        if operator is None
+        else selection["case_count"]
+    )
     if len(result) != expected_count or len(
         {item.case.case_id for item in result}
     ) != len(result):
@@ -300,7 +319,11 @@ def load_prefill_benchmark_cases(
     represented = sum(
         item.representative_weight or 0 for item in result if item.is_representative
     )
-    expected_weight = int(payload["representative_strata"]["represented_calls"])
+    expected_weight = int(
+        payload["representative_strata"]["represented_calls"]
+        if operator is None
+        else selection["represented_calls"]
+    )
     if represented != expected_weight:
         raise ValueError("representative benchmark weights are inconsistent")
     if batch_size is None:
@@ -309,7 +332,9 @@ def load_prefill_benchmark_cases(
     if not filtered:
         raise ValueError(f"benchmark selection has no batch_size={batch_size} cases")
     represented = sum(
-        item.representative_weight or 0 for item in filtered if item.is_representative
+        item.representative_weight or 0
+        for item in filtered
+        if item.is_representative
     )
     expected_weight = sum(
         case.count for case in load_prefill_cases() if case.batch_size == batch_size

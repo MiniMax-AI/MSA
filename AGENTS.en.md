@@ -5,7 +5,7 @@ file is its English companion and must be updated with it.
 
 ## Paths and scope
 
-- This branch contains only MSA v1 training, inference, and required dependencies;
+- The public `nv_dev` branch contains only MSA v1 training, inference, and required dependencies;
   do not import other model implementations or development-repository history.
 - Repository paths in this document are relative to the repository root;
   Markdown links are relative to the containing document.
@@ -26,8 +26,7 @@ file is its English companion and must be updated with it.
 ## Git and worktrees
 
 - A feature means a new operator. New operators and performance optimization
-  start from the latest user-designated development baseline (`nv_dev` for
-  this branch) in an isolated worktree. Use
+  start from the latest user-designated development baseline in an isolated worktree. Use
   `feature/<name>` for a new operator and `perf/<name>` for optimization.
 - Small documentation, rule, configuration, or local maintenance changes do
   not require a worktree. Bug fixes stay in the requested worktree unless the
@@ -340,3 +339,8 @@ under the Git-ignored repository-root `agent/` directory:
 Do not track these artifacts. Local `design.md`, `optimization.md`, and
 `results.md` and optimization-process documents are also untracked. If already
 tracked, remove them from the index while keeping local copies and ignore them.
+
+## Existing Rubin path and optional SGLang integration
+
+- Preserve the existing SM107 FP16 softmax implementation and switches. This exception does not authorize additional low-precision arithmetic.
+- Keep `integrations/sglang` optional and document its currently inaccessible pinned dependency; do not promise publicly reproducible server deployment.

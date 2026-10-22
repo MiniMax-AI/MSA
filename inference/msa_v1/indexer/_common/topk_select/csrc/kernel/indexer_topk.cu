@@ -1,6 +1,6 @@
 #include "indexer_topk_kernel.hpp"
 
-// The M3 headers below are copied verbatim from PR #23 commit
+// The M3 headers below are adapted from PR #23 commit
 // 0dd596a32d458ed068464ea03ef2a992f5d197fb.
 #include "m3/m3_topk.cuh"
 

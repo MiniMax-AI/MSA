@@ -19,6 +19,7 @@ from inference.msa_v1._cache_layout import (
 )
 from inference.msa_v1.aot_cache import compile_or_load
 from inference.msa_v1.indexer._common.topk_select import _topk_select
+from inference.msa_v1.indexer._common.topk_select.interface import MAXIMUM_COLUMNS
 from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm import (
     PrefillIndexerGemmSm100,
 )
@@ -152,7 +153,7 @@ def _validate_plan_inputs(
     )
     if page_table.shape[1] < max_cols:
         raise ValueError("page_table capacity is smaller than max_seqlen_k")
-    if max_cols > 8192:
+    if max_cols > MAXIMUM_COLUMNS:
         raise ValueError("max_cols exceeds the internal TopK limit")
     return batch, max_cols
 

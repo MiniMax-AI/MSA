@@ -37,6 +37,10 @@ assert indices.shape == (2, 4, 16)
 
 ## 数据契约
 
+每个请求的总 KV 长度最多为 2,097,152 tokens（16384 页，每页 128 tokens），
+包含当前 query chunk。支持 batch 内请求长度不同；每个 query 按自己的有效页数选择，
+并始终保留其 local page。
+
 | 参数 | Shape | Dtype |
 | --- | --- | --- |
 | `q` | `[B,Q,H,128]` | `torch.bfloat16` |
@@ -45,7 +49,7 @@ assert indices.shape == (2, 4, 16)
 | `seq_lens` | `[B]` | `torch.int32` |
 | `out` | `[H,B*Q,16]` | `torch.int32` |
 
-`plan()` 默认 `num_index_heads=1`、`query_length=8`；page table 容量为 1–8192 页。
+`plan()` 默认 `num_index_heads=1`、`query_length=8`；page table 容量为 1–16384 页。
 所有 tensor 必须位于同一 CUDA device；Q、metadata 和输出必须 contiguous，Q/K 须 16-byte 对齐。
 所有请求共用 Q；长度包含当前 query chunk，满足 `Q <= seq_lens[b] <= max_pages*128`。
 

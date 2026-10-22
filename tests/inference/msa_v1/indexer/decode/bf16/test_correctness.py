@@ -95,3 +95,20 @@ def test_all_query_lengths(heads, query_length):
         query_length=query_length,
     )
     _check_inputs(values, heads, query_length)
+
+
+@pytest.mark.parametrize("final_length", (1048576, 1048584, 1048705, 2097152))
+def test_long_context(final_length):
+    lengths = torch.tensor(
+        [final_length, final_length // 2 + 1, 100001, 129], dtype=torch.int32
+    )
+    values = make_inputs(
+        4,
+        (final_length + 127) // 128,
+        lengths,
+        seed=1701,
+        device=torch.device("cuda"),
+        num_index_heads=1,
+        query_length=8,
+    )
+    _check_inputs(values, 1, 8)

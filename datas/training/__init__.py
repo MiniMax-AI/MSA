@@ -1,4 +1,4 @@
-"""Training workload manifests shared by MSA v1."""
+"""Training workload manifests shared by sparse attention packages."""
 
 from datas.training.cases import (
     DEFAULT_SCENARIO,

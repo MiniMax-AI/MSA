@@ -20,6 +20,9 @@ except ImportError:  # pragma: no cover
 
 from inference.msa_v1._cache_layout import check_cache_layout
 from inference.msa_v1.indexer._common.topk_select import _topk_select
+from inference.msa_v1.indexer._common.topk_select.interface import (
+    MAXIMUM_COLUMNS as _MAXIMUM_PAGES,
+)
 from inference.msa_v1.indexer.decode.indexer_gemm import DecodeIndexerGemmSm100
 from inference.msa_v1.indexer.decode.plan import BatchDecodeIndexerPlan
 
@@ -28,7 +31,6 @@ logger = logging.getLogger(__name__)
 _PAGE_SIZE = 128
 _HEAD_DIM = 128
 _TOP_K = 16
-_MAXIMUM_PAGES = 8192
 _COMPILE_CACHE: dict[tuple, object] = {}
 
 

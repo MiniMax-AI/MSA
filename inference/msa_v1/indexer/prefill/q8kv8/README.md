@@ -4,7 +4,7 @@
 
 ## Purpose
 
-True-varlen paged prefill indexer for SM100 and SM103. Q/K use E4M3, and the output contains
+True-varlen paged prefill indexer for SM100, SM103, and SM107. Q/K use E4M3, and the output contains
 selected logical page indices for every query, including the local page.
 
 ## Public API
@@ -32,6 +32,10 @@ the public `replan()` outside CUDA Graph capture.
 
 ## Data contract
 
+The maximum total KV length per request is 2,097,152 tokens (16384 pages of 128 tokens),
+including the current query chunk. Mixed request lengths are supported; selection uses each
+query's valid page count and always includes its local page.
+
 - `num_index_heads` defaults to 1 and accepts 1/2/4. Heads select TopK independently and share K cache.
 - Q and output must be contiguous CUDA tensors; K must reside on the same device.
 - H=1 also retains the output head dimension.
@@ -50,9 +54,12 @@ the public `replan()` outside CUDA Graph capture.
 - Historical pages may map to scattered and unordered physical pages.
 - Call `plan()` and `replan()` outside CUDA Graph capture and complete warmup before the first
   capture.
-- SM100 and SM103 are supported, and `nvidia-cutlass-dsl[cu13]>=4.5.2` is required.
-- Use the repository's CUTLASS submodule or set `CUTLASS_ROOT` to public CUTLASS headers.
-  Set this environment variable when using an installed wheel.
+- SM100 and SM103 require `nvidia-cutlass-dsl[cu13]>=4.5.2`. SM107 requires a compatible
+  CUDA toolkit and a CuTe DSL build exposing `cutlass.cute.nvgpu.tcgen05.SM107MmaFP8Op`.
+  The PyTorch C++ extension builder must also recognize the `10.7a` CUDA architecture;
+  builds without it fail with `Unknown CUDA arch (10.7a)`.
+- Use the repository CUTLASS submodule or set `CUTLASS_ROOT` to public CUTLASS headers,
+  including for wheel installations.
 - The default AOT cache directory is `~/.cache/minfer/msa_v1`; override it with
   `MSA_V1_AOT_CACHE`. Set `MSA_V1_AOT_DISABLE=1` to disable the AOT cache. JIT is disabled by
   default on a cache miss. To enable JIT, explicitly set
@@ -76,7 +83,7 @@ for metric definitions.
 
 ## Cache layout
 
-Non-contiguous cache support is verified on SM100/SM103; it is not yet verified on SM107.
+Non-contiguous cache support has been verified on SM100/SM103, not SM107.
 
 Cache data must be contiguous along the last (dim) storage dimension (`stride(-1) == 1`).
 Cache data pointers and non-singleton outer byte strides must be multiples of 16.

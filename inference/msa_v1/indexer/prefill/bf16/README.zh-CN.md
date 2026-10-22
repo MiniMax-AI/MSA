@@ -36,6 +36,10 @@ K cache。调用方可以向 `run()` 传入预分配输出。
 
 ## 数据契约
 
+每个请求的总 KV 长度最多为 2,097,152 tokens（16384 页，每页 128 tokens），
+包含当前 query chunk。支持 batch 内请求长度不同；每个 query 按自己的有效页数选择，
+并始终保留其 local page。
+
 - Q 和 K 为 BF16。
 - 支持 1、2 或 4 个本地 index head。
 - 输出为 `[num_index_heads, total_q, 16]`，内容为 logical page ID。有效项位于前缀，
@@ -53,7 +57,7 @@ K cache。调用方可以向 `run()` 传入预分配输出。
 
 所有输入和输出须位于同一 CUDA device；Q、metadata 和输出须 contiguous、16-byte 对齐。累积长度从 0
 开始且非递减，Q 的末项等于 `total_q`，每个请求的 KV 长度须覆盖 query 长度。
-`max_seqlen_q`/`max_seqlen_k` 是各请求长度的 host 上界；KV 上界最多为 8192×128，
+`max_seqlen_q`/`max_seqlen_k` 是各请求长度的 host 上界；KV 上界最多为 16384×128，
 page table 必须覆盖该上界。默认 `num_index_heads=4`，支持 H=1/2/4。
 每行有效页数由 bottom-right causal 位置决定：
 

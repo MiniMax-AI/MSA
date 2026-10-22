@@ -8,7 +8,6 @@ import subprocess
 from pathlib import Path
 
 import msa_v1
-
 try:
     import tomllib
 except ImportError:
@@ -64,7 +63,7 @@ def test_local_inference_dumps_are_excluded_from_package_data() -> None:
 
 
 def test_production_packages_exclude_test_and_benchmark_trees() -> None:
-    roots = (TRAINING_ROOT / "msa_v1", INFERENCE_ROOT)
+    roots = (*TRAINING_ROOT.glob("msa_*"), INFERENCE_ROOT)
     for root in roots:
         forbidden = [
             path
@@ -81,7 +80,7 @@ def test_training_and_inference_packages_do_not_cross_import() -> None:
         if "inference" in _import_roots(path):
             violations.append(f"{path.relative_to(REPO_ROOT)} imports inference")
     for path in INFERENCE_ROOT.rglob("*.py"):
-        forbidden = _import_roots(path).intersection({"msa_v1", "training"})
+        forbidden = _import_roots(path).intersection({"training", *(p.name for p in TRAINING_ROOT.glob("msa_*"))})
         if forbidden:
             violations.append(
                 f"{path.relative_to(REPO_ROOT)} imports {', '.join(sorted(forbidden))}"
@@ -184,6 +183,17 @@ def test_msa_v1_inference_layout_is_canonical() -> None:
     assert not (msa_v1_root / "indexer/decode/dense_interface.py").exists()
     assert (msa_v1_root / "indexer/prefill/q8kv8/indexer_gemm.py").is_file()
     assert (msa_v1_root / "indexer/prefill/bf16/indexer_gemm.py").is_file()
+    config = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    package_data = config["tool"]["setuptools"]["package-data"]
+    assert "inference.msa_v1.indexer.decode.tp4_q8kv4" not in package_data
+    root = msa_v1_root / "indexer/decode/q8kv4"
+    packaged = {
+        path
+        for pattern in package_data["inference.msa_v1.indexer.decode.q8kv4"]
+        for path in root.glob(pattern)
+        if path.is_file()
+    }
+    assert {path for path in (root / "csrc").rglob("*") if path.is_file()} <= packaged
 
 
 def test_msa_v1_legacy_inference_packages_are_absent() -> None:
@@ -201,7 +211,6 @@ def test_msa_v1_legacy_inference_packages_are_absent() -> None:
         package for package in legacy_packages if (msa_v1_root / package).exists()
     ]
     assert not [path for path in msa_v1_root.rglob("_vendor") if path.is_dir()]
-    assert not [path for path in msa_v1_root.rglob("tp*") if path.is_dir()]
 
 
 def test_decode_attention_q8kv4_csrc_uses_op_local_flashinfer_layout() -> None:
@@ -321,7 +330,8 @@ def test_msa_v1_operator_readmes_use_one_structure() -> None:
         readme = operator_root / "README.zh-CN.md"
         text = readme.read_text(encoding="utf-8")
         headings = [line for line in text.splitlines() if line.startswith("## ")]
-        assert headings in (
+        core_headings = headings[:-1] if headings[-1:] == ["## Cache 布局"] else headings
+        assert core_headings in (
             expected_headings,
             [*expected_headings, "## 验收命令"],
             [*expected_headings, "## 验证命令"],
@@ -337,6 +347,7 @@ def test_msa_v1_operator_readmes_use_one_structure() -> None:
                 "## 验收命令": "## Validation commands",
                 "## 验证命令": "## Validation commands",
                 "## 验证与性能测试": "## Validation and performance testing",
+                "## Cache 布局": "## Cache layout",
             }
         )
         assert [line for line in english.splitlines() if line.startswith("## ")] == [

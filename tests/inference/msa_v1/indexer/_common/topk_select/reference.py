@@ -30,6 +30,11 @@ def focused_lengths(max_cols: int, num_rows: int, seed: int) -> np.ndarray:
         max_cols - 1,
         max_cols,
     )
+    boundaries += tuple(
+        rung * 256 + offset
+        for rung in (2, 4, 8, 12, 16, 20, 24, 28, 32)
+        for offset in (0, 1, 2)
+    )
     selected = [value for value in boundaries if 1 <= value <= max_cols]
     rng = np.random.default_rng(seed)
     random_values = rng.integers(1, max_cols + 1, size=num_rows, dtype=np.int32)

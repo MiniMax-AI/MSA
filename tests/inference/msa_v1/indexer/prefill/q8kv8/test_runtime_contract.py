@@ -28,6 +28,40 @@ from tests.inference.msa_v1.indexer.prefill.q8kv8.test_plan_reuse import _case
 pytestmark = pytest.mark.gpu
 
 
+@pytest.mark.parametrize("num_index_heads", (1, 4))
+@pytest.mark.parametrize("final_length", (1048576, 1048584, 2097152))
+def test_long_context(num_index_heads, final_length):
+    case = _case(
+        "long_context",
+        (8, 3, 17),
+        (final_length - 8, 126, final_length // 2 - 17),
+    )
+    inputs = make_real_prefill_inputs(
+        case, device=require_sm100_device(), num_index_heads=num_index_heads
+    )
+    wrapper = BatchPrefillIndexerWithPagedKVCacheWrapper()
+    wrapper.plan(
+        inputs.cu_seqlens_q,
+        inputs.cu_seqlens_k,
+        inputs.page_table,
+        total_q=case.total_q,
+        max_seqlen_q=case.max_query_len,
+        max_seqlen_k=case.max_final_kv,
+        num_index_heads=num_index_heads,
+    )
+    state = wrapper._proxy_score.plan_state
+    baseline = None
+    for _ in range(3):
+        state.proxy_scores.fill_(float("nan"))
+        output = run_checked(wrapper, inputs.q, inputs.k_cache)
+        if baseline is None:
+            expected = assert_full_scores(case, inputs, state.proxy_scores)
+            assert_full_topk_quality(expected, state.num_valid_pages, output)
+            baseline = output.clone()
+        else:
+            assert torch.equal(baseline, output)
+
+
 @pytest.mark.parametrize("num_index_heads", (1, 2, 4))
 @pytest.mark.parametrize(
     "layout", (*CACHE_LAYOUTS, "singleton_zero", "singleton_unaligned")

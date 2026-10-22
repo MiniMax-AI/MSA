@@ -1,1 +1,1 @@
-"""MSA v1 tests."""
+"""Tests for sparse attention training and inference packages."""

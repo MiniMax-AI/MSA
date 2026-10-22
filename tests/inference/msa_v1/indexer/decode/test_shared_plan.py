@@ -5,6 +5,7 @@ import importlib
 import logging
 import time
 import weakref
+from functools import partial
 from itertools import pairwise
 
 import pytest
@@ -12,6 +13,7 @@ import torch
 
 from inference.msa_v1.indexer.decode import BatchDecodeIndexerPlan
 from inference.msa_v1.indexer.decode.plan import _COMPILE_CACHE
+from tests.inference.msa_v1.attention.decode.runtime import run_cuda
 from tests.inference.msa_v1.indexer._common.topk_select.reference import (
     assert_quantized_topk_contract,
 )
@@ -63,7 +65,7 @@ def test_shared_plan_replay_and_cache():
     for field, invalid_values in (
         ("query_length", (0, 17, True, 1.5)),
         ("num_index_heads", (0, 3, True)),
-        ("max_pages", (0, 8193, True)),
+        ("max_pages", (0, 16385, True)),
     ):
         for value in invalid_values:
             options = {"max_pages": 1, field: value}
@@ -113,6 +115,13 @@ def test_shared_plan_replay_and_cache():
                 if cache_keys is not None:
                     assert current_keys == cache_keys
                 cache_keys = current_keys
+    for max_pages in (8192, 8193, 16384):
+        lengths = [8, max_pages * 128 - 3, max_pages * 128]
+        source = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+        plan = BatchDecodeIndexerPlan(source, max_pages=max_pages)
+        run_cuda("wide decode plan", plan.update)
+        _check_plan(plan, lengths)
+        assert set(_COMPILE_CACHE) == cache_keys
 
 
 @pytest.mark.gpu
@@ -194,6 +203,27 @@ def test_shared_plan_query_lengths(kind, heads):
         else:
             jit = importlib.import_module("inference.msa_v1.indexer.decode.q8kv4.jit")
             current_keys = jit._load_extension_for_arch.cache_info().misses
+        if query_length == 8:
+            padded_table = torch.nn.functional.pad(table, (0, 16384 - 32), value=-1)
+            padded = api.BatchDecodeIndexerWithPagedKVCacheWrapper()
+            padded.plan(
+                padded_table, source, num_index_heads=heads, query_length=query_length
+            )
+            if kind != "q8kv4":
+                padded._proxy_score._compile_and_bind(q, k, padded._proxy_scores)
+            padded._proxy_scores.fill_(float("nan"))
+            padded_output = run_cuda(
+                "preallocated decode capacity", partial(padded.run, q, k, **kwargs)
+            )
+            assert torch.equal(output, padded_output)
+            if kind != "q8kv4":
+                assert current_keys == set(
+                    importlib.import_module(
+                        "inference.msa_v1.indexer.decode._interface"
+                    )._COMPILE_CACHE
+                )
+            else:
+                assert current_keys == jit._load_extension_for_arch.cache_info().misses
         granularity = 8 if kind != "q8kv4" else 16
         query_columns = (
             (query_length * heads + granularity - 1) // granularity

@@ -60,6 +60,8 @@ metrics.
   checks for all 10,562 cases.
 - `msa_v1_smoke`: 32 deterministic real cases for MSA v1 quick correctness checks.
 - `msa_v1_full`: 512 real cases for full-output MSA v1 correctness checks.
+- `smoke`: the existing 96 deterministic real cases used by existing paths.
+- `full`: the existing 1,024 real cases used by existing paths.
 - `gemm_topk_e2e`: 1,024 end-to-end Indexer cases.
 - `cuda_graph`: 16 cases covering different batches, workspace sizes, and
   workload imbalance.
@@ -122,13 +124,15 @@ distance greater than twice L2, 5 warmups, 20 replays, and a per-case
 
 ```bash
 python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
-  --suite full --out /path/to/baseline.json
+  --suite full --num-index-heads 1 --out /path/to/baseline.json
 
 python3 -m benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark \
-  --suite full --baseline /path/to/baseline.json --out /path/to/candidate.json
+  --suite full --num-index-heads 4 --verify \
+  --baseline /path/to/baseline.json --out /path/to/candidate.json
 ```
 
 Use `smoke` for a quick check; `full` uses the complete 128-case benchmark selection.
+
 
 Q8KV8 prefill indexer accepts `--num-index-heads` 1/2/4 and returns `[H, total_q, 16]`.
 Useful FLOPs equal the single-head count above multiplied by H. Production-weighted

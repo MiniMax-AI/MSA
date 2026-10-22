@@ -36,6 +36,10 @@ the current layer. Callers may pass a preallocated output to `run()`.
 
 ## Data contract
 
+The maximum total KV length per request is 2,097,152 tokens (16384 pages of 128 tokens),
+including the current query chunk. Mixed request lengths are supported; selection uses each
+query's valid page count and always includes its local page.
+
 - Q and K use BF16.
 - One, two, or four local index heads are supported.
 - Output shape is `[num_index_heads, total_q, 16]` and values are logical page IDs. Valid entries
@@ -54,7 +58,7 @@ the current layer. Callers may pass a preallocated output to `run()`.
 All inputs and outputs must be on the same CUDA device. Q, metadata, and output must be contiguous and 16-byte aligned.
 Cumulative lengths start at zero and are nondecreasing; the final Q offset equals `total_q`,
 and each request's KV length must cover its query length. `max_seqlen_q`/`max_seqlen_k` are
-host upper bounds on per-request lengths. The KV bound is at most 8192×128, and the page table
+host upper bounds on per-request lengths. The KV bound is at most 16384×128, and the page table
 must cover that bound. `num_index_heads` defaults to 4 and supports H=1/2/4.
 The valid page count follows the bottom-right causal position:
 

@@ -18,6 +18,9 @@ from inference.msa_v1.attention.prefill._common.dsl.compile_utils import (
     compile_with_timing,
 )
 from inference.msa_v1.indexer._common.topk_select import _topk_select
+from inference.msa_v1.indexer._common.topk_select.interface import (
+    MAXIMUM_COLUMNS as _MAXIMUM_COLUMNS,
+)
 from inference.msa_v1.indexer.prefill.bf16.indexer_gemm import (
     M3_PAGED_DIRECT_SCORE_NUM_HEADS,
     M3IndexerGemmSm100,
@@ -27,7 +30,6 @@ from inference.msa_v1.indexer.prefill.bf16.schedule import M3IndexerScheduleSm10
 _HEAD_DIM = 128
 _PAGE_SIZE = 128
 _TOP_K = 16
-_MAXIMUM_COLUMNS = 8192
 _SUPPORTED_CAPABILITIES = {(10, 0), (10, 3)}
 _SCHEDULE_COMPILE_CACHE: dict[tuple[object, ...], object] = {}
 _GEMM_COMPILE_CACHE: dict[tuple[object, ...], object] = {}

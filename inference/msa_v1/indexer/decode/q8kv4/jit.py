@@ -167,7 +167,7 @@ class JitSpec:
     head_dim: int = 128
     page_tokens: int = 128
     scale_group_size: int = 16
-    maximum_pages: int = 8192
+    maximum_pages: int = 16384
 
     @property
     def uri(self) -> str:

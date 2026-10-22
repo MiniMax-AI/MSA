@@ -1,0 +1,16 @@
+// Auto-generated M3 Decode MegaKernel variant: {{ variant_name }}
+#define M3_DECODE_WAIT_DEADLINE {{ wait_deadline | default(0) }}
+#define M3_DECODE_ENABLE_PLACEMENT {{ enable_placement | default(0) }}
+#include "{{ source_owner }}/kernel/include/m3_decode_sm100.cuh"
+
+using namespace mega_atten::m3_decode;
+
+cudaError_t {{ func_name }}(const M3DecodeMegaKernelParams& p) {
+{% if kernel_mode == "mega_atten" %}
+  return run_m3_decode_mega_atten(p);
+{% else %}
+  return run_m3_decode_megakernel<{{ router_gamma_prepacked }},
+                      {{ indexer_topk_items_per_thread }},
+                      {{ wave_balanced_indexer_pages }}>(p);
+{% endif %}
+}

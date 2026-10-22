@@ -11,6 +11,7 @@ from functools import partial
 import pytest
 import torch
 
+from inference.msa_v1.indexer._common.topk_select.build import load_extension
 from inference.msa_v1.indexer.decode._interface import (
     _BatchDecodeProxyScoreWrapper,
 )
@@ -187,14 +188,18 @@ def test_selected_sequence_cases(case_shard, num_index_heads) -> None:
                 assert torch.equal(topk_indices, repeated)
 
 
-def test_1m_length_and_unwritten_suffix() -> None:
-    """Exercise the maximum page-table width and output contract."""
+@pytest.mark.parametrize(
+    ("batch", "final_length"),
+    ((32, 1048576), (4, 1048576), (4, 1048584), (4, 1048705), (4, 2097152)),
+)
+def test_long_length_and_unwritten_suffix(batch: int, final_length: int) -> None:
+    """Verify all long-context scores and TopK against an independent oracle."""
 
     device = torch.device("cuda")
-    batch = 32
-    max_pages = 8192
+    max_pages = (final_length + 127) // 128
     lengths = torch.tensor(
-        [1048576, 524289, 100001, 129] + [8 + index for index in range(batch - 4)],
+        [final_length, final_length // 2 + 1, 100001, 129]
+        + [8 + index for index in range(batch - 4)],
         dtype=torch.int32,
     )
     q, k_cache, page_table, seq_lens = make_inputs(
@@ -212,8 +217,10 @@ def test_1m_length_and_unwritten_suffix() -> None:
     )
     wrapper = _BatchDecodeProxyScoreWrapper()
     wrapper.plan(page_table, seq_lens)
-    actual = wrapper.run(q, k_cache, out=output)
-    torch.cuda.synchronize()
+    wrapper._compile_and_bind(q, k_cache, output)
+    actual = _timed_run(
+        "long-context scores", partial(wrapper.run, q, k_cache, out=output)
+    )
     pages = torch.arange(max_pages, device=device).reshape(1, 1, -1)
     query_positions = (
         seq_lens.reshape(-1, 1)
@@ -227,6 +234,26 @@ def test_1m_length_and_unwritten_suffix() -> None:
     ).reshape(1, -1, 1)
     assert torch.all(actual.masked_select(pages >= local_pages) == 123.0)
     assert torch.all(torch.isfinite(actual.masked_select(pages < local_pages)))
+    expected = indexer_gemm_reference(q, k_cache, page_table, seq_lens)
+    _assert_scores(actual, expected, seq_lens)
+    topk_wrapper = BatchDecodeIndexerWithPagedKVCacheWrapper()
+    topk_wrapper.plan(page_table, seq_lens)
+    topk_wrapper._proxy_score._compile_and_bind(q, k_cache, topk_wrapper._proxy_scores)
+    load_extension()
+    topk_indices = _timed_run(
+        "long-context TopK", partial(topk_wrapper.run, q, k_cache)
+    )
+    assert_quantized_topk_contract(
+        expected.reshape(-1, max_pages).cpu().numpy(),
+        (local_pages + 1).reshape(-1).cpu().numpy(),
+        topk_indices.reshape(-1, 16).cpu().numpy(),
+    )
+    baseline = topk_indices.clone()
+    for _ in range(2):
+        repeated = _timed_run(
+            "long-context repeat", partial(topk_wrapper.run, q, k_cache)
+        )
+        assert torch.equal(baseline, repeated)
 
 
 @pytest.mark.parametrize("page_table_kind", ("interval", "reverse"))

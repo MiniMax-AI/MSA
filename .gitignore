@@ -1,22 +1,69 @@
+# Generated profiling / benchmark artifacts
+log/
+nsys_reports/
+profiles/
+BENCHMARK*.log
+pytest*.log
+*.ncu-rep
+*.qdrep
+*.nsys-rep
+
+# Python bytecode / caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
 .ruff_cache/
 build/
 dist/
 *.egg-info/
+
+# Editor / OS temp files
+*.swp
+*.swo
+*.tmp
+.DS_Store
+.claude/
+
+# Non-submission content
+AI/
+demo/
+plan/
+agent_tests/
+tools/
+bench/
+bench_decode_vs_trt.py
+bench_split_kv_strategy.py
+bench_out/
+*.pptx
+DESIGN_*.md
+HANDOFF_*.md
+optimization.md
+schedule_atten_cowork.md
+schedule_theory.md
+task.md
+
+# Local design notes
+**/design.md
+**/development.md
+**/results.md
+src/sm100_pro/design_bwd.md
+src/sm100_pro/design_fwd.md
+
+# Local raw workload data
+/datas/192k_cp16/*.csv
+/datas/inference/dspark_forward_dumps.dp*.jsonl
+
+/agent/*
+/issues/*
+
+temp/*
+
 *.log
-*.ncu-rep
-*.nsys-rep
 *.sqlite
 *.so
 *.o
 *.cubin
 *.ptx
-**/design.md
-**/development.md
-**/results.md
 **/optimization.md
-/datas/inference/dspark_forward_dumps.dp*.jsonl
-/datas/192k_cp16/*.csv
 /agent/

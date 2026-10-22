@@ -173,7 +173,7 @@ def test_jit_spec_contains_only_compile_time_configuration(
     assert spec.variant_name == "indexer_gemm_q8kv4"
     assert spec.dequant_mode in {"qmul4", "fp16_fallback"}
     assert spec.max_query_length == 16
-    assert spec.maximum_pages == 8192
+    assert spec.maximum_pages == 16384
 
     built_specs = []
 

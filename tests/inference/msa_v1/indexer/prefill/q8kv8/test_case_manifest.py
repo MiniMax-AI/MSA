@@ -1,6 +1,6 @@
-from copy import deepcopy
-
 """Static checks for the fixed real-inference selection."""
+
+from copy import deepcopy
 
 import hashlib
 import json
@@ -44,7 +44,13 @@ def test_real_prefill_manifest_and_tiers() -> None:
 
 
 def test_real_prefill_benchmark_selection() -> None:
+    from benchmarks.inference.msa_v1.indexer.prefill.q8kv8.benchmark import _resolve_slots
+
     cases = load_prefill_benchmark_cases()
+    no_history = [entry.case for entry in cases if max(entry.case.final_kv_lens) <= 128]
+    assert no_history
+    for case in no_history:
+        assert _resolve_slots(case, requested_slots=0, l2_bytes=132 * 1024**2) == 1
     representative = [case for case in cases if case.is_representative]
     assert len(cases) == 128
     assert len(representative) == 66

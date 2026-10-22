@@ -9,6 +9,8 @@ import cutlass.cute as cute  # noqa: PLR0402
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+from inference.msa_v1.indexer._common.topk_select.interface import MAXIMUM_COLUMNS
+
 from .plan_kernel import DecodeIndexerPlanSm100
 
 try:
@@ -51,8 +53,8 @@ class BatchDecodeIndexerPlan:
             raise ValueError("query_length must be an integer in [1, 16]")
         if type(num_index_heads) is not int or num_index_heads not in (1, 2, 4):
             raise ValueError("num_index_heads must be 1, 2, or 4")
-        if type(max_pages) is not int or not 1 <= max_pages <= 8192:
-            raise ValueError("max_pages must be an integer in [1, 8192]")
+        if type(max_pages) is not int or not 1 <= max_pages <= MAXIMUM_COLUMNS:
+            raise ValueError(f"max_pages must be an integer in [1, {MAXIMUM_COLUMNS}]")
         self.device = seq_lens_buffer.device
         with torch.cuda.device(self.device):
             if torch.cuda.is_current_stream_capturing():

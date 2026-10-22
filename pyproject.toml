@@ -32,6 +32,7 @@ include = ["msa_v1*", "datas*", "inference*"]
 namespaces = false
 
 [tool.setuptools.package-data]
+"*" = ["csrc/**/*", "README.md", "README.zh-CN.md", "E2E_DEFINITIONS*.md"]
 datas = [
     "*.json",
     "inference/*.json",

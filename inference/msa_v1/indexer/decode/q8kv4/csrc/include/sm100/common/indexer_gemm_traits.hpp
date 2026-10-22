@@ -28,7 +28,7 @@ template <int NumIndexHeads, int QueryColumns> struct IndexerGemmTraitsForHeads 
   static constexpr int kThreads =
       (kPageWorkerGroups * kPageWorkerWarps + 2) * cutlass::NumThreadsPerWarp;
   static constexpr int kMaxPagesPerCta = 8;
-  static constexpr int kMaximumPages = 8192;
+  static constexpr int kMaximumPages = 16384;
 };
 
 using IndexerGemmTraits =

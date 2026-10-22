@@ -4,7 +4,7 @@
 
 ## 功能
 
-面向 SM100/SM103 的 true-varlen paged prefill indexer。Q/K 均使用 E4M3，输出每个
+面向 SM100/SM103/SM107 的 true-varlen paged prefill indexer。Q/K 均使用 E4M3，输出每个
 query 选中的 logical page indices，并保证包含 local page。
 
 ## 公开接口
@@ -32,6 +32,10 @@ topk_indices = wrapper.run(q, paged_k_cache)
 
 ## 数据契约
 
+每个请求的总 KV 长度最多为 2,097,152 tokens（16384 页，每页 128 tokens），
+包含当前 query chunk。支持 batch 内请求长度不同；每个 query 按自己的有效页数选择，
+并始终保留其 local page。
+
 - `num_index_heads` 默认为 1，支持 1/2/4。各 head 独立选择 TopK，共享 K cache。
 - Q 和输出必须为 CUDA contiguous tensor；K 必须位于同一 device。
 - H=1 的输出也保留 head 维。
@@ -49,9 +53,12 @@ topk_indices = wrapper.run(q, paged_k_cache)
 - 历史 page 的物理映射允许乱序和不连续。
 - `plan()` 和 `replan()` 必须在 CUDA Graph capture 外调用；首次 capture 前必须完成
   warmup。
-- 支持 SM100/SM103，并要求 `nvidia-cutlass-dsl[cu13]>=4.5.2`。
-- 使用仓库的 CUTLASS 子模块，或通过 `CUTLASS_ROOT` 指向公开 CUTLASS headers；
-  安装 wheel 后应设置此环境变量。
+- SM100/SM103 要求 `nvidia-cutlass-dsl[cu13]>=4.5.2`。SM107 要求兼容的 CUDA
+  工具链，以及提供 `cutlass.cute.nvgpu.tcgen05.SM107MmaFP8Op` 的 CuTe DSL 版本。
+  PyTorch C++ extension builder 也必须识别 `10.7a` CUDA 架构；缺少该支持的版本
+  会报 `Unknown CUDA arch (10.7a)`。
+- 使用仓内 CUTLASS submodule，或通过 `CUTLASS_ROOT` 指向公开 CUTLASS 头文件；
+  wheel 安装同样需要这些头文件。
 - 默认 AOT cache 目录为 `~/.cache/minfer/msa_v1`，可通过 `MSA_V1_AOT_CACHE`
   覆盖。设置 `MSA_V1_AOT_DISABLE=1` 可禁用 AOT cache。Cache miss 时默认禁止 JIT；
   需要 JIT 时，显式设置 `FMHA_SM100_ALLOW_JIT=1`，并在 CUDA Graph capture
@@ -74,7 +81,7 @@ Benchmark 使用公开 `run()` 的 CUDA Graph E2E 时间，按生产权重汇总
 
 ## Cache 布局
 
-非连续 cache 的支持已在 SM100/SM103 上验证，尚未在 SM107 上验证。
+非连续 cache 已在 SM100/SM103 验证，尚未在 SM107 验证。
 
 Cache 数据的最后一个存储维度（dim）须连续（`stride(-1) == 1`）。
 Cache 数据地址及非单例外层维度的字节 stride 必须为 16 的倍数。
