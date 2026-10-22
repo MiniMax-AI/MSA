@@ -90,6 +90,27 @@ def _gather_tp(obj):
     return out
 
 
+def placement_required() -> bool:
+    """Whether MegaAttention must accept non-canonical cluster placement.
+
+    With canonical placement off, the kernel traps unless all 144 CTAs land in the
+    canonical 8/2-CTA cluster shape, which needs every SM free at launch. Under
+    overlap scheduling the scheduler prepares the next batch on its own stream
+    and, by default, only waits for an in-graph event of the previous forward, so
+    its small kernels can hold SMs while MegaAttention launches. That stream waits
+    for the whole forward with SGLANG_FORCE_COARSE_WAR_BARRIER=1, or is the forward
+    stream without overlap scheduling; the plan stream, which also launches
+    kernels off the forward stream, must stay off.
+    """
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        return True
+    if get_server_args().disable_overlap_schedule:
+        return False
+    return not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
+
+
 def model_disable_reasons(model, hf_config, copies) -> list[str]:
     lm = _language_model(model)
     layers = _moe_layer_ids(lm)
@@ -307,9 +328,10 @@ class Built:
         self.moe_context = create_moe_tp_context(
             group=group, group_id=f"sglang-msa-v1-{leader}-moe", backend="mega"
         )
+        placement = placement_required()
         # the MSA-v1 pool stores K/V/index K with unit outer scales
         attention_config = AttentionConfig(
-            enable_placement=True,
+            enable_placement=placement,
             sm_scale=HEAD_DIM**-0.5,
             input_norm_eps=eps,
             head_norm_eps=eps,
@@ -341,11 +363,12 @@ class Built:
         self._hooked: set[int] = set()
         logger.info(
             "msa-v1 MegaAttention + token-parallel MoE: MoE layers %d-%d, weights "
-            "%.1f GiB (routed experts %.1f GiB)",
+            "%.1f GiB (routed experts %.1f GiB), cluster placement %s",
             self.layer_ids[0],
             self.layer_ids[-1],
             sum(op.nbytes() for op in self.operands.values()) / 2**30,
             sum(e.nbytes() for e in self.experts.values()) / 2**30,
+            "on" if placement else "off (canonical)",
         )
 
     # ----- weights -----------------------------------------------------------

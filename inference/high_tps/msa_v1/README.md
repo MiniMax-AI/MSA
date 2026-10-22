@@ -51,7 +51,8 @@ then update that device tensor and the page mapping in place before replay.
 Entries beyond the visible length are not read. All legal KV lengths and page
 capacities reuse one compiled kernel for each static placement/diagnostic mode.
 MegaAttention defaults to `AttentionConfig(enable_placement=False)`, requiring canonical
-hardware placement; enable it for non-canonical placement, as the SGLang plugin does.
+hardware placement; enable it for non-canonical placement. The SGLang plugin enables it
+unless no other stream runs kernels during the forward (see its README).
 See the [Attention contract](attention/README.md) for failure handling and Graph mode changes.
 Wave-balanced dispatch is disabled. Selection returns
 the exact FP32 top 15 historical pages plus the local page, with page-ID tie

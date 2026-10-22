@@ -10,6 +10,7 @@ import sglang_msa_mono
 from sglang.srt.monokernels import spec as registry
 from sglang.srt.monokernels.guards import monokernel_disable_reasons
 from sglang.srt.server_args import ServerArgs
+from sglang_msa_mono.minimax_m3 import runtime
 from sglang_msa_mono.minimax_m3.spec import SPEC
 
 # The text config of MiniMaxAI/MiniMax-M3.1-Flash, reduced to the fields read
@@ -163,3 +164,27 @@ def test_model_shapes_the_kernel_does_not_build_are_refused(overrides, expected)
 def test_server_setups_the_kernel_cannot_serve_are_refused(kw, expected):
     _, reasons = _reasons(_server_args(**kw))
     assert any(expected in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize(
+    ("disable_overlap", "env", "required"),
+    [
+        # the scheduler stream only waits for an in-graph event: its kernels can hold SMs
+        (False, {}, True),
+        (False, {"SGLANG_FORCE_COARSE_WAR_BARRIER": "1"}, False),
+        (True, {}, False),
+        # the plan stream launches allocation kernels off both streams
+        (False, {"SGLANG_FORCE_COARSE_WAR_BARRIER": "1", "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1"}, True),
+        (True, {"SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1"}, True),
+    ],
+)
+def test_canonical_placement_only_when_no_other_stream_runs_kernels(
+    monkeypatch, disable_overlap, env, required
+):
+    for name in ("SGLANG_FORCE_COARSE_WAR_BARRIER", "SGLANG_ENABLE_OVERLAP_PLAN_STREAM"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    args = SimpleNamespace(disable_overlap_schedule=disable_overlap)
+    monkeypatch.setattr(runtime, "get_server_args", lambda: args)
+    assert runtime.placement_required() is required

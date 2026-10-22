@@ -16,7 +16,7 @@ cluster placement. Concurrent GPU work can change placement; a mismatch reports
 `M3_DECODE_CANONICAL_PLACEMENT_REQUIRED` and a CUDA launch failure. Use
 `enable_placement=True` when non-canonical placement must be supported. After a launch
 failure, terminate the TP worker group and recreate its CUDA contexts. SGLang's plugin
-explicitly enables placement.
+enables placement unless no other stream runs kernels during the forward.
 
 Placement and diagnostic-timeout modes select separate compiled kernels. Choose and warm up
 the mode before Graph capture; changing it requires a new runner/plan and Graph capture.

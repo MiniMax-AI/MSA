@@ -14,8 +14,8 @@
 `m3_decode_mega_atten` 接受同名参数。该模式要求 canonical 硬件 cluster 排布。
 并发 GPU 工作可能改变排布；不匹配时会报告 `M3_DECODE_CANONICAL_PLACEMENT_REQUIRED`
 和 CUDA launch failure。需要兼容非 canonical 排布时使用 `enable_placement=True`。
-launch failure 后须终止整组 TP worker，并重建 CUDA context。SGLang 插件显式开启
-placement。
+launch failure 后须终止整组 TP worker，并重建 CUDA context。SGLang 插件默认开启
+placement，仅在 forward 期间没有其他 stream 运行 kernel 时关闭。
 
 Placement 和诊断超时模式选择独立编译产物。须在 Graph capture 前选择模式并预热；
 切换模式需要新建 runner/plan 并重新捕获 Graph。固定静态模式后，全部合法 KV 长度和

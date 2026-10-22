@@ -33,6 +33,7 @@ SGLang loads the package as a general plugin (`sglang.srt.plugins` entry point).
 
 ```bash
 # MiniMaxAI/MiniMax-M3.1-Flash ships its DSpark draft in the dspark/ subdirectory
+SGLANG_FORCE_COARSE_WAR_BARRIER=1 \
 python -m sglang.launch_server --model-path MiniMax-M3.1-Flash --trust-remote-code \
   --tp-size 4 --page-size 128 \
   --speculative-algorithm DSPARK --speculative-draft-model-path MiniMax-M3.1-Flash/dspark \
@@ -63,9 +64,17 @@ startup.
 
 ## Contract
 
-- The plugin explicitly uses `AttentionConfig(enable_placement=True)` to support
-  non-canonical hardware cluster placement. The standalone MegaAttention API defaults
-  to `False`; its canonical-placement restriction does not become the plugin default.
+- Cluster placement: MegaAttention's canonical-placement mode is about 3.4 µs faster
+  per launch, but traps (`M3_DECODE_CANONICAL_PLACEMENT_REQUIRED`, then a CUDA launch
+  failure that ends the TP worker group) unless every SM is free when it launches.
+  Under overlap scheduling the scheduler prepares the next batch on its own stream
+  and by default waits only for an event inside the previous forward, so its small
+  kernels can hold SMs at a MegaAttention launch. The plugin therefore enables
+  placement unless no other stream can run kernels during the forward:
+  `SGLANG_FORCE_COARSE_WAR_BARRIER=1` (the scheduler stream waits for the whole
+  forward) or `--disable-overlap-schedule`, and `SGLANG_ENABLE_OVERLAP_PLAN_STREAM`
+  unset. The server log states the choice (`cluster placement on` or
+  `off (canonical)`). With placement off, the GPUs must not run other processes.
 - Checkpoint: MiniMax-M3.1's NVFP4 release (`quantization_config` declares
   `mxfp8` with `moe_quant_algo: NVFP4`, which SGLang serves as
   `minimax_m3_nvfp4`): MXFP8 attention and shared expert, NVFP4 routed

@@ -31,6 +31,7 @@ SGLang 通过 `sglang.srt.plugins` entry point 加载此通用插件。
 
 ```bash
 # MiniMaxAI/MiniMax-M3.1-Flash 的 DSpark draft 位于 dspark/ 子目录
+SGLANG_FORCE_COARSE_WAR_BARRIER=1 \
 python -m sglang.launch_server --model-path MiniMax-M3.1-Flash --trust-remote-code \
   --tp-size 4 --page-size 128 \
   --speculative-algorithm DSPARK --speculative-draft-model-path MiniMax-M3.1-Flash/dspark \
@@ -56,9 +57,15 @@ SGLang 会把 draft 行数补齐到 attention TP 的倍数，因此需要传
 
 ## 契约
 
-- 插件显式使用 `AttentionConfig(enable_placement=True)`，兼容非 canonical 硬件
-  cluster 排布。独立 MegaAttention API 默认为 `False`；其 canonical 排布限制
-  不作为插件默认设置。
+- Cluster placement：MegaAttention 的 canonical 排布模式每次 launch 约快 3.4 µs，但要求
+  launch 时所有 SM 空闲，否则 trap（`M3_DECODE_CANONICAL_PLACEMENT_REQUIRED`，随后 CUDA
+  launch failure，整组 TP worker 退出）。overlap scheduling 下 scheduler 在自己的 stream
+  上准备下一批，默认只等上一个 forward 内部的 event，其小 kernel 可能在 MegaAttention
+  launch 时占用 SM。因此插件默认开启 placement，只有在 forward 期间不会有其他 stream
+  运行 kernel 时才关闭：设置 `SGLANG_FORCE_COARSE_WAR_BARRIER=1`（scheduler stream 等待
+  整个 forward）或 `--disable-overlap-schedule`，且未设置
+  `SGLANG_ENABLE_OVERLAP_PLAN_STREAM`。服务日志会打印所选模式（`cluster placement on`
+  或 `off (canonical)`）。关闭 placement 时 GPU 上不得运行其他进程。
 - Checkpoint 为 MiniMax-M3.1 的 NVFP4 发布版（`quantization_config` 声明 `mxfp8`
   并带 `moe_quant_algo: NVFP4`，SGLang 按 `minimax_m3_nvfp4` 加载）：attention 和
   shared expert 使用 MXFP8，routed experts 使用 NVFP4，router 使用 FP32。同一

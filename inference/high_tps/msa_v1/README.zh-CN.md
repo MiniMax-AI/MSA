@@ -44,7 +44,8 @@ MegaAttention 每次调用都从 `plan_info.kv_segment_lens` 读取实际 KV 长
 与 page mapping；不读取超出可见长度的条目。所有合法 KV 长度与 page capacity
 在固定 placement/诊断静态模式下复用一个编译产物。
 MegaAttention 默认 `AttentionConfig(enable_placement=False)`，要求 canonical 硬件排布；
-需要非 canonical 排布时须开启，SGLang 插件已显式开启。错误处理与 Graph 模式切换
+需要非 canonical 排布时须开启；SGLang 插件仅在 forward 期间没有其他 stream 运行 kernel 时
+关闭（见其 README）。错误处理与 Graph 模式切换
 见 [Attention 契约](attention/README.zh-CN.md)。关闭 wave-balanced 选型。
 选页使用原始 FP32 分数精确选择 15 个历史页并保留 local page，同分按 page ID
 决定，有效 ID 升序排列，短行后缀填 `-1`。
