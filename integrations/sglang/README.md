@@ -3,10 +3,12 @@
 [简体中文](README.zh-CN.md)
 
 SGLang monokernel plugin for MSA-v1 MegaAttention and the token-parallel MoE
-kernel (`inference.high_tps.msa_v1`). It registers `--monokernel-backend msa` for
+kernel (`inference.high_tps.msa_v1`), and for the DSpark draft backbone
+(`inference.high_tps.msa_v1.draft`). It registers `--monokernel-backend msa` for
 MiniMax-M3.1 (`MiniMaxM3SparseForConditionalGeneration`, as released in
 `MiniMaxAI/MiniMax-M3.1-Flash`, and `MiniMaxM3TinyForConditionalGeneration`,
-`MiniMaxM3SparseForCausalLM`, `MiniMaxM3TinyForCausalLM`) on SM100 / SM103 with TP4.
+`MiniMaxM3SparseForCausalLM`, `MiniMaxM3TinyForCausalLM`) and for its DSpark draft
+(`DSparkMiniMaxDraftModel`) on SM100 / SM103 with TP4.
 
 Both architectures are compilation targets. Runtime integration checks currently
 cover SM103; SM100 runtime and complete-server performance remain unqualified.
@@ -36,18 +38,28 @@ python -m sglang.launch_server --model-path MiniMax-M3.1-Flash --trust-remote-co
   --speculative-algorithm DSPARK --speculative-draft-model-path MiniMax-M3.1-Flash/dspark \
   --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8 \
   --speculative-dspark-block-size 7 \
-  --monokernel-backend msa
+  --monokernel-backend msa --disable-attn-tp-gather
 ```
 
 Only DSpark/EAGLE chain verify steps of one request with exactly 8 draft tokens
-run the kernels, because the token-parallel MoE kernel has a fixed 8 rows. The
+run the target kernels, because the token-parallel MoE kernel has a fixed 8 rows. The
 embedding and dense layers 0-2 run SGLang's modules. Each MoE layer then runs
 as two persistent launches: MegaAttention, then the token-parallel MoE, each
 with its TP4 all-reduce in its own NVLS workspace. SGLang's final norm and
-logits processor end the step. Prefill, plain decode, batches of more than one
-request, and every draft step take the standard path. A server without
+logits processor end the step. Prefill, plain decode and batches of more than one
+request take the standard path. A server without
 speculative decoding, or with another draft token count, fails at startup and
 lists the reasons.
+
+The DSpark draft's one-request block step (7 rows: the bonus token and six mask
+tokens) runs the draft backbone: the vocab-parallel embedding, the five dense
+layers and the final norm in one cooperative launch per rank, with every TP4 sum
+inside it. SGLang's draft head (lm_head, Markov head, sampling) and its injection
+of the target's hidden states into the draft KV cache are unchanged. The draft
+graphs must hold one request on their own: with an a2a MoE backend (M3.1 NVFP4
+forces `megamoe`), SGLang pads draft rows to a multiple of attention TP, so pass
+`--disable-attn-tp-gather`; without it the draft spec refuses the server at
+startup.
 
 ## Contract
 
@@ -79,6 +91,12 @@ lists the reasons.
   with arbitrary SGLang releases or real-checkpoint accuracy.
 - `--fp8-gemm-runner-backend flashinfer_trtllm` is refused because it
   shuffles MXFP8 weights in place.
+- Draft: the draft config SGLang derives from the checkpoint's `dspark_*` fields
+  (5 sliding-attention layers of window 4096, dense FFN 12288, Gemma norms,
+  `sample_from_anchor` on), MXFP8 linears in checkpoint layout, SGLang's plain
+  BF16 draft KV pool with 128-token pages (not a fused or quantized draft cache),
+  and the target's vocab-parallel embedding without added vocabulary.
+  `SGLANG_DSPARK_EMBED_IN_GRAPH` must stay on: the kernel embeds token ids.
 
 ## Tests
 

@@ -19,6 +19,8 @@ SPECS = {
     "MiniMaxM3TinyForConditionalGeneration": "sglang_msa_mono.minimax_m3.spec:SPEC",
     "MiniMaxM3SparseForCausalLM": "sglang_msa_mono.minimax_m3.spec:SPEC",
     "MiniMaxM3TinyForCausalLM": "sglang_msa_mono.minimax_m3.spec:SPEC",
+    # the DSpark draft that SGLang derives from the M3.1 checkpoints' dspark fields
+    "DSparkMiniMaxDraftModel": "sglang_msa_mono.minimax_m3.draft_spec:SPEC",
 }
 
 

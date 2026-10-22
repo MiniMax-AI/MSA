@@ -103,12 +103,14 @@ def test_dense_layers_without_msa_are_accepted():
     assert reasons == []
 
 
-def test_every_registered_architecture_resolves_to_the_spec():
-    for architecture in sglang_msa_mono.SPECS:
+def test_every_registered_architecture_resolves_to_its_spec():
+    from sglang_msa_mono.minimax_m3.draft_spec import SPEC as DRAFT_SPEC
+
+    for architecture, path in sglang_msa_mono.SPECS.items():
         spec, why = registry.find_spec(
             backend=sglang_msa_mono.BACKEND, architectures=[architecture], isa="sm_100"
         )
-        assert spec is SPEC, why
+        assert spec is (DRAFT_SPEC if path.endswith("draft_spec:SPEC") else SPEC), why
 
 
 def test_other_gpus_are_refused():

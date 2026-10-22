@@ -30,6 +30,7 @@ def _prepare_kernel(
     pages,
     PAGE: tl.constexpr,
     ROWS: tl.constexpr,
+    ROWS_POW2: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     block = tl.program_id(0)
@@ -45,9 +46,10 @@ def _prepare_kernel(
     if block == 0:
         # verify seq_lens exclude the rows being verified
         tl.store(kv_len, (tl.load(seq_lens) + ROWS).to(kv_len.dtype.element_ty))
-        r = tl.arange(0, ROWS)
-        tl.store(positions_out + r, tl.load(positions_in + r).to(tl.int64))
-        tl.store(slots_out + r, tl.load(slots_in + r).to(tl.int64))
+        r = tl.arange(0, ROWS_POW2)
+        rows = r < ROWS
+        tl.store(positions_out + r, tl.load(positions_in + r, rows).to(tl.int64), rows)
+        tl.store(slots_out + r, tl.load(slots_in + r, rows).to(tl.int64), rows)
 
 
 def prepare_step_inputs(
@@ -85,6 +87,7 @@ def prepare_step_inputs(
         pages,
         PAGE=page,
         ROWS=rows,
+        ROWS_POW2=triton.next_power_of_2(rows),
         BLOCK=_BLOCK,
         num_warps=4,
     )

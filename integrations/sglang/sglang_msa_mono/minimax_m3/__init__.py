@@ -1,8 +1,10 @@
-"""MiniMax-M3.1 TP4 verify on MSA-v1 MegaAttention + token-parallel MoE.
+"""MiniMax-M3.1 TP4 verify on MSA-v1 MegaAttention + token-parallel MoE, and its
+DSpark draft on the one-launch draft backbone.
 
-``spec`` holds the SGLang contract, ``weights`` the conversion of SGLang's
-parameters and the checkpoint's routed experts into the kernels' layouts, and
-``runtime`` the routed forward.
+``spec`` holds the target's SGLang contract, ``weights`` the conversion of
+SGLang's parameters and the checkpoint's routed experts into the kernels'
+layouts, and ``runtime`` the routed forward; ``draft_spec`` and
+``draft_runtime`` are the draft's contract and forward.
 """
 
 # Fixed by the kernels (csrc/common/kernel/include/tp4_nvls_layout.hpp,
@@ -27,3 +29,9 @@ O_PROJ_K = LOCAL_Q_HEADS * HEAD_DIM  # 2048
 INDEXER_MAX_PAGES = 8192
 MAX_CONTEXT = INDEXER_MAX_PAGES * PAGE  # 1048576 tokens
 GRID_CTAS = 144  # both persistent grids: Scheduler::kGridCtas and moe kGrid
+# The DSpark draft backbone (inference/high_tps/msa_v1/draft/backbone.py)
+DRAFT_ROWS = 7  # one request's draft block: the bonus token and six mask tokens
+DRAFT_LAYERS = 5
+DRAFT_QKV_ROWS = LOCAL_Q_HEADS * HEAD_DIM + 2 * HEAD_DIM  # 2304: q | k | v
+DRAFT_FFN_INTER = 3072  # this rank's slice of the 12288 dense FFN
+DRAFT_WINDOW = 4096  # keys a row attends, HF sliding_window

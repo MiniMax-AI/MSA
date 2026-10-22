@@ -3,10 +3,12 @@
 [English](README.md)
 
 SGLang monokernel 插件，通过 `inference.high_tps.msa_v1` 调用 MegaAttention 和
-token-parallel MoE。注册 `--monokernel-backend msa`，面向 TP4、SM100/SM103 的
+token-parallel MoE，并通过 `inference.high_tps.msa_v1.draft` 调用 DSpark draft
+backbone。注册 `--monokernel-backend msa`，面向 TP4、SM100/SM103 的
 MiniMax-M3.1：`MiniMaxM3SparseForConditionalGeneration`（发布版
 `MiniMaxAI/MiniMax-M3.1-Flash` 使用此架构）、`MiniMaxM3TinyForConditionalGeneration`、
-`MiniMaxM3SparseForCausalLM`、`MiniMaxM3TinyForCausalLM`。
+`MiniMaxM3SparseForCausalLM`、`MiniMaxM3TinyForCausalLM`，以及其 DSpark draft
+`DSparkMiniMaxDraftModel`。
 
 两种架构均为编译目标。当前集成运行检查覆盖 SM103；SM100 实机运行和完整服务性能
 尚未完成验证。
@@ -34,15 +36,23 @@ python -m sglang.launch_server --model-path MiniMax-M3.1-Flash --trust-remote-co
   --speculative-algorithm DSPARK --speculative-draft-model-path MiniMax-M3.1-Flash/dspark \
   --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 8 \
   --speculative-dspark-block-size 7 \
-  --monokernel-backend msa
+  --monokernel-backend msa --disable-attn-tp-gather
 ```
 
-仅单请求、恰好 8 个 draft token 的 DSpark/EAGLE 链式 verify 调用这些 kernel，
+仅单请求、恰好 8 个 draft token 的 DSpark/EAGLE 链式 verify 调用 target kernel，
 因为 token-parallel MoE 固定为 8 行。embedding 与第 0–2 个 dense 层沿用
 SGLang 模块；随后每个 MoE 层调用 MegaAttention 和 token-parallel MoE 两个
 kernel，各自使用独立 NVLS workspace 完成 TP4 all-reduce，最后沿用 SGLang 的
-final norm 和 logits processor。prefill、普通 decode、多请求 batch 和所有 draft
-步骤走标准路径。没有启用投机解码，或 draft token 数不匹配时，服务启动会列出原因并失败。
+final norm 和 logits processor。prefill、普通 decode 和多请求 batch 走标准路径。
+没有启用投机解码，或 draft token 数不匹配时，服务启动会列出原因并失败。
+
+DSpark draft 的单请求 block 步骤（7 行：bonus token 加 6 个 mask token）调用 draft
+backbone：vocab-parallel embedding、5 个 dense 层和 final norm 在每个 rank 上合为一次
+cooperative launch，全部 TP4 求和都在 kernel 内完成。SGLang 的 draft head（lm_head、
+Markov head、采样）以及把 target hidden states 注入 draft KV cache 的步骤保持不变。
+draft graph 必须只装一个请求：使用 a2a MoE backend 时（M3.1 NVFP4 强制 `megamoe`），
+SGLang 会把 draft 行数补齐到 attention TP 的倍数，因此需要传
+`--disable-attn-tp-gather`；未传时 draft spec 会在启动时拒绝该服务。
 
 ## 契约
 
@@ -68,6 +78,11 @@ final norm 和 logits processor。prefill、普通 decode、多请求 batch 和�
   作为验证版本。其他 monokernel API 会被拒绝。这不代表任意 SGLang 发行版兼容，
   也不代表已通过真实 checkpoint 的准确率验收。
 - 拒绝 `--fp8-gemm-runner-backend flashinfer_trtllm`，因为它会原地重排 MXFP8 权重。
+- Draft：SGLang 从 checkpoint 的 `dspark_*` 字段推导出的 draft 配置（5 个窗口 4096 的
+  sliding attention 层、dense FFN 12288、Gemma norm、开启 `sample_from_anchor`），
+  checkpoint 布局的 MXFP8 linear，SGLang 普通 BF16 draft KV pool 且 page 为 128 tokens
+  （不支持融合或量化的 draft cache），以及不含额外词表的 target vocab-parallel embedding。
+  `SGLANG_DSPARK_EMBED_IN_GRAPH` 必须保持开启：kernel 内部完成 token id 的 embedding。
 
 ## 测试
 
