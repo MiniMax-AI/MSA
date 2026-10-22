@@ -28,8 +28,8 @@ def test_real_case_cuda_graph_replay(case, num_kv_heads: int) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) not in {(10, 0), (10, 3)}:
-        pytest.skip("Q8KV4 prefill attention requires SM100 or SM103")
+    if torch.cuda.get_device_capability(device) not in {(10, 0), (10, 3), (10, 7)}:
+        pytest.skip("Q8KV4 prefill attention requires SM100, SM103 or SM107")
 
     inputs = make_real_prefill_attention_inputs(
         case, device=device, num_kv_heads=num_kv_heads
@@ -78,10 +78,12 @@ def test_real_case_cuda_graph_replay(case, num_kv_heads: int) -> None:
             return_lse=True,
         )
 
-    state = wrapper._plan_state
-    assert state is not None
-    state.o_partial.fill_(-777)
-    state.lse_partial.fill_(float("nan"))
+    assert wrapper._plan_state is not None
+    o_partial, lse_partial, _ = wrapper._workspace.split_buffers(
+        case.total_q, num_kv_heads * 16
+    )
+    o_partial.fill_(-777)
+    lse_partial.fill_(float("nan"))
     out.fill_(-777)
     lse.fill_(float("nan"))
     graph.replay()

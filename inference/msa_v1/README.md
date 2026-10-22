@@ -32,7 +32,7 @@ Available formats and constraints:
   CUDA 13.5 or newer.
 - Q8KV8 prefill attention supports GQA group sizes 1, 2, 4, 8, and 16.
 
-BF16/Q8KV8 prefill attention also retains SM107 Rubin paths selected by the actual device architecture.
+BF16/Q8KV8/Q8KV4 prefill attention also retains SM107 Rubin paths selected by the actual device architecture.
 
 See the README in each operator directory for exact tensor shapes, dtypes, and usage examples.
 

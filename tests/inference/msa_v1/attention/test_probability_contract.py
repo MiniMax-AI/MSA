@@ -392,6 +392,7 @@ def _verify_cpp(root, scores, maxima, scales, reference, reference_p):
             "-Xcompiler=-fPIC",
             "--expt-relaxed-constexpr",
             "-DMINIMAX_MSA_Q8KV4_HAS_QMUL4=1",
+            "-DMINIMAX_MSA_PREFILL_Q8KV4_SM107=0",
             "-I" + str(repo / "third_party/cutlass/include"),
             "-I" + str(prefill),
             "-I" + str(decode / "collective"),

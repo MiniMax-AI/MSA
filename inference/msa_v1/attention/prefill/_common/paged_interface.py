@@ -326,10 +326,8 @@ class _BatchPrefillWithPagedKVCacheWrapperBase:
             state.lse_partial,
             out_tensor,
             lse_tensor if return_lse or lse is not None else None,
-            cu_seqlens=state.metadata.cu_seqlens_q,
             split_counts=schedule.split_counts,
             use_pdl=True,
-            raw_partial_stats=False,
         )
         if return_lse:
             return out_tensor, lse_tensor

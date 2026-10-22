@@ -112,12 +112,12 @@ python -c 'import cutlass; print(cutlass.__version__, cutlass.CUDA_VERSION)'
 ```
 
 Q8KV4 C++ 算子使用标准的 `CUDA_HOME`、`CUTLASS_ROOT` 和 `TORCH_EXTENSIONS_DIR`
-配置。运行时 JIT 始终根据输入 tensor 所在的 CUDA device 选择 `sm_100a` 或
-`sm_103a`；无 tensor 的 AOT/离线构建使用 `MM_SPARSE_TARGET_ARCH=100a|103a` 指定
-目标（默认 `103a`）。`TORCH_CUDA_ARCH_LIST` 只由内部编译流程设置，不作为运行时
+配置。运行时 JIT 始终根据输入 tensor 所在的 CUDA device 选择 `sm_100a`、
+`sm_103a` 或 `sm_107a`（支持 SM107 的算子）；无 tensor 的 AOT/离线构建使用
+`MM_SPARSE_TARGET_ARCH=100a|103a|107a` 指定目标（默认 `103a`）。`TORCH_CUDA_ARCH_LIST` 只由内部编译流程设置，不作为运行时
 架构选择接口。Q8KV4 Decode Attention、Decode Indexer 和共享 dequant 支持 CUDA
 Toolkit 12.9 或更高版本；工具链支持 QMUL4 时使用该路径，否则自动使用精确
-fallback。Q8KV4 Prefill Attention 要求 CUDA Toolkit 13.4 或更高版本。
+fallback。Q8KV4 Prefill Attention 要求 CUDA Toolkit 13.4 或更高版本（SM107 上要求 13.5 或更高版本）。
 
 BF16 和 Q8KV8 sparse decode 通过可选的外部 FlashInfer TRTLLM-GEN backend 提供。本仓库不包含
 FlashInfer 源码或 cubin；使用 `python -m pip install -e '.[flashinfer]'` 安装
@@ -125,7 +125,7 @@ FlashInfer 源码或 cubin；使用 `python -m pip install -e '.[flashinfer]'` �
 均支持 B200/B300 上的 GQA=8/16 和 BF16 输出，按实际 `Hq/Hkv` 选择实现。
 Q8KV4 decode 另保留 SM107 的 GQA=16 支持，需要 CUDA Toolkit 13.5 或更新版本。
 
-Rubin（SM107）保留 BF16/Q8KV8 prefill attention、Q8KV8 prefill indexer 和 Q8KV4 decode attention 路径，
+Rubin（SM107）保留 BF16/Q8KV8/Q8KV4 prefill attention、Q8KV8 prefill indexer 和 Q8KV4 decode attention 路径，
 通过输入 tensor 所在设备自动选择；具体依赖和限制见各算子 README。其余算子不据此声明 Rubin 支持。
 
 ## 3. 主要接口
