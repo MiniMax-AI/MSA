@@ -58,17 +58,6 @@ links for shape, scale, paging, and CUDA Graph contracts.
 All varlen interfaces use real length metadata. Valid TopK entries retain sparse,
 unordered semantics, with the local block in the last valid position.
 
-### 1.4 High-TPS and draft
-
-| Capability | Entry point | Supported scope |
-| --- | --- | --- |
-| TP4 MegaAttention and MegaMoE | [high_tps](inference/high_tps/msa_v1/README.md) | MegaAttention Q=1–8; MegaMoE Q=8; single-node TP4 |
-| DSpark draft backbone | [draft](inference/high_tps/msa_v1/draft/README.md) | TP4, one request with 7 rows, embedding + 5 decoder layers + final norm; draft head excluded |
-| Optional SGLang plugin | [sglang-msa-mono](integrations/sglang/README.md) | TP4, single-request Q8 verification; the pinned external dependency is not currently publicly accessible |
-
-high_tps and draft target SM100/SM103; see each operator's documented runtime coverage.
-Existing draft runtime validation covers SM103; SM100 is compile-checked only. SM107 is not supported.
-
 ## 2. Requirements and installation
 
 | GPU | Architecture | Status |

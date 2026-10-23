@@ -340,7 +340,6 @@ Do not track these artifacts. Local `design.md`, `optimization.md`, and
 `results.md` and optimization-process documents are also untracked. If already
 tracked, remove them from the index while keeping local copies and ignore them.
 
-## Existing Rubin path and optional SGLang integration
+## Existing Rubin path
 
 - Preserve the existing SM107 FP16 softmax implementation and switches. This exception does not authorize additional low-precision arithmetic.
-- Keep `integrations/sglang` optional and document its currently inaccessible pinned dependency; do not promise publicly reproducible server deployment.
