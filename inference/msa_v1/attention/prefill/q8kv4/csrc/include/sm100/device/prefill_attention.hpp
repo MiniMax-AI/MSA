@@ -22,7 +22,14 @@ struct PrefillArguments {
   int32_t const *scheduler_metadata_ptr = nullptr;
   int32_t const *work_count_ptr = nullptr;
   cutlass::bfloat16_t *o_partial_ptr = nullptr;
+  // Elements between consecutive split slabs of o_partial: total_q * num_q_heads * 128 for a
+  // contiguous buffer, more when the slabs are padded (locality-domain striping).
+  int64_t o_partial_split_stride = 0;
   float *lse_partial_ptr = nullptr;
+  // Optional int32 counters the combine claims its tiles from; this kernel zeroes them for the
+  // combine that follows it in the stream (the previous combine has completed when it starts).
+  int32_t *combine_tile_counters_ptr = nullptr;
+  int combine_tile_counter_count = 0;
 
   int total_q = 0;
   int num_q_heads = 0;

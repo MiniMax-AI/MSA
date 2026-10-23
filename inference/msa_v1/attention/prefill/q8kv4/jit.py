@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 import jinja2
@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 from inference.msa_v1._build_utils import cuda_home as _cuda_home
 from inference.msa_v1._build_utils import cutlass_root as _cutlass_root
 from inference.msa_v1._build_utils import require_cuda_version
+from inference.msa_v1._build_utils import supports_qmul4 as _probe_supports_qmul4
 from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
-from inference.msa_v1._build_utils import torch_cuda_arch as _resolve_torch_arch
 
 
 _ROOT = Path(__file__).resolve().parent
@@ -28,23 +28,44 @@ _CSRC = _ROOT / "csrc"
 _API = _CSRC / "api"
 _INCLUDE = _CSRC / "include"
 _TEMPLATES = _CSRC / "templates"
+_SUPPORTED_ARCHES = ("100a", "103a", "107a")
+_QMUL4_DEQUANT = "qmul4"
+_FP16_DEQUANT = "fp16_fallback"
 
 
 @lru_cache(maxsize=1)
 def _cuda_version() -> tuple[int, int]:
     return require_cuda_version(
         (13, 4),
-        component="Q8KV4 prefill attention with QMUL4",
+        component="Q8KV4 prefill attention",
     )
 
 
 @lru_cache(maxsize=None)
 def _target_arch(device=None) -> str:
-    return _resolve_target_arch(device, component="Q8KV4 prefill attention")
+    arch = _resolve_target_arch(
+        device,
+        component="Q8KV4 prefill attention",
+        supported_arches=_SUPPORTED_ARCHES,
+    )
+    if arch == "107a" and _cuda_version() < (13, 5):
+        raise RuntimeError(
+            "Q8KV4 prefill attention on SM107 requires CUDA 13.5 or newer"
+        )
+    return arch
 
 
-def _torch_arch(arch: str) -> str:
-    return _resolve_torch_arch(arch, component="Q8KV4 prefill attention")
+@cache
+def _supports_qmul4(arch: str) -> bool:
+    """Return whether the selected NVCC accepts the public QMUL4 PTX form."""
+
+    return _probe_supports_qmul4(arch, probe_root=_cache_root() / "capability_probes")
+
+
+@cache
+def _dequant_mode(arch: str) -> str:
+    # SM107 has no QMUL4; the kernel then dequantizes with exact packed FP16 math.
+    return _QMUL4_DEQUANT if _supports_qmul4(arch) else _FP16_DEQUANT
 
 
 @lru_cache(maxsize=1)
@@ -90,21 +111,23 @@ class JitSpec:
     """The single compile-time configuration supported by this op."""
 
     target_arch: str
+    dequant_mode: str
     variant_name: str = "prefill_attention_q8kv4"
     q_heads_per_kv: int = 16
     head_dim: int = 128
     page_size: int = 128
     topk: int = 16
-    q_stages: int = 3
+    q_stages: int = 8
     score_stages: int = 2
 
     @property
     def uri(self) -> str:
-        return f"{self.variant_name}_{self.target_arch}_{_source_digest()}"
+        return (
+            f"{self.variant_name}_{self.dequant_mode}_{self.target_arch}_"
+            f"{_source_digest()}"
+        )
 
     def build_and_load(self):
-        import torch
-
         cache_dir = _cache_root() / self.uri
         cache_dir.mkdir(parents=True, exist_ok=True)
         template = jinja2.Template(
@@ -127,6 +150,7 @@ class JitSpec:
         sources = [
             _API / "prefill_attention_api.cpp",
             _API / "prefill_attention_binding.cpp",
+            _API / "locality_domains.cu",
             generated_source,
         ]
         include_paths = [
@@ -137,9 +161,7 @@ class JitSpec:
         ]
         started_at = time.time()
         previous_cuda_home = cpp_extension.CUDA_HOME
-        previous_arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST")
         cpp_extension.CUDA_HOME = str(_cuda_home())
-        os.environ["TORCH_CUDA_ARCH_LIST"] = _torch_arch(self.target_arch)
         try:
             extension = cpp_extension.load(
                 name=module_name,
@@ -155,6 +177,17 @@ class JitSpec:
                     "--expt-extended-lambda",
                     "-static-global-template-stub=false",
                     "-Xptxas=-O3",
+                    # An explicit gencode keeps torch from adding its own arch list,
+                    # which does not know SM107.
+                    f"-gencode=arch=compute_{self.target_arch},"
+                    f"code=sm_{self.target_arch}",
+                    "-DMINIMAX_MSA_Q8KV4_HAS_QMUL4="
+                    f"{int(self.dequant_mode == _QMUL4_DEQUANT)}",
+                    # Seen by the host and device passes alike (the cute arch macros are
+                    # device-only), so the kernel instantiation the host registers is the
+                    # one the cubin holds.
+                    "-DMINIMAX_MSA_PREFILL_Q8KV4_SM107="
+                    f"{int(self.target_arch == '107a')}",
                     "-DCUTLASS_ENABLE_GDC_FOR_SM100",
                 ],
                 extra_ldflags=[
@@ -167,10 +200,6 @@ class JitSpec:
             )
         finally:
             cpp_extension.CUDA_HOME = previous_cuda_home
-            if previous_arch_list is None:
-                os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
-            else:
-                os.environ["TORCH_CUDA_ARCH_LIST"] = previous_arch_list
         logger.info(
             "Compiled inference.msa_v1.attention.prefill.q8kv4 in %.1fs",
             time.time() - started_at,
@@ -181,12 +210,13 @@ class JitSpec:
 def gen_jit_spec(device=None) -> JitSpec:
     """Return the only production compile-time configuration."""
 
-    return JitSpec(target_arch=_target_arch(device))
+    arch = _target_arch(device)
+    return JitSpec(target_arch=arch, dequant_mode=_dequant_mode(arch))
 
 
 @lru_cache(maxsize=None)
 def _load_extension_for_arch(arch: str):
-    return JitSpec(target_arch=arch).build_and_load()
+    return JitSpec(target_arch=arch, dequant_mode=_dequant_mode(arch)).build_and_load()
 
 
 def load_extension(device=None):

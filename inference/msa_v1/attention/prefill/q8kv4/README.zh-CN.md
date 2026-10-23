@@ -4,7 +4,7 @@
 
 ## 功能
 
-面向 SM100/SM103 的 paged sparse causal prefill attention。Q 使用 E4M3，K/V 使用
+面向 SM100/SM103/SM107 的 paged sparse causal prefill attention。Q 使用 E4M3，K/V 使用
 packed E2M1 和 E4M3 scale，输出为 BF16，并支持 varlen chunk prefill。
 
 Attention 概率按 `E4M3(P × 448)` 量化，并在归一化时补偿该缩放；返回的 LSE
@@ -15,6 +15,7 @@ Attention 概率按 `E4M3(P × 448)` 量化，并在归一化时补偿该缩放�
 ```python
 from inference.msa_v1.attention.prefill.q8kv4 import (
     BatchPrefillWithPagedKVCacheWrapper,
+    PrefillWorkspace,
 )
 
 wrapper = BatchPrefillWithPagedKVCacheWrapper()
@@ -38,6 +39,27 @@ out, lse = wrapper.run(
 
 调用方可以向 `run()` 传入预分配的 `out` 和 `lse`。
 
+### Split workspace
+
+forward 为每个 (query, head, 选中页) 写出一份 partial output 和 LSE，由 combine 合并。
+`PrefillWorkspace` 持有这些 buffer。wrapper 默认在 `plan()` 中创建自己的 workspace；在同一
+stream 上顺序执行的多个 wrapper 可以共享构造时传入的同一个 workspace，`partial_bytes` 可按
+最大 batch 预留：
+
+```python
+workspace = PrefillWorkspace(device)
+workspace = PrefillWorkspace(
+    device, partial_bytes=workspace.required_bytes(max_total_q, num_q_heads)
+)
+wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace)
+```
+
+在具有多个 memory locality domain 的 GPU（Rubin uGPU、Blackwell）上，workspace 将 partial
+buffer 按 domain 条带化，combine 的每个 tile 都从其所在 SM 的 domain 读取；结果与 interleaved
+内存完全一致。batch 超出已条带化的 buffer 时会先同步设备再替换，因此应在 CUDA Graph capture
+前按最大 batch 预留。`MM_SPARSE_PREFILL_Q8KV4_LOCALITY_DOMAINS=0` 保持 interleaved 布局
+（用于对比）。同一个 workspace 不得同时用于两个 stream。
+
 ## 数据契约
 
 - `q`：`[total_q, Hq, 128]`，E4M3；`Hq = 16 * Hkv`。
@@ -55,7 +77,8 @@ out, lse = wrapper.run(
 - head 数由 TopK 的首维确定，支持 64/4 和 16/1 本地 query/KV heads，无需复制 heads。
 - `cu_seqlens_k` 是 KV 长度的唯一来源。
 - `plan()` 必须在 CUDA Graph capture 外调用；capture 时应预分配 `out` 和 `lse`。
-- NVFP4 dequant 要求 CUDA Toolkit 13.4 或更高版本。
+- 要求 CUDA Toolkit 13.4 或更高版本；SM107 要求 13.5 或更高版本。NVFP4 dequant 在工具链
+  支持时使用 QMUL4，否则（SM107）使用精确的 packed-FP16 路径。
 
 ## Cache 布局
 

@@ -14,6 +14,8 @@ from inference.msa_v1.attention.prefill._common.prepare_k2q_csr import (
 )
 from inference.msa_v1.attention.prefill.q8kv4 import (
     BatchPrefillWithPagedKVCacheWrapper,
+    PrefillWorkspace,
+    interface,
     jit,
 )
 
@@ -63,8 +65,11 @@ def _plan_single_page(
     )
 
 
-def test_public_package_exports_only_wrapper() -> None:
-    assert q8kv4_package.__all__ == ["BatchPrefillWithPagedKVCacheWrapper"]
+def test_public_package_exports_wrapper_and_workspace() -> None:
+    assert q8kv4_package.__all__ == [
+        "BatchPrefillWithPagedKVCacheWrapper",
+        "PrefillWorkspace",
+    ]
 
 
 def test_prepare_does_not_retain_layout_or_workspace_caches() -> None:
@@ -201,6 +206,7 @@ def test_jit_spec_contains_only_compile_time_configuration() -> None:
 
     assert tuple(spec.__dataclass_fields__) == (
         "target_arch",
+        "dequant_mode",
         "variant_name",
         "q_heads_per_kv",
         "head_dim",
@@ -210,6 +216,7 @@ def test_jit_spec_contains_only_compile_time_configuration() -> None:
         "score_stages",
     )
     assert spec.variant_name == "prefill_attention_q8kv4"
+    assert spec.dequant_mode in {"qmul4", "fp16_fallback"}
     assert spec.topk == 16
 
 
@@ -258,3 +265,104 @@ def test_lazy_jit_uses_tensor_device_over_offline_target(
         assert jit._target_arch(device) == "103a"
     finally:
         jit._target_arch.cache_clear()
+
+
+def _run_single_page(workspace: PrefillWorkspace | None, num_kv_heads, batch, length):
+    topk, cu_seqlens, page_table, q, packed_k, packed_v, scale = _make_single_page_inputs(
+        num_kv_heads, batch, length
+    )
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace=workspace)
+    _plan_single_page(wrapper, topk, cu_seqlens, page_table)
+    out, lse = wrapper.run(
+        q, (packed_k, packed_v), kv_cache_sf=(scale, scale), return_lse=True
+    )
+    torch.cuda.synchronize()
+    # Zero K scores: every output row averages the ones in V and the LSE of query ``i`` of a
+    # request is ln(i + 1), the number of keys its causal window sees.
+    torch.testing.assert_close(out, torch.ones_like(out), atol=0, rtol=0)
+    expected_lse = torch.log(
+        torch.arange(1, length + 1, dtype=torch.float32, device=lse.device)
+    ).repeat(batch)[:, None].expand_as(lse)
+    torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+    return wrapper
+
+
+def test_workspace_serves_batches_in_turn() -> None:
+    """One split workspace carries batches of growing and then smaller size through separate
+    wrappers without growing past the largest, and its partial slabs follow the device's
+    locality-domain stripe."""
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    workspace = PrefillWorkspace(device)
+    sizes = []
+    for num_kv_heads, batch, length in ((1, 1, 1), (4, 1, 8), (4, 2, 3), (1, 2, 3)):
+        _run_single_page(workspace, num_kv_heads, batch, length)
+        sizes.append(workspace._partials.numel())
+    assert sizes[1] >= sizes[0] and sizes[2] == sizes[1] and sizes[3] == sizes[1]
+    o_partial, lse_partial, locality = workspace.split_buffers(333, 64)
+    assert tuple(o_partial.shape) == (16, 333, 64, 128)
+    assert tuple(lse_partial.shape) == (16, 333, 64)
+    assert o_partial.stride()[1:] == (64 * 128, 128, 1)
+    assert workspace.required_bytes(333, 64) == 16 * o_partial.stride(0) * 2
+    if workspace.num_domains > 1:
+        assert locality is not None and locality.num_domains == workspace.num_domains
+        assert (o_partial.stride(0) * 2) % (locality.num_domains * locality.page_bytes) == 0
+        assert locality.tile_counters.numel() == locality.num_domains
+    else:
+        assert locality is None and o_partial.is_contiguous()
+    with pytest.raises(ValueError, match="CUDA device"):
+        PrefillWorkspace("cpu")
+
+
+def test_workspace_locality_can_be_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(interface.LOCALITY_DOMAINS_ENV, "0")
+    workspace = PrefillWorkspace(torch.device("cuda"))
+    assert workspace.num_domains == 1
+    o_partial, _, locality = workspace.split_buffers(5, 64)
+    assert locality is None and o_partial.is_contiguous()
+    _run_single_page(workspace, 4, 1, 1)
+    monkeypatch.setenv(interface.LOCALITY_DOMAINS_ENV, "maybe")
+    with pytest.raises(ValueError, match="must be 0 or 1"):
+        PrefillWorkspace(torch.device("cuda"))
+
+
+def test_workspace_falls_back_when_localized_memory_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A device that counts locality domains but cannot place memory in them keeps the
+    interleaved workspace, and the batch still runs."""
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    workspace = PrefillWorkspace(device)
+    if workspace.num_domains == 1:
+        pytest.skip("device exposes one locality domain")
+    extension = jit.load_extension(device)
+
+    def refuse(nbytes, index):
+        raise RuntimeError("localized memory refused for the test")
+
+    monkeypatch.setattr(extension, "alloc_locality_striped", refuse)
+    o_partial, _, locality = workspace.split_buffers(333, 64)
+    assert locality is None and workspace.num_domains == 1 and o_partial.is_contiguous()
+    _run_single_page(workspace, 4, 1, 8)
+
+
+def test_workspace_is_released_with_its_owner() -> None:
+    """The partial buffer of a dropped wrapper returns to the device."""
+
+    import gc
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    reserve = 512 << 20
+    torch.cuda.synchronize()
+    free_before, _ = torch.cuda.mem_get_info(device)
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(
+        PrefillWorkspace(device, partial_bytes=reserve)
+    )
+    free_reserved, _ = torch.cuda.mem_get_info(device)
+    assert free_before - free_reserved >= reserve // 2
+    del wrapper
+    gc.collect()
+    torch.cuda.empty_cache()
+    free_after, _ = torch.cuda.mem_get_info(device)
+    assert free_after - free_reserved >= reserve // 2

@@ -5,6 +5,12 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/float8.h"
 
+// Defined by the JIT for the host and device passes alike (the cute arch macros are device-only),
+// so the kernel instantiation the host registers is the one the cubin holds.
+#if !defined(MINIMAX_MSA_PREFILL_Q8KV4_SM107)
+#error "The Q8KV4 prefill JIT must define MINIMAX_MSA_PREFILL_Q8KV4_SM107"
+#endif
+
 namespace minimax::msa_v1::attention::prefill::q8kv4::detail {
 
 using Element = cutlass::float_e4m3_t;
@@ -14,15 +20,15 @@ inline constexpr int kQHeadsPerKv = 16;
 inline constexpr int kHeadDim = 128;
 inline constexpr int kPageSize = 128;
 inline constexpr int kQueriesPerGroup = 128 / kQHeadsPerKv;
-inline constexpr int kQStages = 3;
+inline constexpr int kQStages = 8;
 inline constexpr int kScoreStages = 2;
-inline constexpr int kQMetadataStages = 16;
+inline constexpr int kQMetadataStages = 32;
 
 inline constexpr int kTmemScoreOffset = 0;
 inline constexpr int kTmemScoreStride = 128;
-inline constexpr int kTmemProbabilityOffset = 96;
 inline constexpr int kTmemOutputOffset = 256;
 inline constexpr int kTmemOutputStride = 128;
+inline constexpr int kTmemProbabilityOffset = 96;
 inline constexpr int kTmemColumns = 512;
 
 inline constexpr int kPackedKvBytes = kPageSize * kHeadDim / 2;
@@ -102,7 +108,6 @@ inline constexpr int kOtherRegisters = 64;
 static_assert(kSoftmax0Registers + kSoftmax1Registers + kEpilogueRegisters + kOtherRegisters <=
               512);
 
-inline constexpr int kEpilogueBarrierId = 4;
 inline constexpr int kKvDequantKBarrierId = 6;
 inline constexpr int kKvDequantVBarrierId = 7;
 inline constexpr int kTmemBarrierId = 0;

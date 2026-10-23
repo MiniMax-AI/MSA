@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "cute/arch/copy_sm100.hpp"
@@ -37,49 +38,40 @@ CUTLASS_DEVICE int real_col_to_stg128_half_fake_col(int col) {
   return tile * 32 + lane * 8 + group * 2 + element;
 }
 
+// Pure functions of their operands: plain (non-volatile) asm lets ptxas schedule the exp loop's
+// independent chains across each other instead of in program order.
 CUTLASS_DEVICE float rcp_approx_ftz(float value) {
   float result;
-  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+  asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
   return result;
 }
 
 CUTLASS_DEVICE float exp2_approx_ftz(float value) {
   float result;
-  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
   return result;
 }
 
 CUTLASS_DEVICE float log2_approx_ftz(float value) {
   float result;
-  asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+  asm("lg2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
   return result;
 }
 
 CUTLASS_DEVICE float2 add_packed_f32x2(float2 lhs, float2 rhs) {
   float2 result;
-  asm volatile("add.rn.ftz.f32x2 %0, %1, %2;"
-               : "=l"(reinterpret_cast<uint64_t &>(result))
-               : "l"(reinterpret_cast<uint64_t const &>(lhs)),
-                 "l"(reinterpret_cast<uint64_t const &>(rhs)));
-  return result;
-}
-
-CUTLASS_DEVICE float2 mul_packed_f32x2(float2 lhs, float2 rhs) {
-  float2 result;
-  asm volatile("mul.rn.ftz.f32x2 %0, %1, %2;"
-               : "=l"(reinterpret_cast<uint64_t &>(result))
-               : "l"(reinterpret_cast<uint64_t const &>(lhs)),
-                 "l"(reinterpret_cast<uint64_t const &>(rhs)));
+  asm("add.rn.ftz.f32x2 %0, %1, %2;"
+      : "=l"(reinterpret_cast<uint64_t &>(result))
+      : "l"(reinterpret_cast<uint64_t const &>(lhs)), "l"(reinterpret_cast<uint64_t const &>(rhs)));
   return result;
 }
 
 CUTLASS_DEVICE float2 fma_packed_f32x2(float2 lhs, float2 rhs, float2 addend) {
   float2 result;
-  asm volatile("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-               : "=l"(reinterpret_cast<uint64_t &>(result))
-               : "l"(reinterpret_cast<uint64_t const &>(lhs)),
-                 "l"(reinterpret_cast<uint64_t const &>(rhs)),
-                 "l"(reinterpret_cast<uint64_t const &>(addend)));
+  asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+      : "=l"(reinterpret_cast<uint64_t &>(result))
+      : "l"(reinterpret_cast<uint64_t const &>(lhs)), "l"(reinterpret_cast<uint64_t const &>(rhs)),
+        "l"(reinterpret_cast<uint64_t const &>(addend)));
   return result;
 }
 
@@ -106,32 +98,6 @@ template <class Tensor> CUTLASS_DEVICE auto make_16x256b_tensor_mn_view(Tensor t
                       get<0, 2>(stride(converted_col_major)), get<2>(stride(converted_col_major))),
           get<3>(stride(converted_col_major))));
   return make_tensor(tensor.data(), composition(converted_sm90, converted_mn));
-}
-
-CUTLASS_DEVICE void store_bf16x8_cs(cutlass::bfloat16_t *destination, float value0, float value1,
-                                    float value2, float value3, float value4, float value5,
-                                    float value6, float value7) {
-  asm volatile("{\n"
-               ".reg .b16 h0, h1, h2, h3, h4, h5, h6, h7;\n"
-               ".reg .b32 p0, p1, p2, p3;\n"
-               "cvt.rn.bf16.f32 h0, %1;\n"
-               "cvt.rn.bf16.f32 h1, %2;\n"
-               "cvt.rn.bf16.f32 h2, %3;\n"
-               "cvt.rn.bf16.f32 h3, %4;\n"
-               "cvt.rn.bf16.f32 h4, %5;\n"
-               "cvt.rn.bf16.f32 h5, %6;\n"
-               "cvt.rn.bf16.f32 h6, %7;\n"
-               "cvt.rn.bf16.f32 h7, %8;\n"
-               "mov.b32 p0, {h0, h1};\n"
-               "mov.b32 p1, {h2, h3};\n"
-               "mov.b32 p2, {h4, h5};\n"
-               "mov.b32 p3, {h6, h7};\n"
-               "st.global.cs.v4.b32 [%0], {p0, p1, p2, p3};\n"
-               "}\n"
-               :
-               : "l"(destination), "f"(value0), "f"(value1), "f"(value2), "f"(value3), "f"(value4),
-                 "f"(value5), "f"(value6), "f"(value7)
-               : "memory");
 }
 
 template <int Offset, class Tensor, size_t... Indices>
@@ -180,16 +146,29 @@ CUTLASS_DEVICE void softmax_to_tmem(TiledMmaQK tiled_mma_qk, uint32_t score_addr
   float maximum1 = -INFINITY;
   float maximum2 = -INFINITY;
   float maximum3 = -INFINITY;
-  CUTLASS_PRAGMA_UNROLL
-  for (int col = 0; col < 128; col += 8) {
+  // Only the query's own page is partially visible; history pages (the common case) are read in
+  // full, so the per-element select is skipped when every row of the warp sees all 128 keys. The
+  // test is warp-uniform by construction (all lanes vote), so both paths are warp-uniform.
+  if (__all_sync(0xffffffffu, visible_cols >= 128)) {
     CUTLASS_PRAGMA_UNROLL
-    for (int value = 0; value < 8; ++value) {
-      rS(col + value) = col + value < visible_cols ? rS(col + value) : -INFINITY;
+    for (int col = 0; col < 128; col += 8) {
+      maximum0 = fmaxf(maximum0, fmaxf(rS(col), rS(col + 1)));
+      maximum1 = fmaxf(maximum1, fmaxf(rS(col + 2), rS(col + 3)));
+      maximum2 = fmaxf(maximum2, fmaxf(rS(col + 4), rS(col + 5)));
+      maximum3 = fmaxf(maximum3, fmaxf(rS(col + 6), rS(col + 7)));
     }
-    maximum0 = fmaxf(maximum0, fmaxf(rS(col), rS(col + 1)));
-    maximum1 = fmaxf(maximum1, fmaxf(rS(col + 2), rS(col + 3)));
-    maximum2 = fmaxf(maximum2, fmaxf(rS(col + 4), rS(col + 5)));
-    maximum3 = fmaxf(maximum3, fmaxf(rS(col + 6), rS(col + 7)));
+  } else {
+    CUTLASS_PRAGMA_UNROLL
+    for (int col = 0; col < 128; col += 8) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int value = 0; value < 8; ++value) {
+        rS(col + value) = col + value < visible_cols ? rS(col + value) : -INFINITY;
+      }
+      maximum0 = fmaxf(maximum0, fmaxf(rS(col), rS(col + 1)));
+      maximum1 = fmaxf(maximum1, fmaxf(rS(col + 2), rS(col + 3)));
+      maximum2 = fmaxf(maximum2, fmaxf(rS(col + 4), rS(col + 5)));
+      maximum3 = fmaxf(maximum3, fmaxf(rS(col + 6), rS(col + 7)));
+    }
   }
   float const maximum = fmaxf(fmaxf(maximum0, maximum1), fmaxf(maximum2, maximum3));
 
@@ -272,19 +251,16 @@ CUTLASS_DEVICE void softmax_to_tmem(TiledMmaQK tiled_mma_qk, uint32_t score_addr
   row_max = maximum;
 }
 
+// Thread-level views of one 64-column half of the O accumulator: the tiled TMEM copy, its source
+// partition and the matching coordinate partition.
 template <int ColumnPass, class TiledMmaPV, class OutputTensor, class CoordinateTensor>
-CUTLASS_DEVICE void
-store_partial_output_pass(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor cO,
-                          cutlass::bfloat16_t *o_partial_ptr, int total_q, int num_q_heads,
-                          int head_kv, int q_count, int q_batch_offset, int group, int group_thread,
-                          int output_token_base, int output_qsplit0, int output_qsplit1,
-                          float const *row_sum) {
+CUTLASS_DEVICE auto partial_output_pass_views(TiledMmaPV tiled_mma_pv, OutputTensor tO,
+                                              CoordinateTensor cO, int group_thread) {
+  constexpr int kColumnPassSize = 64;
   auto thr_mma = tiled_mma_pv.get_slice(0);
   Tensor tOcO = thr_mma.partition_C(cO);
-  constexpr int kColumnPassSize = 64;
   Tensor tOcOPass =
       logical_divide(tOcO, make_layout(make_shape(Int<128>{}, Int<kColumnPassSize>{})));
-
   Tensor tOPass = tO;
   tOPass.data() = tO.data() + ColumnPass * kColumnPassSize;
   Tensor tOPassDivided =
@@ -294,73 +270,65 @@ store_partial_output_pass(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTe
   auto thread_tmem_load = tiled_tmem_load.get_slice(group_thread);
   Tensor tTMEMtOAll = thread_tmem_load.partition_S(tOPassDivided(make_coord(_, _), _));
   Tensor tTMEMcOAll = thread_tmem_load.partition_D(tOcOPass(make_coord(_, _), _));
-  Tensor tTMEMtOPass = tTMEMtOAll(_, _, _, _0{});
-  Tensor tTMEMcOPass = tTMEMcOAll(_, _, _, _0{});
-  Tensor rOPass = make_tensor<Accumulator>(shape(tTMEMcOPass));
-  copy(tiled_tmem_load, tTMEMtOPass, rOPass);
-  cutlass::arch::fence_view_async_tmem_load();
+  return cute::make_tuple(tiled_tmem_load, tTMEMtOAll(_, _, _, _0{}), tTMEMcOAll(_, _, _, _0{}));
+}
 
+// Per-thread view of the O accumulator: the 16dp256b TMEM load gives each thread, per 64-column
+// pass, two "row indices" x four 8-value chunks that cover four accumulator rows (A, A+8, A+16,
+// A+24 for A = 32 * warp + lane / 4) x two column offsets (c, c+32). A row is one (token, head)
+// of the group, so its output pointer, scale and validity are computed once per group and reused
+// by the four 16-byte chunks the thread stores for it (two per pass). Plain C++ arithmetic keeps
+// the compiler free to interleave the rows and column groups; the rounding (rcp.approx, fp32
+// multiply, round-to-nearest bf16) is unchanged.
+struct PartialRowState {
+  cutlass::bfloat16_t *ptr;
+  float scale;
+  bool valid;
+};
+
+template <int ColumnPass, class RegTensor, class CoordinateTensor>
+CUTLASS_DEVICE void store_partial_output_pass(RegTensor const &rOPass,
+                                              CoordinateTensor const &tTMEMcOPass,
+                                              PartialRowState const (&rows)[2][2]) {
+  constexpr int kColumnPassSize = 64;
   Tensor rOMnFull = make_16x256b_tensor_mn_view(rOPass);
   Tensor cOMnFull = make_16x256b_tensor_mn_view(tTMEMcOPass);
   Tensor rOMn = rOMnFull(_, _, _0{});
   Tensor cOMn = cOMnFull(_, _, _0{});
-  static_assert(rank(rOMn) == 2);
-  static_assert(size<0>(rOMn) == 2);
-  static_assert(size<1>(rOMn) == 32);
-  static_assert(rank(cOMn) == 2);
-  static_assert(size<0>(cOMn) == 2);
-  static_assert(size<1>(cOMn) == 32);
+  static_assert(rank(rOMn) == 2 && size<0>(rOMn) == 2 && size<1>(rOMn) == 32);
 
   CUTLASS_PRAGMA_UNROLL
-  for (int row_index = 0; row_index < size<0>(rOMn); ++row_index) {
+  for (int row_index = 0; row_index < 2; ++row_index) {
     CUTLASS_PRAGMA_UNROLL
-    for (int column_group = 0; column_group < size<1>(rOMn) / 8; ++column_group) {
+    for (int column_group = 0; column_group < 4; ++column_group) {
       int const column_base = column_group * 8;
-      int const row = get<0>(cOMn(row_index, column_base));
-      int const token = row / kQHeadsPerKv;
-      int const qi = group * kQueriesPerGroup + token;
-      if (qi < q_count) {
-        int const packed_qsplit = token == output_token_base ? output_qsplit0 : output_qsplit1;
-        int const q_idx = decode_q_idx(packed_qsplit);
-        int const split = decode_split_idx(packed_qsplit);
-        int const q_abs = q_batch_offset + q_idx;
-        int const head = head_kv * kQHeadsPerKv + row % kQHeadsPerKv;
-        float const sum = row_sum[row];
-        float const scale = sum > 0.0f ? rcp_approx_ftz(sum) : 0.0f;
-        float2 const packed_scale = make_float2(scale, scale);
-        float2 const output0 = mul_packed_f32x2(
-            make_float2(rOMn(row_index, column_base), rOMn(row_index, column_base + 1)),
-            packed_scale);
-        float2 const output1 = mul_packed_f32x2(
-            make_float2(rOMn(row_index, column_base + 2), rOMn(row_index, column_base + 3)),
-            packed_scale);
-        float2 const output2 = mul_packed_f32x2(
-            make_float2(rOMn(row_index, column_base + 4), rOMn(row_index, column_base + 5)),
-            packed_scale);
-        float2 const output3 = mul_packed_f32x2(
-            make_float2(rOMn(row_index, column_base + 6), rOMn(row_index, column_base + 7)),
-            packed_scale);
-        int const col = get<1>(cOMn(row_index, column_base)) + ColumnPass * kColumnPassSize;
-        int const fake_col = real_col_to_stg128_half_fake_col(col);
-        int64_t const output_offset =
-            ((static_cast<int64_t>(split) * total_q + q_abs) * num_q_heads + head) * kHeadDim +
-            fake_col;
-        store_bf16x8_cs(o_partial_ptr + output_offset, output0.x, output0.y, output1.x, output1.y,
-                        output2.x, output2.y, output3.x, output3.y);
+      PartialRowState const &state = rows[row_index][column_group / 2];
+      int const col = get<1>(cOMn(row_index, column_base)) + ColumnPass * kColumnPassSize;
+      int const fake_col = real_col_to_stg128_half_fake_col(col);
+      uint32_t packed[4];
+      CUTLASS_PRAGMA_UNROLL
+      for (int pair = 0; pair < 4; ++pair) {
+        float2 const value = make_float2(rOMn(row_index, column_base + 2 * pair) * state.scale,
+                                         rOMn(row_index, column_base + 2 * pair + 1) * state.scale);
+        __nv_bfloat162 const bf16_pair = __float22bfloat162_rn(value);
+        packed[pair] = *reinterpret_cast<uint32_t const *>(&bf16_pair);
+      }
+      if (state.valid) {
+        __stcs(reinterpret_cast<uint4 *>(state.ptr + fake_col),
+               make_uint4(packed[0], packed[1], packed[2], packed[3]));
       }
     }
   }
-
-  cutlass::arch::fence_view_async_tmem_load();
 }
 
 template <class TiledMmaPV, class OutputTensor, class CoordinateTensor>
 CUTLASS_DEVICE void
 store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor cO,
-                     cutlass::bfloat16_t *o_partial_ptr, float *lse_partial_ptr, int total_q,
-                     int num_q_heads, float softmax_scale_log2, int head_kv, int q_count,
-                     int q_batch_offset, int group, int group_thread, int const *qsplit_indices,
-                     float const *row_sum, float const *row_max) {
+                     uint64_t *output_empty, uint64_t *stats_empty,
+                     cutlass::bfloat16_t *o_partial_ptr, int64_t o_partial_split_stride,
+                     float *lse_partial_ptr, int total_q, int num_q_heads, float softmax_scale_log2,
+                     int head_kv, int q_count, int q_batch_offset, int group, int group_thread,
+                     int const *qsplit_indices, float const *row_sum, float const *row_max) {
   int const lane = group_thread & 31;
   int const output_token_base = (group_thread / 32) * 2;
   int output_qsplit0 = 0;
@@ -372,13 +340,55 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor 
   output_qsplit0 = __shfl_sync(0xffffffffu, output_qsplit0, 0);
   output_qsplit1 = __shfl_sync(0xffffffffu, output_qsplit1, 0);
 
-  store_partial_output_pass<0>(tiled_mma_pv, tO, cO, o_partial_ptr, total_q, num_q_heads, head_kv,
-                               q_count, q_batch_offset, group, group_thread, output_token_base,
-                               output_qsplit0, output_qsplit1, row_sum);
-  store_partial_output_pass<1>(tiled_mma_pv, tO, cO, o_partial_ptr, total_q, num_q_heads, head_kv,
-                               q_count, q_batch_offset, group, group_thread, output_token_base,
-                               output_qsplit0, output_qsplit1, row_sum);
-  cutlass::arch::fence_view_async_tmem_load();
+  auto views0 = partial_output_pass_views<0>(tiled_mma_pv, tO, cO, group_thread);
+  auto views1 = partial_output_pass_views<1>(tiled_mma_pv, tO, cO, group_thread);
+
+  // The four rows this thread stores (see store_partial_output_pass): rows[row_index][half]
+  // is the row of column groups 2 * half and 2 * half + 1 of that row index. This thread's LSE
+  // row stats are read here too, before the stats stage is handed back to the softmax.
+  Tensor cOMn = make_16x256b_tensor_mn_view(get<2>(views0))(_, _, _0{});
+  float const lse_sum = row_sum[group_thread];
+  float const lse_max = row_max[group_thread];
+  PartialRowState rows[2][2];
+  CUTLASS_PRAGMA_UNROLL
+  for (int row_index = 0; row_index < 2; ++row_index) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int half = 0; half < 2; ++half) {
+      int const row = get<0>(cOMn(row_index, half * 16));
+      int const token = row / kQHeadsPerKv;
+      int const qi = group * kQueriesPerGroup + token;
+      int const packed_qsplit = token == output_token_base ? output_qsplit0 : output_qsplit1;
+      int const q_idx = decode_q_idx(packed_qsplit);
+      int const split = decode_split_idx(packed_qsplit);
+      int const q_abs = q_batch_offset + q_idx;
+      int const head = head_kv * kQHeadsPerKv + row % kQHeadsPerKv;
+      int64_t const row_offset = static_cast<int64_t>(split) * o_partial_split_stride +
+                                 (static_cast<int64_t>(q_abs) * num_q_heads + head) * kHeadDim;
+      float const sum = row_sum[row];
+      rows[row_index][half].ptr = o_partial_ptr + row_offset;
+      rows[row_index][half].scale = sum > 0.0f ? rcp_approx_ftz(sum) : 0.0f;
+      rows[row_index][half].valid = qi < q_count;
+    }
+  }
+  // Every stat this thread needs is in registers: the softmax may publish the next group's.
+  cutlass::arch::ClusterBarrier::arrive(stats_empty);
+
+  // One 64-column half at a time: the epilogue register budget (96) holds one half's 32
+  // accumulators plus the row state, not both halves. The O stage is handed back to the MMA as
+  // soon as its second half is in registers, before this group's stores drain.
+  {
+    Tensor rO0 = make_tensor<Accumulator>(shape(get<2>(views0)));
+    copy(get<0>(views0), get<1>(views0), rO0);
+    cutlass::arch::fence_view_async_tmem_load();
+    store_partial_output_pass<0>(rO0, get<2>(views0), rows);
+  }
+  {
+    Tensor rO1 = make_tensor<Accumulator>(shape(get<2>(views1)));
+    copy(get<0>(views1), get<1>(views1), rO1);
+    cutlass::arch::fence_view_async_tmem_load();
+    cutlass::arch::ClusterBarrier::arrive(output_empty);
+    store_partial_output_pass<1>(rO1, get<2>(views1), rows);
+  }
 
   int const row = group_thread;
   int const token = row / kQHeadsPerKv;
@@ -388,15 +398,15 @@ store_partial_output(TiledMmaPV tiled_mma_pv, OutputTensor tO, CoordinateTensor 
     int const q_idx = decode_q_idx(packed_qsplit);
     int const split = decode_split_idx(packed_qsplit);
     int const q_abs = q_batch_offset + q_idx;
-    int const head = head_kv * kQHeadsPerKv + row % kQHeadsPerKv;
-    float const sum = row_sum[row];
+    int const lse_head = head_kv * kQHeadsPerKv + row % kQHeadsPerKv;
     float lse = -INFINITY;
-    if (sum > 0.0f && isfinite(row_max[row])) {
+    if (lse_sum > 0.0f && isfinite(lse_max)) {
       constexpr float kLn2 = 0.6931471805599453f;
-      lse = (row_max[row] * softmax_scale_log2 + log2_approx_ftz(sum) - kLog2Fp8ProbabilityScale) *
+      lse = (lse_max * softmax_scale_log2 + log2_approx_ftz(lse_sum) - kLog2Fp8ProbabilityScale) *
             kLn2;
     }
-    int64_t const lse_offset = (static_cast<int64_t>(split) * total_q + q_abs) * num_q_heads + head;
+    int64_t const lse_offset =
+        (static_cast<int64_t>(split) * total_q + q_abs) * num_q_heads + lse_head;
     lse_partial_ptr[lse_offset] = lse;
   }
 }

@@ -156,30 +156,50 @@ CUTLASS_DEVICE void run_load_warps(Storage &storage, Params const &params, int w
     cute::prefetch_tma_descriptor(tma_q.get_tma_descriptor());
   }
 
+  // The packed query indices are fetched kQsplitPrefetchGroups groups at a time (one coalesced
+  // warp load) into the metadata ring, so the per-group loop carries no dependent global load.
+  // Slot g % kQMetadataStages was last used by group g - kQMetadataStages, whose consumers are
+  // done by then: the epilogue trails the loader by at most kQStages + kScoreStages groups.
+  constexpr int kQsplitPrefetchGroups = 8;
+  static_assert(kQsplitPrefetchGroups * kQueriesPerGroup == 2 * 32);
+  static_assert(kQsplitPrefetchGroups + kQStages + kScoreStages <= kQMetadataStages);
   for (int group = 0; group < num_groups; ++group) {
     int const q_stage = group % kQStages;
     int const q_phase = (group / kQStages) & 1;
     int const producer_phase = q_phase ^ 1;
     int const metadata_stage = group & (kQMetadataStages - 1);
+    bool const prefetch_boundary = (group % kQsplitPrefetchGroups) == 0;
 
+    // Every loader warp waits for the stage itself; no per-group warpgroup barrier.
+    cute::wait_barrier(storage.q_empty[q_stage], producer_phase);
     if (warp_idx == WarpSpecialization::kLoadWarp) {
-      cute::wait_barrier(storage.q_empty[q_stage], producer_phase);
+      if (prefetch_boundary) {
+        CUTLASS_PRAGMA_UNROLL
+        for (int pass = 0; pass < 2; ++pass) {
+          int const entry = pass * 32 + lane;
+          int const qi = group * kQueriesPerGroup + entry;
+          int packed_qsplit = 0;
+          if (qi < q_count) {
+            packed_qsplit =
+                arguments.qsplit_indices_ptr[head_kv * arguments.qsplit_stride + row_start + qi];
+          }
+          storage.qsplit_indices[(group + entry / kQueriesPerGroup) & (kQMetadataStages - 1)]
+                                [entry % kQueriesPerGroup] = packed_qsplit;
+        }
+        __syncwarp();
+      }
       if (lane == 0) {
         cute::set_barrier_transaction_bytes(storage.q_full[q_stage],
                                             kQueriesPerGroup * kQHeadsPerKv * kHeadDim);
       }
       if (lane < kQueriesPerGroup) {
-        int const qi = group * kQueriesPerGroup + lane;
-        int packed_qsplit = 0;
-        if (qi < q_count) {
-          packed_qsplit =
-              arguments.qsplit_indices_ptr[head_kv * arguments.qsplit_stride + row_start + qi];
-        }
-        storage.qsplit_indices[metadata_stage][lane] = packed_qsplit;
         cutlass::arch::ClusterBarrier::arrive(&storage.q_full[q_stage]);
       }
     }
-    load_barrier.arrive_and_wait();
+    if (prefetch_boundary) {
+      // Publish the freshly prefetched indices to the other loader warps.
+      load_barrier.arrive_and_wait();
+    }
 
     if (lane == 0) {
       CUTLASS_PRAGMA_UNROLL
@@ -240,15 +260,18 @@ CUTLASS_DEVICE void issue_pv_group(Storage &storage, TiledMmaPV tiled_mma_pv, Ou
   tO.data() = storage.tmem_base + kTmemOutputOffset + score_stage * kTmemOutputStride;
   tP.data() = storage.tmem_base + score_stage * kTmemScoreStride + kTmemProbabilityOffset;
 
+  // The softmax publishes P in two halves of 64 keys (probability_early_full, then
+  // probability_full); the k-blocks covering the first half run before the second wait.
+  constexpr int kEarlyKBlocks = size<2>(tP) / 2;
   tiled_mma_pv.accumulate_ = UMMA::ScaleOut::Zero;
   CUTLASS_PRAGMA_UNROLL
-  for (int k_block = 0; k_block < 2; ++k_block) {
+  for (int k_block = 0; k_block < kEarlyKBlocks; ++k_block) {
     gemm(tiled_mma_pv, tP(_, _, k_block), tV(_, _, k_block, 0), tO);
     tiled_mma_pv.accumulate_ = UMMA::ScaleOut::One;
   }
   cute::wait_barrier(storage.probability_full[score_stage], score_phase);
   CUTLASS_PRAGMA_UNROLL
-  for (int k_block = 2; k_block < size<2>(tP); ++k_block) {
+  for (int k_block = kEarlyKBlocks; k_block < size<2>(tP); ++k_block) {
     gemm(tiled_mma_pv, tP(_, _, k_block), tV(_, _, k_block, 0), tO);
   }
   cutlass::arch::umma_arrive(&storage.output_full[score_stage]);
@@ -410,8 +433,6 @@ CUTLASS_DEVICE void run_epilogue_warpgroup(Storage &storage, PrefillArguments co
   Tensor tO = partition_fragment_C(tiled_mma_pv, make_shape(Int<128>{}, Int<128>{}));
   Tensor cO = make_identity_tensor(make_shape(Int<128>{}, Int<128>{}));
   int const group_thread = tid - WarpSpecialization::kEpilogueWarp * 32;
-  cutlass::arch::NamedBarrier epilogue_barrier(WarpSpecialization::kEpilogueWarps * 32,
-                                               kEpilogueBarrierId);
 
   for (int group = 0; group < num_groups; ++group) {
     int const score_stage = group % kScoreStages;
@@ -421,14 +442,17 @@ CUTLASS_DEVICE void run_epilogue_warpgroup(Storage &storage, PrefillArguments co
     cute::wait_barrier(storage.stats_full[score_stage], score_phase);
     Tensor tOCurrent = tO;
     tOCurrent.data() = storage.tmem_base + kTmemOutputOffset + score_stage * kTmemOutputStride;
-    store_partial_output(tiled_mma_pv, tOCurrent, cO, arguments.o_partial_ptr,
-                         arguments.lse_partial_ptr, arguments.total_q, arguments.num_q_heads,
-                         arguments.softmax_scale_log2, head_kv, q_count, q_batch_offset, group,
-                         group_thread, storage.qsplit_indices[metadata_stage],
-                         storage.row_sum[score_stage], storage.row_max[score_stage]);
-    epilogue_barrier.arrive_and_wait();
-    cutlass::arch::ClusterBarrier::arrive(&storage.output_empty[score_stage]);
-    cutlass::arch::ClusterBarrier::arrive(&storage.stats_empty[score_stage]);
+    // output_empty and stats_empty expect one arrival per epilogue thread; store_partial_output
+    // arrives on each as soon as that thread no longer needs the stage (after its own TMEM-load
+    // fence for O), so no warpgroup barrier is needed and the MMA can refill the stage while
+    // this group's stores drain.
+    store_partial_output(tiled_mma_pv, tOCurrent, cO, &storage.output_empty[score_stage],
+                         &storage.stats_empty[score_stage], arguments.o_partial_ptr,
+                         arguments.o_partial_split_stride, arguments.lse_partial_ptr,
+                         arguments.total_q, arguments.num_q_heads, arguments.softmax_scale_log2,
+                         head_kv, q_count, q_batch_offset, group, group_thread,
+                         storage.qsplit_indices[metadata_stage], storage.row_sum[score_stage],
+                         storage.row_max[score_stage]);
   }
 
   cutlass::arch::NamedBarrier tmem_barrier(WarpSpecialization::kTmemParticipantWarps * 32,

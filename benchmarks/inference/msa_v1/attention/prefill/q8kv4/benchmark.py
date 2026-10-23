@@ -371,8 +371,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.slots < 0 or args.warmup < 1 or args.replays < 2:
         parser.error("slots must be non-negative, warmup positive, and replays >= 2")
-    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
-        raise RuntimeError("SM100-family GPU (B200/GB300) required")
+    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3), (10, 7)}:
+        raise RuntimeError("SM100, SM103 or SM107 GPU required")
 
     device = torch.device("cuda")
     _warm_compilation(device)

@@ -67,16 +67,16 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
                  torch::Tensor cu_seqlens_q, torch::Tensor cu_seqlens_k, torch::Tensor k2q_row_ptr,
                  torch::Tensor qsplit_indices, torch::Tensor scheduler_metadata,
                  torch::Tensor work_count, torch::Tensor o_partial, torch::Tensor lse_partial,
-                 double softmax_scale) {
+                 double softmax_scale, c10::optional<torch::Tensor> combine_tile_counters) {
   torch::Tensor tensors[] = {
       q,           page_table,     cu_seqlens_q,       cu_seqlens_k,
       k2q_row_ptr, qsplit_indices, scheduler_metadata, work_count,
-      o_partial,   lse_partial,
+      lse_partial,
   };
   char const *names[] = {
       "q",           "page_table",     "cu_seqlens_q",       "cu_seqlens_k",
       "k2q_row_ptr", "qsplit_indices", "scheduler_metadata", "work_count",
-      "o_partial",   "lse_partial",
+      "lse_partial",
   };
   constexpr std::size_t kTensorCount = sizeof(tensors) / sizeof(tensors[0]);
   static_assert(kTensorCount == sizeof(names) / sizeof(names[0]));
@@ -96,6 +96,10 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
   }
   TORCH_CHECK(packed_v.strides() == packed_k.strides() && v_scale.strides() == k_scale.strides(),
               "K/V cache strides and K/V scale strides must match");
+  // The split slabs of o_partial may be padded apart (locality-domain striping); rows inside a
+  // slab are contiguous.
+  TORCH_CHECK(o_partial.is_cuda(), "o_partial must be a CUDA tensor");
+  check_same_device(q, o_partial, "o_partial");
 
   TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn, "q must have dtype torch.float8_e4m3fn");
   TORCH_CHECK(packed_k.scalar_type() == at::kByte && packed_v.scalar_type() == at::kByte,
@@ -147,6 +151,14 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
                   o_partial.size(1) == total_q_64 && o_partial.size(2) == num_q_heads &&
                   o_partial.size(3) == kHeadDim,
               "o_partial must have shape [16, total_q, num_q_heads, 128]");
+  int64_t const slab_elements = total_q_64 * num_q_heads * kHeadDim;
+  TORCH_CHECK(o_partial.stride(3) == 1 && o_partial.stride(2) == kHeadDim &&
+                  o_partial.stride(1) == static_cast<int64_t>(num_q_heads) * kHeadDim,
+              "o_partial rows must be contiguous inside each split slab");
+  TORCH_CHECK(o_partial.stride(0) >= slab_elements && o_partial.stride(0) % 8 == 0,
+              "o_partial split stride must cover a slab and keep 16-byte alignment");
+  TORCH_CHECK(reinterpret_cast<uintptr_t>(o_partial.data_ptr()) % 16 == 0,
+              "o_partial must be 16-byte aligned");
   TORCH_CHECK(lse_partial.dim() == 3 && lse_partial.size(0) == kTopK &&
                   lse_partial.size(1) == total_q_64 && lse_partial.size(2) == num_q_heads,
               "lse_partial must have shape [16, total_q, num_q_heads]");
@@ -155,8 +167,9 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
 
   c10::cuda::CUDAGuard const device_guard(q.device());
   cudaDeviceProp const *properties = at::cuda::getCurrentDeviceProperties();
-  TORCH_CHECK(properties->major == 10 && (properties->minor == 0 || properties->minor == 3),
-              "Q8KV4 sparse prefill requires an SM100-family GPU");
+  TORCH_CHECK(properties->major == 10 &&
+                  (properties->minor == 0 || properties->minor == 3 || properties->minor == 7),
+              "Q8KV4 sparse prefill requires an SM100, SM103 or SM107 GPU");
 
   PrefillArguments arguments{};
   arguments.q_ptr = reinterpret_cast<uint8_t const *>(q.data_ptr());
@@ -173,7 +186,18 @@ void prefill_run(torch::Tensor q, torch::Tensor packed_k, torch::Tensor packed_v
   arguments.work_count_ptr = work_count.data_ptr<int32_t>();
   arguments.o_partial_ptr =
       reinterpret_cast<cutlass::bfloat16_t *>(o_partial.data_ptr<at::BFloat16>());
+  arguments.o_partial_split_stride = o_partial.stride(0);
   arguments.lse_partial_ptr = lse_partial.data_ptr<float>();
+  if (combine_tile_counters.has_value()) {
+    check_cuda_contiguous(*combine_tile_counters, "combine_tile_counters");
+    check_same_device(q, *combine_tile_counters, "combine_tile_counters");
+    TORCH_CHECK(combine_tile_counters->scalar_type() == at::kInt &&
+                    combine_tile_counters->dim() == 1 && combine_tile_counters->numel() >= 1,
+                "combine_tile_counters must be a one-dimensional int32 tensor");
+    arguments.combine_tile_counters_ptr = combine_tile_counters->data_ptr<int32_t>();
+    arguments.combine_tile_counter_count =
+        checked_int_dimension(combine_tile_counters->numel(), "combine_tile_counters");
+  }
   arguments.total_q = total_q;
   arguments.num_q_heads = num_q_heads;
   arguments.num_kv_heads = num_kv_heads;

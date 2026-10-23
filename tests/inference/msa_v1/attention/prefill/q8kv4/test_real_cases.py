@@ -29,12 +29,12 @@ _SUITE = active_inference_suite()
 logger = logging.getLogger(__name__)
 
 
-def _require_sm100_or_sm103() -> torch.device:
+def _require_supported_device() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     device = torch.device("cuda")
-    if torch.cuda.get_device_capability(device) not in {(10, 0), (10, 3)}:
-        pytest.skip("Q8KV4 prefill attention requires SM100 or SM103")
+    if torch.cuda.get_device_capability(device) not in {(10, 0), (10, 3), (10, 7)}:
+        pytest.skip("Q8KV4 prefill attention requires SM100, SM103 or SM107")
     return device
 
 
@@ -123,6 +123,6 @@ def _run_case(case, device: torch.device, num_kv_heads: int) -> None:
 def test_real_varlen_attention_cases(case, num_kv_heads: int) -> None:
     """Check every selected real shape as an independently timed test case."""
 
-    device = _require_sm100_or_sm103()
+    device = _require_supported_device()
     _run_case(case, device, num_kv_heads)
     torch.cuda.empty_cache()

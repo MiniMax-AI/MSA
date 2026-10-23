@@ -9,27 +9,17 @@
 
 namespace minimax::msa_v1::attention::prefill::q8kv4::detail {
 
-CUTLASS_DEVICE void dequant_e2m1x8_uniform_scale(
-    uint32_t& output_lo, uint32_t& output_hi,
-    uint32_t packed_fp4, uint32_t scale_e4m3x4) {
-  ::minimax::msa_v1::attention::prefill::q8kv4::sm100::common::
-      nvfp4_to_e4m3x4(
-      output_lo, static_cast<uint16_t>(packed_fp4), scale_e4m3x4);
-  ::minimax::msa_v1::attention::prefill::q8kv4::sm100::common::
-      nvfp4_to_e4m3x4(
-      output_hi, static_cast<uint16_t>(packed_fp4 >> 16), scale_e4m3x4);
-}
-
 struct Fp4DequantInput {
   uint32_t packed_fp4;
-  uint32_t scale_e4m3x4;
+  uint32_t scale_word;
 };
 
 CUTLASS_DEVICE Fp4DequantInput load_fp4_dequant_input(
     uint8_t const* packed_fp4, uint8_t scale_e4m3) {
   return {
       *reinterpret_cast<uint32_t const*>(packed_fp4),
-      static_cast<uint32_t>(scale_e4m3) * 0x01010101u,
+      ::minimax::msa_v1::attention::prefill::q8kv4::sm100::common::
+          make_dequant_scale_word(scale_e4m3),
   };
 }
 
@@ -37,8 +27,9 @@ CUTLASS_DEVICE void dequant_store_fp8_smem(
     Fp4DequantInput const& input, uint32_t output_address) {
   uint32_t output_lo;
   uint32_t output_hi;
-  dequant_e2m1x8_uniform_scale(
-      output_lo, output_hi, input.packed_fp4, input.scale_e4m3x4);
+  ::minimax::msa_v1::attention::prefill::q8kv4::sm100::common::
+      dequant_e2m1x8_uniform_scale(
+          output_lo, output_hi, input.packed_fp4, input.scale_word);
   asm volatile("st.shared.v2.b32 [%0], {%1, %2};"
                :
                : "r"(output_address), "r"(output_lo), "r"(output_hi));

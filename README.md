@@ -108,15 +108,15 @@ python -c 'import cutlass; print(cutlass.__version__, cutlass.CUDA_VERSION)'
 ```
 
 Q8KV4 C++ operators use the standard `CUDA_HOME`, `CUTLASS_ROOT`, and
-`TORCH_EXTENSIONS_DIR` configuration. Runtime JIT always selects `sm_100a` or
-`sm_103a` from the CUDA device of the input tensor. Tensor-less AOT/offline
-builds use `MM_SPARSE_TARGET_ARCH=100a|103a` to select a target (default:
-`103a`). `TORCH_CUDA_ARCH_LIST` is internal compiler plumbing rather than the
+`TORCH_EXTENSIONS_DIR` configuration. Runtime JIT always selects `sm_100a`,
+`sm_103a` or `sm_107a` (operators with SM107 support) from the CUDA device of
+the input tensor. Tensor-less AOT/offline builds use
+`MM_SPARSE_TARGET_ARCH=100a|103a|107a` to select a target (default: `103a`). `TORCH_CUDA_ARCH_LIST` is internal compiler plumbing rather than the
 runtime architecture-selection interface. Q8KV4 Decode Attention, Decode
 Indexer, and the shared dequant package support CUDA Toolkit 12.9 or newer.
 They use QMUL4 when the selected toolchain supports it and otherwise select an
 exact fallback automatically. Q8KV4 Prefill Attention requires CUDA Toolkit
-13.4 or newer.
+13.4 or newer (13.5 or newer on SM107).
 
 BF16 and Q8KV8 sparse decode are provided through an optional external FlashInfer
 TRTLLM-GEN backend. This repository does not include FlashInfer source code or
@@ -125,7 +125,7 @@ Q8KV4 decode uses native CUTLASS C++. All three decode attention formats support
 output on B200/B300, selecting the implementation by the actual `Hq/Hkv`.
 Q8KV4 decode also retains SM107 GQA=16 support, requiring CUDA Toolkit 13.5 or newer.
 
-Rubin (SM107) retains BF16/Q8KV8 prefill attention, Q8KV8 prefill indexer, and Q8KV4 decode attention paths,
+Rubin (SM107) retains BF16/Q8KV8/Q8KV4 prefill attention, Q8KV8 prefill indexer, and Q8KV4 decode attention paths,
 selected from the input tensor device. See the operator READMEs for dependencies and restrictions.
 This does not imply Rubin support for the other operators.
 

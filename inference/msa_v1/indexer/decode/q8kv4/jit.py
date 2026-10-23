@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -18,6 +17,7 @@ from torch.utils import cpp_extension
 from inference.msa_v1._build_utils import cuda_home as _cuda_home
 from inference.msa_v1._build_utils import cutlass_root as _cutlass_root
 from inference.msa_v1._build_utils import require_cuda_version
+from inference.msa_v1._build_utils import supports_qmul4 as _probe_supports_qmul4
 from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
 from inference.msa_v1._build_utils import torch_cuda_arch as _resolve_torch_arch
 
@@ -30,20 +30,6 @@ _INCLUDE = _CSRC / "include"
 _TEMPLATES = _CSRC / "templates"
 _QMUL4_DEQUANT = "qmul4"
 _FP16_DEQUANT = "fp16_fallback"
-_QMUL4_PROBE_SOURCE = r"""
-#include <cstdint>
-
-__global__ void qmul4_probe(uint32_t* output) {
-  uint32_t result;
-  uint16_t packed_e2m1 = 0;
-  uint32_t scale_e4m3 = 0;
-  asm volatile(
-      "mul.rn.satfinite.e4m3x4.e2m1x4.e4m3x4 %0, %1, %2;"
-      : "=r"(result)
-      : "h"(packed_e2m1), "r"(scale_e4m3));
-  output[0] = result;
-}
-""".lstrip()
 
 
 @lru_cache(maxsize=1)
@@ -105,48 +91,7 @@ def _write_text_if_changed(path: Path, content: str) -> None:
 def _supports_qmul4(arch: str) -> bool:
     """Return whether the selected NVCC accepts the public QMUL4 PTX form."""
 
-    nvcc = _cuda_home() / "bin/nvcc"
-    probe_key = hashlib.sha256()
-    probe_key.update(str(nvcc.resolve()).encode())
-    probe_key.update(str(_cuda_version()).encode())
-    probe_key.update(arch.encode())
-    probe_key.update(_QMUL4_PROBE_SOURCE.encode())
-    probe_dir = _cache_root() / "capability_probes" / probe_key.hexdigest()[:16]
-    result_path = probe_dir / "qmul4.result"
-    if result_path.is_file():
-        return result_path.read_text(encoding="utf-8").strip() == "supported"
-
-    probe_dir.mkdir(parents=True, exist_ok=True)
-    source_path = probe_dir / "qmul4_probe.cu"
-    object_path = probe_dir / f"qmul4_probe.{os.getpid()}.o"
-    _write_text_if_changed(source_path, _QMUL4_PROBE_SOURCE)
-    result = subprocess.run(
-        [
-            str(nvcc),
-            "-std=c++20",
-            f"-gencode=arch=compute_{arch},code=sm_{arch}",
-            "-c",
-            str(source_path),
-            "-o",
-            str(object_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    supported = result.returncode == 0
-    if supported:
-        object_path.unlink(missing_ok=True)
-    else:
-        logger.info(
-            "Selected NVCC does not accept QMUL4 for SM%s; using FP16 dequant fallback",
-            arch,
-        )
-    _write_text_if_changed(
-        result_path,
-        "supported\n" if supported else "unsupported\n",
-    )
-    return supported
+    return _probe_supports_qmul4(arch, probe_root=_cache_root() / "capability_probes")
 
 
 @cache

@@ -31,7 +31,7 @@ MSA v1 提供 paged sparse attention 和 indexer 的 decode/prefill 接口。所
   Q8KV4 使用原生 CUTLASS C++，并保留 CUDA 13.5 或更新版本上的 SM107 GQA=16 支持。
 - Q8KV8 prefill attention 支持 GQA group size 1、2、4、8 或 16。
 
-BF16/Q8KV8 prefill attention 还保留 SM107 Rubin 路径，由实际设备架构选择。
+BF16/Q8KV8/Q8KV4 prefill attention 还保留 SM107 Rubin 路径，由实际设备架构选择。
 
 具体张量 shape、dtype 和调用示例见各算子目录中的 README。
 
