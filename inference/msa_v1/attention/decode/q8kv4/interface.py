@@ -14,7 +14,7 @@ from inference.msa_v1._cache_layout import check_cache_layout
 
 logger = logging.getLogger(__name__)
 
-from inference.msa_v1._build_utils import cuda_home
+from inference.msa_v1._build_utils import cuda_home, jit_build_lock
 
 __all__ = ["BatchDecodeWithPagedKVCacheWrapper"]
 
@@ -114,7 +114,7 @@ def _select_num_kv_splits(
 def _jit_compile_cpp_backend():
     """JIT-compile the C++ backend using torch.utils.cpp_extension.load()."""
     import tvm_ffi
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import _get_build_directory, load
 
     pkg_dir = os.path.dirname(os.path.abspath(__file__))
     csrc_dir = os.path.join(pkg_dir, "csrc")
@@ -127,21 +127,23 @@ def _jit_compile_cpp_backend():
     extra_include.append(str(cuda_home() / "include"))
 
     started_at = time.time()
-    cpp = load(
-        name="_minimax_msa_v1_attention_decode_q8kv4_cpp",
-        sources=[
-            os.path.join(csrc_dir, "api", "decode_attention_api.cpp"),
-            os.path.join(csrc_dir, "api", "decode_attention_binding.cpp"),
-        ],
-        extra_include_paths=extra_include,
-        extra_ldflags=[
-            f"-L{os.path.join(tvm_ffi_dir, 'lib')}",
-            "-ltvm_ffi",
-            f"-Wl,-rpath,{os.path.join(tvm_ffi_dir, 'lib')}",
-        ],
-        extra_cflags=["-std=c++20", "-O2"],
-        verbose=True,
-    )
+    name = "_minimax_msa_v1_attention_decode_q8kv4_cpp"
+    with jit_build_lock(_get_build_directory(name, verbose=False)):
+        cpp = load(
+            name=name,
+            sources=[
+                os.path.join(csrc_dir, "api", "decode_attention_api.cpp"),
+                os.path.join(csrc_dir, "api", "decode_attention_binding.cpp"),
+            ],
+            extra_include_paths=extra_include,
+            extra_ldflags=[
+                f"-L{os.path.join(tvm_ffi_dir, 'lib')}",
+                "-ltvm_ffi",
+                f"-Wl,-rpath,{os.path.join(tvm_ffi_dir, 'lib')}",
+            ],
+            extra_cflags=["-std=c++20", "-O2"],
+            verbose=True,
+        )
     logger.info(
         "Compiled inference.msa_v1.attention.decode.q8kv4 host API in %.1fs",
         time.time() - started_at,
