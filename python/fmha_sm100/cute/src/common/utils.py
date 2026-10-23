@@ -15,7 +15,16 @@ from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
 
-import quack.activation
+# Packed FP32x2 subtract (round to nearest even). CUTLASS DSL now provides it as
+# cute.arch.sub_packed_f32x2; quack-kernels 0.6.5 dropped its own
+# quack.activation.sub_packed_f32x2 in favor of it. Keep the quack helper only as the
+# fallback for older CUTLASS DSL releases.
+if hasattr(cute.arch, "sub_packed_f32x2"):
+    sub_packed_f32x2 = cute.arch.sub_packed_f32x2
+else:  # pragma: no cover - older CUTLASS DSL
+    from quack.activation import sub_packed_f32x2
+
+_NVVM_FMAX_TAKES_RESULT_TYPE = next(iter(inspect.signature(nvvm.fmax).parameters)) == "res"
 
 _MIXER_ATTRS = ("__vec_size__",)
 
@@ -208,10 +217,10 @@ def warp_reduce(
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+    # Older NVVM bindings take the result type as the first positional argument; newer ones
+    # (nvidia-cutlass-dsl >= 4.6.2 for every CUDA flavor) infer it. Decide by the binding's
+    # signature rather than by the CUDA version.
+    if _NVVM_FMAX_TAKES_RESULT_TYPE:
         # Old API: requires explicit result type as first positional argument
         return Float32(
             nvvm.fmax(
@@ -995,10 +1004,10 @@ def ex2_emulation_2(
     xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = quack.activation.sub_packed_f32x2(
+    xy_rounded_back = sub_packed_f32x2(
         xy_rounded, (fp32_round_int, fp32_round_int)
     )
-    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
