@@ -217,8 +217,14 @@ class _BatchDecodeProxyScoreWrapper:
         k_scale: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        pdl: bool = False,
     ) -> torch.Tensor:
-        """Run one layer using the metadata prepared by :meth:`plan`."""
+        """Run one layer using the metadata prepared by :meth:`plan`.
+
+        ``pdl``: launch with programmatic stream serialization. The kernel reads only
+        history K pages, the page table and the plan before ``griddepcontrol.wait``, so the
+        caller must not set it when the immediately preceding kernel wrote the plan or the
+        page table (the first sparse layer of a forward)."""
 
         if (
             self._page_table is None
@@ -269,6 +275,7 @@ class _BatchDecodeProxyScoreWrapper:
             self._workspace_buffer,
             self._sm_count,
             out,
+            bool(pdl),
         )
 
 
@@ -355,8 +362,12 @@ class BatchDecodeIndexerWithPagedKVCacheWrapper:
         *,
         k_scale: torch.Tensor,
         out: torch.Tensor | None = None,
+        pdl: bool = False,
     ) -> torch.Tensor:
-        """Return forced-tail TopK logical page indices for one layer."""
+        """Return forced-tail TopK logical page indices for one layer.
+
+        ``pdl`` launches the score kernel with programmatic dependent launch; see
+        ``_BatchDecodeProxyScoreWrapper.run`` for the caller contract."""
 
         if (
             self._proxy_scores is None
@@ -379,6 +390,7 @@ class BatchDecodeIndexerWithPagedKVCacheWrapper:
             paged_k_cache,
             k_scale,
             out=self._proxy_scores,
+            pdl=pdl,
         )
         _topk_select(
             proxy_scores.view(-1, proxy_scores.shape[-1]),

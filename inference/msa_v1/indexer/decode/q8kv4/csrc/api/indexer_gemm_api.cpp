@@ -95,7 +95,8 @@ void check_workspace(torch::Tensor const &reference, torch::Tensor const &worksp
 
 torch::Tensor indexer_gemm_run(torch::Tensor q, torch::Tensor packed_k_cache, torch::Tensor k_scale,
                                torch::Tensor page_table, torch::Tensor seq_lens,
-                               torch::Tensor workspace, int64_t sm_count, torch::Tensor output) {
+                               torch::Tensor workspace, int64_t sm_count, torch::Tensor output,
+                               bool pdl) {
   using Traits = IndexerGemmTraits;
   check_metadata(page_table, seq_lens);
   check_cuda_contiguous(q, "q");
@@ -158,6 +159,7 @@ torch::Tensor indexer_gemm_run(torch::Tensor q, torch::Tensor packed_k_cache, to
   arguments.packed_k_token_stride = packed_k_cache.stride(1);
   arguments.k_scale_page_stride = k_scale.stride(0) * k_scale.element_size();
   arguments.sm_count = static_cast<int>(sm_count);
+  arguments.pdl = pdl;
 
   cudaStream_t const stream = at::cuda::getCurrentCUDAStream().stream();
   cudaError_t const status = launch_indexer_gemm(arguments, stream);
