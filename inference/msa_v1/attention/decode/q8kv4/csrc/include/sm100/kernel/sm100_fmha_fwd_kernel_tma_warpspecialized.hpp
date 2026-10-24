@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <mutex>
 
 #include <cuda_runtime.h>
@@ -283,19 +284,29 @@ template <class Traits> struct Sm100FmhaFwdQ8Kv4KernelTmaWarpspecialized {
       return attr_status;
     }
 
-    cudaLaunchAttribute attrs[1]{};
+    cudaLaunchAttribute attrs[2]{};
     constexpr int kClusterSize = 1;
     attrs[0].id = cudaLaunchAttributeClusterDimension;
     attrs[0].val.clusterDim.x = kClusterSize;
     attrs[0].val.clusterDim.y = 1;
     attrs[0].val.clusterDim.z = 1;
+    // optional PDL launch (MSA_Q8KV4_DECODE_ATTN_PDL=1, read once). Before griddepcontrol.wait
+    // the kernel only prefetches tensor maps, initializes barriers and allocates TMEM.
+    static int const pdl_enabled = [] {
+      char const *v = std::getenv("MSA_Q8KV4_DECODE_ATTN_PDL");
+      return (v != nullptr && v[0] == '1') ? 1 : 0;
+    }();
+    attrs[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[1].val.programmaticStreamSerializationAllowed = 1;
+
     cudaLaunchConfig_t launch_config{};
     launch_config.gridDim = get_grid_shape(params);
     launch_config.blockDim = get_block_shape();
     launch_config.dynamicSmemBytes = get_smem_size();
     launch_config.stream = stream;
     launch_config.attrs = attrs;
-    launch_config.numAttrs = 1;
+    launch_config.numAttrs = pdl_enabled ? 2 : 1;
+    params.pdl_early_trigger = pdl_enabled;
 
     cudaError_t launch_status =
         cudaLaunchKernelEx(&launch_config, sm100_fmha_fwd_device_kernel<Traits>, params);

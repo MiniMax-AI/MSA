@@ -216,15 +216,35 @@ template <class Traits> struct IndexerGemmUmmaCollective : IndexerGemmConfig<Tra
       allocator.release_allocation_lock();
     }
     cutlass::arch::fence_barrier_init();
+    // PDL: before griddepcontrol.wait the kernel reads only data that no kernel of the
+    // current layer writes: the plan (scheduler words, lengths), the page table and history K
+    // pages, i.e. pages strictly before the page holding the first query token of the request.
+    // Pages that may hold this step's tokens, and Q, are loaded after the wait. Without a PDL
+    // launch the wait returns immediately and the issue order is the only difference.
     if (warp_idx == kTransportWarp) {
       // Publish this warp's metadata and barrier initialization before first-page TMA.
       __syncwarp();
-      if (lane_idx < min(storage.page_count, Traits::kMaxPagesPerCta)) {
+      bool const mine = lane_idx < min(storage.page_count, Traits::kMaxPagesPerCta);
+      bool early = false;
+      int physical = 0;
+      if (mine) {
         int32_t const *table = params.page_table_ptr + size_t(storage.batch_idx) * params.max_pages;
-        Base::issue_page_load(params, storage, lane_idx,
-                              __ldg(table + storage.page_begin + lane_idx));
+        int const logical = storage.page_begin + lane_idx;
+        int const kv_length = __ldg(params.kv_lengths_ptr + storage.batch_idx);
+        physical = __ldg(table + logical);
+        early = logical < (kv_length - params.query_length) / Traits::kPageTokens;
+        if (early) {
+          Base::issue_page_load(params, storage, lane_idx, physical);
+        }
       }
+      asm volatile("griddepcontrol.wait;" ::: "memory");
+      if (mine && !early) {
+        Base::issue_page_load(params, storage, lane_idx, physical);
+      }
+    } else {
+      asm volatile("griddepcontrol.wait;" ::: "memory");
     }
+    asm volatile("griddepcontrol.launch_dependents;" :::);
     __syncthreads();
     // Allocation is published above and remains unchanged until the final deallocation.
     uint32_t const tmem_base = storage.tmem_base;
