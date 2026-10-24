@@ -12,6 +12,7 @@ import torch
 from torch.utils import cpp_extension
 
 from inference.msa_v1._build_utils import cuda_home
+from inference.msa_v1._build_utils import jit_build_lock
 
 _LOGGER = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parent
@@ -50,27 +51,28 @@ def load_extension():
         "10.7a" if torch.cuda.get_device_capability() == (10, 7) else "10.0a;10.3a"
     )
     try:
-        extension = cpp_extension.load(
-            name="minimax_msa_v1_indexer_topk",
-            sources=[str(path) for path in sources],
-            extra_include_paths=include_paths,
-            extra_cflags=["-O3", "-std=c++20"],
-            extra_cuda_cflags=[
-                "-O3",
-                "-std=c++20",
-                "--expt-relaxed-constexpr",
-                "--expt-extended-lambda",
-                "-Xptxas=-v",
-            ],
-            extra_ldflags=[
-                "-lcuda",
-                f"-Wl,-rpath,{selected_cuda_home / 'lib64'}",
-            ],
-            build_directory=str(build_root),
-            verbose=(
-                os.environ.get("MINIMAX_MSA_V1_INDEXER_TOPK_VERBOSE_BUILD") == "1"
-            ),
-        )
+        with jit_build_lock(build_root):
+            extension = cpp_extension.load(
+                name="minimax_msa_v1_indexer_topk",
+                sources=[str(path) for path in sources],
+                extra_include_paths=include_paths,
+                extra_cflags=["-O3", "-std=c++20"],
+                extra_cuda_cflags=[
+                    "-O3",
+                    "-std=c++20",
+                    "--expt-relaxed-constexpr",
+                    "--expt-extended-lambda",
+                    "-Xptxas=-v",
+                ],
+                extra_ldflags=[
+                    "-lcuda",
+                    f"-Wl,-rpath,{selected_cuda_home / 'lib64'}",
+                ],
+                build_directory=str(build_root),
+                verbose=(
+                    os.environ.get("MINIMAX_MSA_V1_INDEXER_TOPK_VERBOSE_BUILD") == "1"
+                ),
+            )
     finally:
         cpp_extension.CUDA_HOME = previous_cuda_home
         if previous_arch_list is None:

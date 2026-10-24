@@ -17,6 +17,7 @@ from torch.utils import cpp_extension
 
 from inference.msa_v1._build_utils import cuda_home as _cuda_home
 from inference.msa_v1._build_utils import cutlass_root as _cutlass_root
+from inference.msa_v1._build_utils import jit_build_lock
 from inference.msa_v1._build_utils import require_cuda_version
 from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
 from inference.msa_v1._build_utils import torch_cuda_arch as _resolve_torch_arch
@@ -213,38 +214,39 @@ class JitSpec:
         cpp_extension.CUDA_HOME = str(_cuda_home())
         os.environ["TORCH_CUDA_ARCH_LIST"] = _torch_arch(self.target_arch)
         try:
-            extension = cpp_extension.load(
-                name=module_name,
-                sources=[str(path) for path in sources],
-                extra_include_paths=[str(path) for path in include_paths],
-                extra_cflags=[
-                    "-O3",
-                    "-DNDEBUG",
-                    "-std=c++20",
-                    f"-DMINIMAX_MSA_INDEX_HEADS={self.num_index_heads}",
-                    f"-DMINIMAX_MSA_QUERY_COLUMNS={self.query_columns}",
-                ],
-                extra_cuda_cflags=[
-                    "-O3",
-                    f"-DMINIMAX_MSA_INDEX_HEADS={self.num_index_heads}",
-                    f"-DMINIMAX_MSA_QUERY_COLUMNS={self.query_columns}",
-                    "-DNDEBUG",
-                    "-lineinfo",
-                    "-std=c++20",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "-static-global-template-stub=false",
-                    "-Xptxas=-O3",
-                    f"-DMINIMAX_MSA_Q8KV4_INDEXER_HAS_QMUL4={int(self.dequant_mode == _QMUL4_DEQUANT)}",
-                ],
-                extra_ldflags=[
-                    "-lcuda",
-                    f"-Wl,-rpath,{_cuda_home() / 'lib64'}",
-                ],
-                build_directory=str(cache_dir),
-                verbose=False,
-                with_cuda=True,
-            )
+            with jit_build_lock(cache_dir):
+                extension = cpp_extension.load(
+                    name=module_name,
+                    sources=[str(path) for path in sources],
+                    extra_include_paths=[str(path) for path in include_paths],
+                    extra_cflags=[
+                        "-O3",
+                        "-DNDEBUG",
+                        "-std=c++20",
+                        f"-DMINIMAX_MSA_INDEX_HEADS={self.num_index_heads}",
+                        f"-DMINIMAX_MSA_QUERY_COLUMNS={self.query_columns}",
+                    ],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        f"-DMINIMAX_MSA_INDEX_HEADS={self.num_index_heads}",
+                        f"-DMINIMAX_MSA_QUERY_COLUMNS={self.query_columns}",
+                        "-DNDEBUG",
+                        "-lineinfo",
+                        "-std=c++20",
+                        "--expt-relaxed-constexpr",
+                        "--expt-extended-lambda",
+                        "-static-global-template-stub=false",
+                        "-Xptxas=-O3",
+                        f"-DMINIMAX_MSA_Q8KV4_INDEXER_HAS_QMUL4={int(self.dequant_mode == _QMUL4_DEQUANT)}",
+                    ],
+                    extra_ldflags=[
+                        "-lcuda",
+                        f"-Wl,-rpath,{_cuda_home() / 'lib64'}",
+                    ],
+                    build_directory=str(cache_dir),
+                    verbose=False,
+                    with_cuda=True,
+                )
         finally:
             cpp_extension.CUDA_HOME = previous_cuda_home
             if previous_arch_list is None:

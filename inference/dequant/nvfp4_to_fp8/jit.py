@@ -16,6 +16,7 @@ from torch.utils import cpp_extension
 
 from inference.msa_v1._build_utils import cuda_home as _cuda_home
 from inference.msa_v1._build_utils import cutlass_root
+from inference.msa_v1._build_utils import jit_build_lock
 from inference.msa_v1._build_utils import require_cuda_version
 from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
 from inference.msa_v1._build_utils import torch_cuda_arch as _resolve_torch_arch
@@ -98,31 +99,32 @@ class JitSpec:
         cpp_extension.CUDA_HOME = str(_cuda_home())
         os.environ["TORCH_CUDA_ARCH_LIST"] = _torch_arch(self.target_arch)
         try:
-            extension = cpp_extension.load(
-                name=module_name,
-                sources=[
-                    str(_API / "dequant_api.cpp"),
-                    str(_API / "dequant_binding.cpp"),
-                    str(_SRC / "dequant.cu"),
-                ],
-                extra_include_paths=[
-                    str(_API),
-                    str(_INCLUDE),
-                    str(cutlass_root() / "include"),
-                ],
-                extra_cflags=["-O3", "-DNDEBUG", "-std=c++20"],
-                extra_cuda_cflags=[
-                    "-O3",
-                    "-DNDEBUG",
-                    "-lineinfo",
-                    "-std=c++20",
-                    "-Xptxas=-O3",
-                ],
-                extra_ldflags=["-lcuda", f"-Wl,-rpath,{_cuda_home() / 'lib64'}"],
-                build_directory=str(cache_dir),
-                verbose=False,
-                with_cuda=True,
-            )
+            with jit_build_lock(cache_dir):
+                extension = cpp_extension.load(
+                    name=module_name,
+                    sources=[
+                        str(_API / "dequant_api.cpp"),
+                        str(_API / "dequant_binding.cpp"),
+                        str(_SRC / "dequant.cu"),
+                    ],
+                    extra_include_paths=[
+                        str(_API),
+                        str(_INCLUDE),
+                        str(cutlass_root() / "include"),
+                    ],
+                    extra_cflags=["-O3", "-DNDEBUG", "-std=c++20"],
+                    extra_cuda_cflags=[
+                        "-O3",
+                        "-DNDEBUG",
+                        "-lineinfo",
+                        "-std=c++20",
+                        "-Xptxas=-O3",
+                    ],
+                    extra_ldflags=["-lcuda", f"-Wl,-rpath,{_cuda_home() / 'lib64'}"],
+                    build_directory=str(cache_dir),
+                    verbose=False,
+                    with_cuda=True,
+                )
         finally:
             cpp_extension.CUDA_HOME = previous_cuda_home
             if previous_arch_list is None:

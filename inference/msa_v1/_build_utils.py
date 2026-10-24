@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import fcntl
+import logging
 import os
 import re
 import shutil
 import subprocess
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
+from typing import Iterator
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MM_SPARSE_TARGET_ARCH = "MM_SPARSE_TARGET_ARCH"
+_LOGGER = logging.getLogger(__name__)
 
 
 def normalize_target_arch(
@@ -181,11 +186,55 @@ def cutlass_root() -> Path:
     )
 
 
+# torch.utils.cpp_extension up to torch 2.13 guards a build directory with a FileBaton: an
+# O_EXCL file named "lock" that other processes poll until it disappears. A builder that dies
+# mid-compile (SIGKILL, OOM killer, container eviction) leaves that file behind, and every
+# later process that loads the same extension then waits forever without any output.
+# torch 2.14 replaced it with an OS-level lock that its holder's death releases.
+_TORCH_BATON_NAME = "lock"
+
+
+@lru_cache(maxsize=1)
+def _torch_uses_file_baton() -> bool:
+    from torch.utils import cpp_extension
+
+    return hasattr(cpp_extension, "FileBaton") and not hasattr(cpp_extension, "FileLock")
+
+
+@contextmanager
+def jit_build_lock(build_directory: str | os.PathLike) -> Iterator[None]:
+    """Serialize one extension build directory across processes, robust to killed builders.
+
+    Holds an fcntl lock on ``<build_directory>/build.lock`` around the build. The kernel
+    releases it when the holder exits, however it exits. Every MSA builder of the
+    directory takes this lock before calling ``cpp_extension.load``, so with a torch that
+    still uses FileBaton, a baton file that exists while we hold it was left by a dead
+    builder; remove it.
+    """
+
+    directory = Path(build_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "build.lock").open("a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            baton = directory / _TORCH_BATON_NAME
+            if _torch_uses_file_baton() and baton.exists():
+                _LOGGER.warning(
+                    "Removing a stale torch extension lock left by an interrupted build: %s",
+                    baton,
+                )
+                baton.unlink(missing_ok=True)
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 __all__ = [
     "MM_SPARSE_TARGET_ARCH",
     "cuda_home",
     "cuda_version",
     "cutlass_root",
+    "jit_build_lock",
     "normalize_target_arch",
     "require_cuda_version",
     "target_arch",
