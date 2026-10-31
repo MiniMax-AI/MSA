@@ -21,7 +21,7 @@ from inference.msa_v1.indexer._common.topk_select import _topk_select
 from inference.msa_v1.indexer._common.topk_select.interface import (
     MAXIMUM_COLUMNS as _MAXIMUM_COLUMNS,
 )
-from inference.msa_v1.indexer.prefill.bf16.indexer_gemm import (
+from inference.msa_v1.indexer.prefill.bf16.indexer_gemm_sm100 import (
     M3_PAGED_DIRECT_SCORE_NUM_HEADS,
     M3IndexerGemmSm100,
 )

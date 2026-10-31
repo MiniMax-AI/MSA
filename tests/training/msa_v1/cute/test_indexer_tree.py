@@ -303,7 +303,7 @@ def test_tree_indexer_rejects_non_boolean_deterministic() -> None:
 def test_tree_indexer_rebases_direct_output_in_preallocated_storage(
     use_fp16_score: bool,
 ) -> None:
-    from msa_v1.indexer_tree import m3_indexer as tree_indexer_module
+    from msa_v1.indexer_tree import indexer_forward as tree_indexer_module
 
     q_len = 1
     k_len = 2304
@@ -389,7 +389,7 @@ def test_tree_indexer_rebases_gather_output(
     deterministic: bool,
     use_fp16_score: bool,
 ) -> None:
-    from msa_v1.indexer_tree import m3_indexer as tree_indexer_module
+    from msa_v1.indexer_tree import indexer_forward as tree_indexer_module
 
     q_len = 17
     k_len = 2816
@@ -532,7 +532,7 @@ def test_tree_indexer_leading_empty_interval_matches_prefix_plan() -> None:
 def test_tree_indexer_gather_lse_matches_causal_reference_for_odd_tile_counts(
     use_fp16_score: bool,
 ) -> None:
-    from msa_v1.indexer_tree import m3_indexer as tree_indexer_module
+    from msa_v1.indexer_tree import indexer_forward as tree_indexer_module
 
     torch.manual_seed(43)
     q_len = 2305

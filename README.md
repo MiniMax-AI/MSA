@@ -78,17 +78,32 @@ nvidia-cutlass-dsl[cu13]>=4.5.2
 Install the project with:
 
 ```bash
-git submodule update --init --recursive
-python -m pip install -e ".[test]"
+python -m pip install /path/to/minimax_msa-0.1.0rc1-py3-none-any.whl
+python -c 'from importlib.metadata import version; print(version("minimax-msa"))'
+python -m pip check
 ```
 
-When using a regular package installation, the C++ operators and Q8KV8 prefill indexer
-still require public CUTLASS headers. Keep a CUTLASS checkout and set `CUTLASS_ROOT`.
-For example, run from the repository root:
+This branch of `minimax-msa` includes MSA v1 training and inference. Its distribution
+version is independent of the `msa_v1` operator name. The first wheel is a release
+candidate; these instructions do not imply it has been published on PyPI.
+It does not replace the older `fmha_sm100` distribution or preserve that package's
+import paths. Existing imports documented below remain unchanged.
+
+The wheel contains runtime JIT sources, templates, and pinned CUTLASS headers.
+Installation does not compile kernels; C++ JIT paths still require Linux, a
+compatible CUDA Toolkit with `nvcc`, and a C++20 host compiler at first use.
+The `py3-none-any` filename describes the packaged Python/source payload, not
+support for arbitrary operating systems or GPUs. A driver-only runtime image is
+insufficient for C++ JIT. The installation directory may be read-only; compilation
+requires a writable cache directory. MSA v1 attention AOT paths require
+`FMHA_SM100_ALLOW_JIT=1` to populate a cold cache; existing warmed AOT-only
+operation remains available.
+
+For an editable development install, initialize the pinned dependency first:
 
 ```bash
-export CUTLASS_ROOT="$PWD/third_party/cutlass"
-python -m pip install .
+git submodule update --init third_party/cutlass
+python -m pip install -e ".[test]"
 ```
 
 Rebuild AOT artifacts after upgrading DSL; do not reuse compiled
@@ -128,6 +143,20 @@ Q8KV4 decode also retains SM107 GQA=16 support, requiring CUDA Toolkit 13.5 or n
 Rubin (SM107) retains BF16/Q8KV8 prefill attention, Q8KV8 prefill indexer, and Q8KV4 decode attention paths,
 selected from the input tensor device. See the operator READMEs for dependencies and restrictions.
 This does not imply Rubin support for the other operators.
+
+### Module-name migration
+
+Public APIs and signatures remain unchanged. Renamed internal modules retain their old import
+paths throughout `0.1.x`; both paths resolve to the same implementation and state. Existing
+validation and benchmark commands remain available through compatibility entry points.
+The complete path mapping is in [module-renames.json](release/module-renames.json).
+The CSR builder now lives in `k2q_csr_builder.py`; imports of `SparseK2qCsrBuilderSm100`
+from `prepare_k2q_csr` remain available throughout `0.1.x` and return the same class.
+
+Renames change the source fingerprint used by AOT caches. Expect first-use recompilation after
+upgrading and warm the required model paths before serving traffic. Use a writable cache and do
+not force reuse of artifacts from an older source fingerprint. Roll back by installing the previous
+validated wheel with its matching dependency environment.
 
 ## 3. Main interfaces
 

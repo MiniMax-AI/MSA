@@ -23,7 +23,7 @@ from inference.msa_v1.indexer._common.topk_select import _topk_select
 from inference.msa_v1.indexer._common.topk_select.interface import (
     MAXIMUM_COLUMNS as _MAXIMUM_PAGES,
 )
-from inference.msa_v1.indexer.decode.indexer_gemm import DecodeIndexerGemmSm100
+from inference.msa_v1.indexer.decode.indexer_gemm_sm100 import DecodeIndexerGemmSm100
 from inference.msa_v1.indexer.decode.plan import BatchDecodeIndexerPlan
 
 logger = logging.getLogger(__name__)

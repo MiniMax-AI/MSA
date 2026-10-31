@@ -72,16 +72,27 @@ nvidia-cutlass-dsl[cu13]>=4.5.2
 安装项目：
 
 ```bash
-git submodule update --init --recursive
-python -m pip install -e ".[test]"
+python -m pip install /path/to/minimax_msa-0.1.0rc1-py3-none-any.whl
+python -c 'from importlib.metadata import version; print(version("minimax-msa"))'
+python -m pip check
 ```
 
-作为普通安装包使用时，C++ 算子和 Q8KV8 prefill indexer 仍需要公开 CUTLASS headers。
-保留 CUTLASS checkout，并通过 `CUTLASS_ROOT` 指定位置。例如在仓库根目录执行：
+本分支的 `minimax-msa` 包含 MSA v1 训练和推理，发行版本独立于 `msa_v1` 算子名称。
+首份 wheel 是候选版；这些说明不表示它已经发布到 PyPI。它不替代旧的
+`fmha_sm100` 发行包，也不承诺兼容旧包的 import 路径。下文所列现有公开 import 保持不变。
+
+wheel 自带运行时 JIT 源码、模板和固定版本的 CUTLASS 头文件。安装时不编译 kernel；
+C++ JIT 路径首次运行仍需要 Linux、带 `nvcc` 的兼容 CUDA Toolkit 和支持 C++20 的
+宿主编译器。文件名中的 `py3-none-any` 描述 Python/源码载荷，不表示支持任意操作系统
+或 GPU。仅有驱动的 runtime 镜像不足以运行 C++ JIT。安装目录可以只读，编译缓存目录
+必须可写。MSA v1 attention 的 AOT 路径在冷缓存首次编译时需要
+`FMHA_SM100_ALLOW_JIT=1`；已有的预热 AOT-only 用法保持不变。
+
+开发时使用 editable 安装，先初始化固定版本的依赖：
 
 ```bash
-export CUTLASS_ROOT="$PWD/third_party/cutlass"
-python -m pip install .
+git submodule update --init third_party/cutlass
+python -m pip install -e ".[test]"
 ```
 
 升级 DSL 后需要重新构建 AOT 产物，
@@ -116,6 +127,18 @@ Q8KV4 decode 另保留 SM107 的 GQA=16 支持，需要 CUDA Toolkit 13.5 或更
 
 Rubin（SM107）保留 BF16/Q8KV8 prefill attention、Q8KV8 prefill indexer 和 Q8KV4 decode attention 路径，
 通过输入 tensor 所在设备自动选择；具体依赖和限制见各算子 README。其余算子不据此声明 Rubin 支持。
+
+### 模块命名迁移
+
+公开 API 和签名保持不变。改名的内部模块在整个 `0.1.x` 保留旧 import 路径，新旧路径指向
+同一实现和状态。已有验收与 benchmark 命令通过兼容入口继续可用。
+完整路径映射见 [module-renames.json](release/module-renames.json)。
+CSR builder 已移至 `k2q_csr_builder.py`；在整个 `0.1.x`，仍可从 `prepare_k2q_csr`
+导入 `SparseK2qCsrBuilderSm100`，并获得同一个类。
+
+改名会改变 AOT 缓存使用的源码指纹。升级后首次使用需要重新编译，上线前应预热实际模型
+路径。使用可写缓存，不要强行复用旧源码指纹的产物。回滚时安装上一已验收 wheel 及其对应
+依赖环境。
 
 ## 3. 主要接口
 

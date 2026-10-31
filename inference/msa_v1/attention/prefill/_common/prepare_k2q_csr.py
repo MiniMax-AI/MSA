@@ -1,428 +1,1262 @@
-"""Fixed MSA v1 q2k-to-k2q CSR preparation on SM100."""
+"""Fixed-configuration CuTe DSL q2k-to-k2q metadata pipeline."""
 
 from __future__ import annotations
 
+import math
+from typing import Optional
+
 import cutlass
+from cutlass import Int32, const_expr
 import cutlass.cute as cute
-import torch
+from cutlass.cute import nvgpu
+import cuda.bindings.driver as cuda
 
-from inference.msa_v1.aot_cache import compile_or_load
-from inference.msa_v1.attention.prefill._common.dsl.compile_utils import (
-    compile_with_timing,
-)
-from inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import to_cute_tensor
-from inference.msa_v1.attention.prefill._common.prepare_k2q_csr_cutedsl import (
-    SparseK2qCsrPipelineSm100,
-)
 from inference.msa_v1.attention.prefill._common.prepare_scheduler import (
-    SPARSE_SCHEDULE_MODEL,
-    SparseAttentionSchedule,
+    KL_VALID_ROWS_MASK,
+    KL_WRITER_RANK_MASK,
+    KL_WRITER_RANK_SHIFT,
 )
 
-_QHEAD_PER_KV = 16
 _TOPK = 16
 _BLOCK_K = 128
+_KL_Q_PER_MACRO = 16
+# The histogram assigns one warp to each fixed KV head.
 _WARPS = 4
 _THREADS = _WARPS * cute.arch.WARP_SIZE
-_INT32_BYTES = cutlass.Int32.width // 8
-# A KL work owns at most 16 query macros for one physical KV block.
-_KL_Q_PER_MACRO = 16
-_KL_MACROS_PER_WORK = 16
-_KL_TARGET_Q_PER_CTA = _KL_Q_PER_MACRO * _KL_MACROS_PER_WORK
-_COMPILE_CACHE: dict[tuple, object] = {}
+# The row-prefix scan uses the SM100 architectural thread limit. Auxiliary
+# row kernels use an eight-warp layout and keep one prefix row per warp.
+_SM100_MAX_THREADS_PER_CTA = 1024
+_AUXILIARY_WARPS = 8
+_PREFIX_THREADS = _SM100_MAX_THREADS_PER_CTA
+_KL_SCHEDULE_THREADS = _AUXILIARY_WARPS * cute.arch.WARP_SIZE
+_TILE_PREFIX_THREADS = _KL_SCHEDULE_THREADS
+_ROWS_PER_PREFIX_CTA = _TILE_PREFIX_THREADS // cute.arch.WARP_SIZE
+# A bucket spans at most the accepted 5% scheduling-cost quantization error.
+_MAX_SCHEDULE_BUCKET_WIDTH = 0.05
+_SCHEDULE_BUCKETS = math.ceil(1.0 / _MAX_SCHEDULE_BUCKET_WIDTH)
+# The reorder CTA uses two Int32 matrices (counts and offsets) plus one bucket
+# base vector. Derive its maximum row domain from the SM100 per-CTA SMEM limit.
+_SM100_SHARED_MEMORY_BYTES = 232448
+_INT32_BYTES = Int32.width // 8
+_VECTOR_BITS = 128
+_VECTOR_BYTES = _VECTOR_BITS // 8
+_INT32_VECTOR_ELEMENTS = _VECTOR_BITS // Int32.width
+_WARP_THREADS = cute.arch.WARP_SIZE
+_REORDER_THREADS = _TILE_PREFIX_THREADS
+_REORDER_WARPS = _REORDER_THREADS // _WARP_THREADS
+_REORDER_FIXED_WORDS = _SCHEDULE_BUCKETS
+_REORDER_WORDS_PER_CHUNK = 2 * _SCHEDULE_BUCKETS
+_REORDER_MAX_CHUNKS = (
+    _SM100_SHARED_MEMORY_BYTES // _INT32_BYTES - _REORDER_FIXED_WORDS
+) // _REORDER_WORDS_PER_CHUNK
+_SCHEDULE_REORDER_CAPACITY = _REORDER_MAX_CHUNKS * _WARP_THREADS
 
 
-def _ceil_div(value: int, divisor: int) -> int:
-    return (value + divisor - 1) // divisor
+class SparseK2qCsrPipelineSm100:
+    """Launch the fixed MSA v1 CSR and schedule preparation pipeline."""
 
+    def __init__(self, *, head_kv: int = 4) -> None:
+        if head_kv <= 0:
+            raise ValueError("head_kv must be positive")
+        self.head_kv = int(head_kv)
 
-def _as_cute_tensor(tensor: torch.Tensor | None) -> cute.Tensor | None:
-    if tensor is None:
-        return None
-    return to_cute_tensor(tensor, leading_dim=tensor.ndim - 1)
-
-
-def _get_compiled_pipeline(
-    tensors: tuple[torch.Tensor | None, ...],
-    scalar_args: tuple[int, ...],
-    *,
-    head_kv: int,
-    reorder_schedule: bool,
-    prepare_kl_schedule: bool,
-) -> object:
-    device = tensors[0].device
-    has_fragment_indices = tensors[3] is not None
-    base_key = (
-        "sparse_k2q_csr_physical_kl_sm100",
-        torch.cuda.get_device_capability(device),
-        reorder_schedule,
-        prepare_kl_schedule,
-        has_fragment_indices,
-    )
-    key = base_key if head_kv == 4 else (*base_key, f"hkv{head_kv}")
-    if key not in _COMPILE_CACHE:
-        _COMPILE_CACHE[key] = compile_or_load(
-            key,
-            lambda: compile_with_timing(
-                SparseK2qCsrPipelineSm100(head_kv=head_kv),
-                *(_as_cute_tensor(tensor) for tensor in tensors),
-                *(cutlass.Int32(value) for value in scalar_args),
-                reorder_schedule,
-                prepare_kl_schedule,
-                cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-                options="--enable-tvm-ffi",
-            ),
-            log_prefix="sparse_k2q_csr_prepare",
+    @cute.jit
+    def _rows_in_batch(
+        self,
+        mCuSeqlensK: cute.Tensor,
+        batch_idx: Int32,
+        mFragmentIndices: Optional[cute.Tensor],
+    ) -> Int32:
+        start_idx = (
+            batch_idx
+            if const_expr(mFragmentIndices is None)
+            else mFragmentIndices[batch_idx]
         )
-    return _COMPILE_CACHE[key]
+        seqlen = mCuSeqlensK[batch_idx + Int32(1)] - mCuSeqlensK[start_idx]
+        return (seqlen + Int32(_BLOCK_K - 1)) // Int32(_BLOCK_K)
 
+    @cute.jit
+    def _row_linear_for_batch_level(
+        self,
+        mCuSeqlensK: cute.Tensor,
+        batch_idx: Int32,
+        level: Int32,
+        batch: Int32,
+        mFragmentIndices: Optional[cute.Tensor],
+    ) -> Int32:
+        rows_before = Int32(0)
+        active_before = Int32(0)
+        for b in cutlass.range(batch, unroll=1):
+            rows = self._rows_in_batch(mCuSeqlensK, b, mFragmentIndices)
+            rows_before += cutlass.min(rows, level)
+            if b < batch_idx and rows > level:
+                active_before += Int32(1)
+        return rows_before + active_before
 
-class SparseK2qCsrBuilderSm100:
-    """Build fixed-configuration packed-varlen CSR and schedule metadata."""
+    @cute.jit
+    def _atomic_inc_packed_i16(
+        self,
+        sPacked: cute.Tensor,
+        row: Int32,
+    ) -> Int32:
+        word_idx = row // Int32(2)
+        shift = (row & Int32(1)) * Int32(16)
+        delta = Int32(1) << shift
+        old = cute.arch.atomic_add(
+            (sPacked.iterator + word_idx).llvm_ptr,
+            delta,
+            sem="relaxed",
+            scope="cta",
+        )
+        return (old >> shift) & Int32(0xFFFF)
 
+    @cute.jit
+    def _read_packed_i16(
+        self,
+        sPacked: cute.Tensor,
+        row: Int32,
+    ) -> Int32:
+        shift = (row & Int32(1)) * Int32(16)
+        return (sPacked[row // Int32(2)] >> shift) & Int32(0xFFFF)
+
+    @cute.jit
     def __call__(
         self,
-        q2k_indices: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        *,
-        total_k: int,
-        total_rows: int,
-        blk_kv: int = _BLOCK_K,
-        max_seqlen_k: int | None = None,
-        max_seqlen_q: int | None = None,
-        qhead_per_kv: int = _QHEAD_PER_KV,
-        fragment_indices: torch.Tensor | None = None,
-        prepare_kl_schedule: bool = True,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        SparseAttentionSchedule,
-        SparseAttentionSchedule,
-    ]:
-        self._validate_inputs(
-            q2k_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            fragment_indices,
-            blk_kv=blk_kv,
-            qhead_per_kv=qhead_per_kv,
+        mQ2K: cute.Tensor,
+        mCuSeqlensQ: cute.Tensor,
+        mCuSeqlensK: cute.Tensor,
+        mFragmentIndices: Optional[cute.Tensor],
+        mRowMap: cute.Tensor,
+        mRowCoords: cute.Tensor,
+        mQIdx: cute.Tensor,
+        mQSplitIdx: cute.Tensor,
+        mSplitCounts: cute.Tensor,
+        mRowCounts: cute.Tensor,
+        mTileCounts: cute.Tensor,
+        mRowPtr: cute.Tensor,
+        mSchedulerMetadataUnsorted: cute.Tensor,
+        mSchedulerMetadata: cute.Tensor,
+        mWorkCount: cute.Tensor,
+        mDkvOwnerCounts: cute.Tensor,
+        mDkvSplitIndices: cute.Tensor,
+        mDkvSplitCount: cute.Tensor,
+        mKlSchedulerMetadata: cute.Tensor,
+        mKlWorkCount: cute.Tensor,
+        mKlPhysicalRowCounts: cute.Tensor,
+        mKlPhysicalRowPtr: cute.Tensor,
+        mKlPhysicalKOffsets: cute.Tensor,
+        mKlPhysicalQIndices: cute.Tensor,
+        mKlPhysicalValidRows: cute.Tensor,
+        mKlDkiOwnerCounts: cute.Tensor,
+        mKlDkiSplitIndices: cute.Tensor,
+        mKlDkiSplitCount: cute.Tensor,
+        batch: Int32,
+        total_q: Int32,
+        total_rows: Int32,
+        max_kv_blocks: Int32,
+        partitions_per_batch: Int32,
+        q_per_cta: Int32,
+        q_per_warp: Int32,
+        target_q_per_cta: Int32,
+        work_capacity: Int32,
+        padded_kv_blocks: Int32,
+        kl_target_q_per_cta: Int32,
+        kl_work_capacity: Int32,
+        reorder_schedule: cutlass.Constexpr[bool],
+        prepare_kl_schedule: cutlass.Constexpr[bool],
+        stream: cuda.CUstream = None,
+    ):
+        num_q_idx = Int32(self.head_kv * _TOPK) * total_q
+        num_row_counts = Int32(self.head_kv) * batch * max_kv_blocks
+        num_owner_counts = Int32(self.head_kv) * padded_kv_blocks
+        fill_copy_atom = cute.make_copy_atom(
+            nvgpu.CopyUniversalOp(),
+            Int32,
+            num_bits_per_copy=128,
         )
-        if max_seqlen_q is None or max_seqlen_k is None:
-            raise ValueError("max_seqlen_q and max_seqlen_k are required")
-
-        total_k = int(total_k)
-        total_rows = int(total_rows)
-        max_seqlen_q = int(max_seqlen_q)
-        max_seqlen_k = int(max_seqlen_k)
-        if min(total_k, total_rows, max_seqlen_q, max_seqlen_k) < 0:
-            raise ValueError("sequence sizes must be non-negative")
-
-        batch = int(cu_seqlens_q.numel() - 1)
-        total_q = int(q2k_indices.shape[1])
-        head_kv = int(q2k_indices.shape[0])
-        max_kv_blocks = _ceil_div(max(max_seqlen_k, _BLOCK_K), _BLOCK_K)
-        padded_kv_blocks = (total_k + (batch + 1) * _BLOCK_K - 1) // _BLOCK_K
-        nnz_upper_bound = total_q * _TOPK
-        device = q2k_indices.device
-        target_q_per_cta = SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta(
-            total_q=total_q,
-            topk=_TOPK,
-            head_kv=head_kv,
-            qhead_per_kv=qhead_per_kv,
-            device=device,
-        )
-        work_capacity = SPARSE_SCHEDULE_MODEL.flat_schedule_capacity(
-            total_rows=total_rows,
-            total_q=total_q,
-            topk=_TOPK,
-            head_kv=head_kv,
-            target_q_per_cta=target_q_per_cta,
-        )
-        kl_work_capacity = SPARSE_SCHEDULE_MODEL.physical_kl_schedule_capacity(
-            total_q=total_q,
-            topk=_TOPK,
-            head_kv=head_kv,
-            padded_kv_blocks=padded_kv_blocks,
-            q_per_macro=_KL_Q_PER_MACRO,
-            macros_per_work=_KL_MACROS_PER_WORK,
-        )
-        partitions_per_batch, q_per_cta, q_per_warp = self._partition_config(
-            batch=batch,
-            max_seqlen_q=max_seqlen_q,
-            max_kv_blocks=max_kv_blocks,
-            device=device,
-        )
-        # Dynamic workers process the largest rows first to minimize the final-wave tail.
-        reorder_schedule = True
-        row_ptr = torch.empty(
-            (head_kv, total_rows + 1),
-            dtype=torch.int32,
-            device=device,
-        )
-        q_idx = torch.empty(
-            (head_kv, nnz_upper_bound),
-            dtype=torch.int32,
-            device=device,
-        )
-
-        scheduler_metadata = torch.empty(
-            (work_capacity, 6),
-            dtype=torch.int32,
-            device=device,
-        )
-        work_count = torch.empty((1,), dtype=torch.int32, device=device)
-        dkv_owner_counts = torch.empty(
-            (head_kv, padded_kv_blocks),
-            dtype=torch.int32,
-            device=device,
-        )
-        dkv_split_indices = torch.empty(
-            (work_capacity,), dtype=torch.int32, device=device
-        )
-        dkv_split_count = torch.empty((1,), dtype=torch.int32, device=device)
-        kl_scheduler_metadata = torch.empty(
-            (kl_work_capacity, 4),
-            dtype=torch.int32,
-            device=device,
-        )
-        kl_work_count = torch.empty((1,), dtype=torch.int32, device=device)
-        kl_physical_row_ptr = torch.empty(
-            (head_kv, padded_kv_blocks + 1),
-            dtype=torch.int32,
-            device=device,
-        )
-        kl_physical_q_indices = torch.empty_like(q_idx)
-        kl_physical_valid_rows = torch.empty_like(q_idx)
-        kl_dki_owner_counts = torch.empty(
-            (padded_kv_blocks,), dtype=torch.int32, device=device
-        )
-        kl_dki_split_indices = torch.empty_like(kl_dki_owner_counts)
-        kl_dki_split_count = torch.empty((1,), dtype=torch.int32, device=device)
-        qsplit_idx = torch.empty_like(q_idx)
-        split_counts = torch.empty(
-            (total_q, head_kv),
-            dtype=torch.int32,
-            device=device,
-        )
-        schedule = SparseAttentionSchedule(
-            enabled=True,
-            scheduler_metadata=scheduler_metadata,
-            work_count=work_count,
-            qsplit_indices=qsplit_idx,
-            split_counts=split_counts,
-            dkv_owner_counts=dkv_owner_counts,
-            dkv_split_indices=dkv_split_indices,
-            dkv_split_count=dkv_split_count,
-            target_q_per_cta=target_q_per_cta,
-        )
-        kl_schedule = SparseAttentionSchedule(
-            enabled=prepare_kl_schedule,
-            scheduler_metadata=kl_scheduler_metadata,
-            work_count=kl_work_count,
-            physical_row_ptr=kl_physical_row_ptr,
-            physical_q_indices=kl_physical_q_indices,
-            physical_valid_rows=kl_physical_valid_rows,
-            dki_owner_counts=kl_dki_owner_counts,
-            dki_split_indices=kl_dki_split_indices,
-            dki_split_count=kl_dki_split_count,
-            target_q_per_cta=_KL_TARGET_Q_PER_CTA,
-        )
-
-        if total_rows == 0 or total_q == 0:
-            row_ptr.zero_()
-            q_idx.fill_(-1)
-            work_count.zero_()
-            dkv_owner_counts.zero_()
-            dkv_split_count.zero_()
-            kl_work_count.zero_()
-            kl_physical_row_ptr.zero_()
-            kl_dki_owner_counts.zero_()
-            kl_dki_split_count.zero_()
-            split_counts.zero_()
-            return row_ptr, q_idx, schedule, kl_schedule
-
-        row_map = torch.empty(
-            (batch, max_kv_blocks),
-            dtype=torch.int32,
-            device=device,
-        )
-        row_coords = torch.empty(
-            (total_rows, 2),
-            dtype=torch.int32,
-            device=device,
-        )
-        row_counts = torch.empty(
-            (head_kv, batch, max_kv_blocks),
-            dtype=torch.int32,
-            device=device,
-        )
-        tile_counts = torch.empty(
-            (
-                batch * partitions_per_batch * _WARPS,
-                head_kv,
-                max_kv_blocks,
+        self.init_kernel(
+            fill_copy_atom,
+            mQIdx,
+            mRowCounts,
+            mWorkCount,
+            mDkvOwnerCounts,
+            mDkvSplitCount,
+            mKlWorkCount,
+            mKlPhysicalRowCounts,
+            mKlPhysicalKOffsets,
+            mKlDkiOwnerCounts,
+            mKlDkiSplitCount,
+            num_q_idx,
+            num_row_counts,
+            cutlass.max(num_owner_counts, padded_kv_blocks),
+            padded_kv_blocks,
+            prepare_kl_schedule,
+        ).launch(
+            grid=(
+                cute.ceil_div(
+                    cutlass.max(
+                        cutlass.max(
+                            num_q_idx // Int32(_INT32_VECTOR_ELEMENTS),
+                            num_row_counts,
+                        ),
+                        num_owner_counts,
+                    ),
+                    _KL_SCHEDULE_THREADS,
+                ),
+                1,
+                1,
             ),
-            dtype=torch.int32,
-            device=device,
+            block=(_KL_SCHEDULE_THREADS, 1, 1),
+            stream=stream,
         )
-        scheduler_workspace = (
-            torch.empty_like(scheduler_metadata) if reorder_schedule else None
-        )
-        kl_physical_row_counts = torch.empty(
-            (head_kv, padded_kv_blocks),
-            dtype=torch.int32,
-            device=device,
-        )
-        kl_physical_k_offsets = torch.empty(
-            (padded_kv_blocks,),
-            dtype=torch.int32,
-            device=device,
-        )
-        scheduler_unsorted = (
-            scheduler_workspace if reorder_schedule else scheduler_metadata
-        )
-        tensors = (
-            q2k_indices,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            fragment_indices,
-            row_map,
-            row_coords,
-            q_idx,
-            qsplit_idx,
-            split_counts,
-            row_counts,
-            tile_counts,
-            row_ptr,
-            scheduler_unsorted,
-            scheduler_metadata,
-            work_count,
-            dkv_owner_counts,
-            dkv_split_indices,
-            dkv_split_count,
-            kl_scheduler_metadata,
-            kl_work_count,
-            kl_physical_row_counts,
-            kl_physical_row_ptr,
-            kl_physical_k_offsets,
-            kl_physical_q_indices,
-            kl_physical_valid_rows,
-            kl_dki_owner_counts,
-            kl_dki_split_indices,
-            kl_dki_split_count,
-        )
-        scalar_args = (
+        self.histogram_kernel(
+            mQ2K,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mFragmentIndices,
+            mRowMap,
+            mRowCoords,
+            mRowCounts,
+            mTileCounts,
             batch,
-            total_q,
-            total_rows,
             max_kv_blocks,
             partitions_per_batch,
             q_per_cta,
             q_per_warp,
+        ).launch(
+            grid=(batch * partitions_per_batch, 1, 1),
+            block=(_THREADS, 1, 1),
+            smem=(
+                Int32(_WARPS)
+                * ((max_kv_blocks + Int32(1)) // Int32(2))
+                * Int32(_INT32_BYTES)
+            ),
+            stream=stream,
+        )
+        self.row_prefix_kernel(
+            mRowCounts,
+            mRowPtr,
+            mRowCoords,
+            mSchedulerMetadataUnsorted,
+            mWorkCount,
+            mDkvOwnerCounts,
+            mDkvSplitIndices,
+            mDkvSplitCount,
+            mCuSeqlensK,
+            mFragmentIndices,
+            mKlPhysicalRowCounts,
+            mKlPhysicalKOffsets,
+            total_rows,
             target_q_per_cta,
             work_capacity,
             padded_kv_blocks,
-            _KL_TARGET_Q_PER_CTA,
-            kl_work_capacity,
+            prepare_kl_schedule,
+        ).launch(
+            grid=(self.head_kv, 1, 1),
+            block=(_PREFIX_THREADS, 1, 1),
+            smem=_PREFIX_THREADS * _INT32_BYTES,
+            stream=stream,
         )
-        compiled = _get_compiled_pipeline(
-            tensors,
-            scalar_args,
-            head_kv=head_kv,
-            reorder_schedule=reorder_schedule,
-            prepare_kl_schedule=prepare_kl_schedule,
+        if const_expr(prepare_kl_schedule):
+            self.kl_physical_prefix_kernel(
+                mKlPhysicalRowCounts,
+                mKlPhysicalRowPtr,
+                padded_kv_blocks,
+            ).launch(
+                grid=(self.head_kv, 1, 1),
+                block=(_PREFIX_THREADS, 1, 1),
+                smem=_PREFIX_THREADS * _INT32_BYTES,
+                stream=stream,
+            )
+            self.kl_physical_schedule_kernel(
+                mKlPhysicalRowPtr,
+                mKlPhysicalKOffsets,
+                mKlSchedulerMetadata,
+                mKlWorkCount,
+                mKlDkiOwnerCounts,
+                mKlDkiSplitIndices,
+                mKlDkiSplitCount,
+                padded_kv_blocks,
+                kl_target_q_per_cta,
+                kl_work_capacity,
+            ).launch(
+                grid=(
+                    cute.ceil_div(padded_kv_blocks, _KL_SCHEDULE_THREADS),
+                    1,
+                    1,
+                ),
+                block=(_KL_SCHEDULE_THREADS, 1, 1),
+                smem=0,
+                stream=stream,
+            )
+        if const_expr(reorder_schedule):
+            self.reorder_schedule_kernel(
+                mSchedulerMetadataUnsorted,
+                mSchedulerMetadata,
+                mWorkCount,
+                work_capacity,
+                target_q_per_cta,
+            ).launch(
+                grid=(1, 1, 1),
+                block=(_REORDER_THREADS, 1, 1),
+                smem=(
+                    _REORDER_MAX_CHUNKS * _REORDER_WORDS_PER_CHUNK
+                    + _REORDER_FIXED_WORDS
+                )
+                * _INT32_BYTES,
+                stream=stream,
+            )
+        self.tile_prefix_kernel(
+            mTileCounts,
+            mRowPtr,
+            mRowMap,
+            batch,
+            total_rows,
+            max_kv_blocks,
+            partitions_per_batch,
+        ).launch(
+            grid=(
+                self.head_kv
+                * batch
+                * cute.ceil_div(max_kv_blocks, _ROWS_PER_PREFIX_CTA),
+                1,
+                1,
+            ),
+            block=(_TILE_PREFIX_THREADS, 1, 1),
+            smem=(
+                _ROWS_PER_PREFIX_CTA
+                * partitions_per_batch
+                * _WARPS
+                * _INT32_BYTES
+            ),
+            stream=stream,
         )
-        with torch.cuda.nvtx.range("SparseK2qCsr_Pipeline"):
-            compiled(*tensors, *scalar_args)
-        return row_ptr, q_idx, schedule, kl_schedule
+        self.scatter_kernel(
+            mQ2K,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mFragmentIndices,
+            mRowMap,
+            mTileCounts,
+            mQIdx,
+            mQSplitIdx,
+            mSplitCounts,
+            mRowCounts,
+            mRowPtr,
+            mKlPhysicalRowPtr,
+            mKlPhysicalQIndices,
+            mKlPhysicalValidRows,
+            total_rows,
+            max_kv_blocks,
+            padded_kv_blocks,
+            partitions_per_batch,
+            q_per_cta,
+            q_per_warp,
+            prepare_kl_schedule,
+        ).launch(
+            grid=(batch * partitions_per_batch, 1, 1),
+            block=(_THREADS, 1, 1),
+            smem=(
+                Int32(_WARPS)
+                * ((max_kv_blocks + Int32(1)) // Int32(2))
+                * Int32(_INT32_BYTES)
+            ),
+            stream=stream,
+        )
 
-    @staticmethod
-    def _validate_inputs(
-        q2k_indices: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        cu_seqlens_k: torch.Tensor,
-        fragment_indices: torch.Tensor | None,
-        *,
-        blk_kv: int,
-        qhead_per_kv: int,
+    @cute.kernel
+    def init_kernel(
+        self,
+        fill_copy_atom: cute.CopyAtom,
+        mQIdx: cute.Tensor,
+        mRowCounts: cute.Tensor,
+        mWorkCount: cute.Tensor,
+        mDkvOwnerCounts: cute.Tensor,
+        mDkvSplitCount: cute.Tensor,
+        mKlWorkCount: cute.Tensor,
+        mKlPhysicalRowCounts: cute.Tensor,
+        mKlPhysicalKOffsets: cute.Tensor,
+        mKlDkiOwnerCounts: cute.Tensor,
+        mKlDkiSplitCount: cute.Tensor,
+        num_q_idx: Int32,
+        num_row_counts: Int32,
+        num_owner_counts: Int32,
+        padded_kv_blocks: Int32,
+        prepare_kl_schedule: cutlass.Constexpr[bool],
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        block_idx = cute.arch.block_idx()[0]
+        grid_dim = cute.arch.grid_dim()[0]
+        idx = block_idx * Int32(_KL_SCHEDULE_THREADS) + tidx
+        stride = grid_dim * Int32(_KL_SCHEDULE_THREADS)
+        gRowCounts = cute.make_tensor(
+            mRowCounts.iterator,
+            cute.make_layout((num_row_counts,)),
+        )
+        vector_idx = idx
+        num_vectors = num_q_idx // Int32(_INT32_VECTOR_ELEMENTS)
+        tFill = cute.make_rmem_tensor((_INT32_VECTOR_ELEMENTS,), Int32)
+        for value_idx in cutlass.range_constexpr(_INT32_VECTOR_ELEMENTS):
+            tFill[value_idx] = Int32(-1)
+        while vector_idx < num_vectors:
+            q_idx = vector_idx * Int32(_INT32_VECTOR_ELEMENTS)
+            qidx_ptr = cute.make_ptr(
+                mQIdx.element_type,
+                (mQIdx.iterator + q_idx).toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=_VECTOR_BYTES,
+            )
+            gFill = cute.make_tensor(qidx_ptr, (_INT32_VECTOR_ELEMENTS,))
+            fill_tiled_copy = cute.make_cotiled_copy(
+                fill_copy_atom,
+                cute.make_layout((1, _INT32_VECTOR_ELEMENTS)),
+                tFill.layout,
+            )
+            fill_thr_copy = fill_tiled_copy.get_slice(0)
+            tFrFill = fill_thr_copy.partition_S(tFill)
+            tFgFill = fill_thr_copy.partition_D(gFill)
+            cute.copy(fill_copy_atom, tFrFill, tFgFill)
+            vector_idx += stride
+        while idx < num_row_counts:
+            gRowCounts[idx] = Int32(0)
+            idx += stride
+        owner_idx = block_idx * Int32(_KL_SCHEDULE_THREADS) + tidx
+        while owner_idx < num_owner_counts:
+            mDkvOwnerCounts[owner_idx] = Int32(0)
+            owner_idx += stride
+        if const_expr(prepare_kl_schedule):
+            kl_idx = block_idx * Int32(_KL_SCHEDULE_THREADS) + tidx
+            num_physical_counts = Int32(self.head_kv) * padded_kv_blocks
+            while kl_idx < num_physical_counts:
+                mKlPhysicalRowCounts[kl_idx] = Int32(0)
+                kl_idx += stride
+            physical_idx = block_idx * Int32(_KL_SCHEDULE_THREADS) + tidx
+            while physical_idx < padded_kv_blocks:
+                mKlPhysicalKOffsets[physical_idx] = Int32(-1)
+                mKlDkiOwnerCounts[physical_idx] = Int32(0)
+                physical_idx += stride
+        if block_idx == Int32(0) and tidx == Int32(0):
+            mWorkCount[Int32(0)] = Int32(0)
+            mDkvSplitCount[Int32(0)] = Int32(0)
+            mKlWorkCount[Int32(0)] = Int32(0)
+            mKlDkiSplitCount[Int32(0)] = Int32(0)
+
+    @cute.kernel
+    def histogram_kernel(
+        self,
+        mQ2K: cute.Tensor,
+        mCuSeqlensQ: cute.Tensor,
+        mCuSeqlensK: cute.Tensor,
+        mFragmentIndices: Optional[cute.Tensor],
+        mRowMap: cute.Tensor,
+        mRowCoords: cute.Tensor,
+        mRowCounts: cute.Tensor,
+        mTileCounts: cute.Tensor,
+        batch: Int32,
+        max_kv_blocks: Int32,
+        partitions_per_batch: Int32,
+        q_per_cta: Int32,
+        q_per_warp: Int32,
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        cta_idx = cute.arch.block_idx()[0]
+        warp_idx = tidx // Int32(32)
+        lane_idx = tidx % Int32(32)
+        batch_idx = cta_idx // partitions_per_batch
+        partition_idx = cta_idx - batch_idx * partitions_per_batch
+        q_start_cta = mCuSeqlensQ[batch_idx] + partition_idx * q_per_cta
+        q_end_cta = cutlass.min(
+            q_start_cta + q_per_cta,
+            mCuSeqlensQ[batch_idx + Int32(1)],
+        )
+        q_start_warp = cutlass.min(
+            q_start_cta + warp_idx * q_per_warp,
+            q_end_cta,
+        )
+        q_end_warp = cutlass.min(q_start_warp + q_per_warp, q_end_cta)
+        packed_per_warp = (max_kv_blocks + Int32(1)) // Int32(2)
+        smem_ptr = cute.arch.get_dyn_smem(Int32, alignment=16)
+        sPacked = cute.make_tensor(
+            smem_ptr,
+            cute.make_layout(
+                (_WARPS, packed_per_warp),
+                stride=(packed_per_warp, 1),
+            ),
+        )
+        sMyPacked = sPacked[warp_idx, None]
+
+        if cta_idx == Int32(0):
+            map_idx = tidx
+            map_entries = batch * max_kv_blocks
+            while map_idx < map_entries:
+                map_batch = map_idx // max_kv_blocks
+                level = map_idx - map_batch * max_kv_blocks
+                rows = self._rows_in_batch(
+                    mCuSeqlensK,
+                    map_batch,
+                    mFragmentIndices,
+                )
+                row = Int32(-1)
+                if level < rows:
+                    row = self._row_linear_for_batch_level(
+                        mCuSeqlensK,
+                        map_batch,
+                        level,
+                        batch,
+                        mFragmentIndices,
+                    )
+                    mRowCoords[row, Int32(0)] = map_batch
+                    mRowCoords[row, Int32(1)] = level
+                mRowMap[map_batch, level] = row
+                map_idx += Int32(_THREADS)
+
+        batch_rows = self._rows_in_batch(
+            mCuSeqlensK,
+            batch_idx,
+            mFragmentIndices,
+        )
+        for head_idx in cutlass.range_constexpr(self.head_kv):
+            packed_idx = lane_idx
+            while packed_idx < packed_per_warp:
+                sMyPacked[packed_idx] = Int32(0)
+                packed_idx += Int32(32)
+            cute.arch.sync_threads()
+
+            q_idx = q_start_warp + lane_idx
+            while q_idx < q_end_warp:
+                for topk_idx in cutlass.range_constexpr(_TOPK):
+                    kv_block = mQ2K[head_idx, q_idx, topk_idx]
+                    if kv_block >= Int32(0) and kv_block < batch_rows:
+                        self._atomic_inc_packed_i16(sMyPacked, kv_block)
+                q_idx += Int32(32)
+            cute.arch.sync_threads()
+
+            row_idx = lane_idx
+            tile_idx = cta_idx * Int32(_WARPS) + warp_idx
+            while row_idx < max_kv_blocks:
+                mTileCounts[tile_idx, head_idx, row_idx] = (
+                    self._read_packed_i16(sMyPacked, row_idx)
+                )
+                row_idx += Int32(32)
+            cute.arch.sync_threads()
+
+            row_idx = tidx
+            while row_idx < max_kv_blocks:
+                row_sum = Int32(0)
+                for source_warp in cutlass.range_constexpr(_WARPS):
+                    row_sum += self._read_packed_i16(
+                        sPacked[source_warp, None],
+                        row_idx,
+                    )
+                if row_sum > Int32(0):
+                    ptr = (
+                        mRowCounts.iterator
+                        + head_idx * batch * max_kv_blocks
+                        + batch_idx * max_kv_blocks
+                        + row_idx
+                    )
+                    cute.arch.atomic_add(
+                        ptr.llvm_ptr,
+                        row_sum,
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                row_idx += Int32(_THREADS)
+            if const_expr(head_idx + 1 < self.head_kv):
+                cute.arch.sync_threads()
+
+    @cute.kernel
+    def row_prefix_kernel(
+        self,
+        mRowCounts: cute.Tensor,
+        mRowPtr: cute.Tensor,
+        mRowCoords: cute.Tensor,
+        mSchedulerMetadata: cute.Tensor,
+        mWorkCount: cute.Tensor,
+        mDkvOwnerCounts: cute.Tensor,
+        mDkvSplitIndices: cute.Tensor,
+        mDkvSplitCount: cute.Tensor,
+        mCuSeqlensK: cute.Tensor,
+        mFragmentIndices: Optional[cute.Tensor],
+        mKlPhysicalRowCounts: cute.Tensor,
+        mKlPhysicalKOffsets: cute.Tensor,
+        total_rows: Int32,
+        target_q_per_cta: Int32,
+        work_capacity: Int32,
+        padded_kv_blocks: Int32,
+        prepare_kl_schedule: cutlass.Constexpr[bool],
+    ):
+        head_idx = cute.arch.block_idx()[0]
+        tidx = cute.arch.thread_idx()[0]
+        smem_ptr = cute.arch.get_dyn_smem(Int32, alignment=16)
+        sScan = cute.make_tensor(
+            smem_ptr,
+            cute.make_layout((_PREFIX_THREADS,)),
+        )
+        if tidx == Int32(0):
+            mRowPtr[head_idx, Int32(0)] = Int32(0)
+        chunk = (total_rows + Int32(_PREFIX_THREADS - 1)) // Int32(
+            _PREFIX_THREADS
+        )
+        row_begin = tidx * chunk
+        row_end = cutlass.min(row_begin + chunk, total_rows)
+        local_sum = Int32(0)
+        row_idx = row_begin
+        while row_idx < row_end:
+            batch_idx = mRowCoords[row_idx, Int32(0)]
+            kv_block_idx = mRowCoords[row_idx, Int32(1)]
+            local_sum += mRowCounts[head_idx, batch_idx, kv_block_idx]
+            row_idx += Int32(1)
+        sScan[tidx] = local_sum
+        cute.arch.sync_threads()
+
+        for scan_step in cutlass.range_constexpr(10):
+            offset = Int32(1 << scan_step)
+            addend = Int32(0)
+            if tidx >= offset:
+                addend = sScan[tidx - offset]
+            cute.arch.sync_threads()
+            sScan[tidx] += addend
+            cute.arch.sync_threads()
+
+        running = sScan[tidx] - local_sum
+        row_idx = row_begin
+        while row_idx < row_end:
+            batch_idx = mRowCoords[row_idx, Int32(0)]
+            kv_block_idx = mRowCoords[row_idx, Int32(1)]
+            row_count = mRowCounts[head_idx, batch_idx, kv_block_idx]
+            running += row_count
+            mRowPtr[head_idx, row_idx + Int32(1)] = running
+            if row_count > Int32(0):
+                num_chunks = (
+                    row_count + target_q_per_cta - Int32(1)
+                ) // target_q_per_cta
+                physical_batch_idx = (
+                    batch_idx
+                    if const_expr(mFragmentIndices is None)
+                    else mFragmentIndices[batch_idx]
+                )
+                physical_offset_k = mCuSeqlensK[physical_batch_idx]
+                physical_block_idx = (
+                    physical_offset_k
+                    + physical_batch_idx * Int32(_BLOCK_K)
+                ) // Int32(_BLOCK_K) + kv_block_idx
+                if const_expr(prepare_kl_schedule):
+                    physical_count_ptr = (
+                        mKlPhysicalRowCounts.iterator
+                        + head_idx * padded_kv_blocks
+                        + physical_block_idx
+                    )
+                    logical_physical_offset = cute.arch.atomic_add(
+                        physical_count_ptr.llvm_ptr,
+                        row_count,
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                    # Row counts are dead after this prefix pass. Reuse their
+                    # storage for the row-local offset in the physical CSR row.
+                    mRowCounts[head_idx, batch_idx, kv_block_idx] = (
+                        logical_physical_offset
+                    )
+                    cute.arch.atomic_cas(
+                        (
+                            mKlPhysicalKOffsets.iterator
+                            + physical_block_idx
+                        ).llvm_ptr,
+                        cmp=Int32(-1),
+                        val=physical_offset_k + kv_block_idx * Int32(_BLOCK_K),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                owner_ptr = (
+                    mDkvOwnerCounts.iterator
+                    + head_idx * padded_kv_blocks
+                    + physical_block_idx
+                )
+                old_owner_count = cute.arch.atomic_add(
+                    owner_ptr.llvm_ptr,
+                    num_chunks,
+                    sem="relaxed",
+                    scope="gpu",
+                )
+                if (
+                    old_owner_count < Int32(2)
+                    and old_owner_count + num_chunks >= Int32(2)
+                ):
+                    split_idx = cute.arch.atomic_add(
+                        mDkvSplitCount.iterator.llvm_ptr,
+                        Int32(1),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                    if split_idx < work_capacity:
+                        mDkvSplitIndices[split_idx] = (
+                            head_idx * padded_kv_blocks + physical_block_idx
+                        )
+                work_base = cute.arch.atomic_add(
+                    mWorkCount.iterator.llvm_ptr,
+                    num_chunks,
+                    sem="relaxed",
+                    scope="gpu",
+                )
+                chunk_idx = Int32(0)
+                while chunk_idx < num_chunks:
+                    work_idx = work_base + chunk_idx
+                    if work_idx < work_capacity:
+                        q_begin = chunk_idx * target_q_per_cta
+                        q_count = cutlass.min(
+                            target_q_per_cta,
+                            row_count - q_begin,
+                        )
+                        mSchedulerMetadata[work_idx, Int32(0)] = head_idx
+                        mSchedulerMetadata[work_idx, Int32(1)] = row_idx
+                        mSchedulerMetadata[work_idx, Int32(2)] = q_begin
+                        mSchedulerMetadata[work_idx, Int32(3)] = q_count
+                        mSchedulerMetadata[work_idx, Int32(4)] = batch_idx
+                        mSchedulerMetadata[work_idx, Int32(5)] = kv_block_idx
+                    chunk_idx += Int32(1)
+            row_idx += Int32(1)
+
+    @cute.kernel
+    def kl_physical_prefix_kernel(
+        self,
+        mPhysicalRowCounts: cute.Tensor,
+        mPhysicalRowPtr: cute.Tensor,
+        padded_kv_blocks: Int32,
+    ):
+        head_idx = cute.arch.block_idx()[0]
+        tidx = cute.arch.thread_idx()[0]
+        smem_ptr = cute.arch.get_dyn_smem(Int32, alignment=16)
+        sScan = cute.make_tensor(smem_ptr, cute.make_layout((_PREFIX_THREADS,)))
+        if tidx == Int32(0):
+            mPhysicalRowPtr[head_idx, Int32(0)] = Int32(0)
+        chunk = (padded_kv_blocks + Int32(_PREFIX_THREADS - 1)) // Int32(
+            _PREFIX_THREADS
+        )
+        block_begin = tidx * chunk
+        block_end = cutlass.min(block_begin + chunk, padded_kv_blocks)
+        local_sum = Int32(0)
+        physical_block = block_begin
+        while physical_block < block_end:
+            local_sum += mPhysicalRowCounts[head_idx, physical_block]
+            physical_block += Int32(1)
+        sScan[tidx] = local_sum
+        cute.arch.sync_threads()
+
+        for scan_step in cutlass.range_constexpr(10):
+            offset = Int32(1 << scan_step)
+            addend = Int32(0)
+            if tidx >= offset:
+                addend = sScan[tidx - offset]
+            cute.arch.sync_threads()
+            sScan[tidx] += addend
+            cute.arch.sync_threads()
+
+        running = sScan[tidx] - local_sum
+        physical_block = block_begin
+        while physical_block < block_end:
+            count = mPhysicalRowCounts[head_idx, physical_block]
+            running += count
+            mPhysicalRowPtr[head_idx, physical_block + Int32(1)] = running
+            physical_block += Int32(1)
+
+    @cute.kernel
+    def kl_physical_schedule_kernel(
+        self,
+        mPhysicalRowPtr: cute.Tensor,
+        mPhysicalKOffsets: cute.Tensor,
+        mKlSchedulerMetadata: cute.Tensor,
+        mKlWorkCount: cute.Tensor,
+        mKlDkiOwnerCounts: cute.Tensor,
+        mKlDkiSplitIndices: cute.Tensor,
+        mKlDkiSplitCount: cute.Tensor,
+        padded_kv_blocks: Int32,
+        kl_target_q_per_cta: Int32,
+        kl_work_capacity: Int32,
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        physical_block = (
+            cute.arch.block_idx()[0] * Int32(_KL_SCHEDULE_THREADS) + tidx
+        )
+        block_stride = cute.arch.grid_dim()[0] * Int32(_KL_SCHEDULE_THREADS)
+        q_per_macro = Int32(_KL_Q_PER_MACRO)
+        macros_per_work = kl_target_q_per_cta // q_per_macro
+        while physical_block < padded_kv_blocks:
+            total_macros = Int32(0)
+            for head_idx in cutlass.range_constexpr(self.head_kv):
+                row_count = (
+                    mPhysicalRowPtr[head_idx, physical_block + Int32(1)]
+                    - mPhysicalRowPtr[head_idx, physical_block]
+                )
+                total_macros += (
+                    row_count + q_per_macro - Int32(1)
+                ) // q_per_macro
+            owner_count = (
+                total_macros + macros_per_work - Int32(1)
+            ) // macros_per_work
+            mKlDkiOwnerCounts[physical_block] = owner_count
+            if owner_count > Int32(1):
+                split_idx = cute.arch.atomic_add(
+                    mKlDkiSplitCount.iterator.llvm_ptr,
+                    Int32(1),
+                    sem="relaxed",
+                    scope="gpu",
+                )
+                if split_idx < padded_kv_blocks:
+                    mKlDkiSplitIndices[split_idx] = physical_block
+            if owner_count > Int32(0):
+                work_base = cute.arch.atomic_add(
+                    mKlWorkCount.iterator.llvm_ptr,
+                    owner_count,
+                    sem="relaxed",
+                    scope="gpu",
+                )
+                owner_idx = Int32(0)
+                while owner_idx < owner_count:
+                    work_idx = work_base + owner_idx
+                    if work_idx < kl_work_capacity:
+                        macro_begin = owner_idx * macros_per_work
+                        macro_count = cutlass.min(
+                            macros_per_work,
+                            total_macros - macro_begin,
+                        )
+                        mKlSchedulerMetadata[work_idx, Int32(0)] = physical_block
+                        mKlSchedulerMetadata[work_idx, Int32(1)] = (
+                            mPhysicalKOffsets[physical_block]
+                        )
+                        mKlSchedulerMetadata[work_idx, Int32(2)] = macro_begin
+                        mKlSchedulerMetadata[work_idx, Int32(3)] = macro_count
+                    owner_idx += Int32(1)
+            physical_block += block_stride
+
+    @cute.jit
+    def _copy_schedule_row(
+        self,
+        mSrc: cute.Tensor,
+        mDst: cute.Tensor,
+        src_idx: Int32,
+        dst_idx: Int32,
     ) -> None:
-        if (
-            q2k_indices.ndim != 3
-            or q2k_indices.shape[0] <= 0
-            or q2k_indices.shape[2] != _TOPK
-        ):
-            raise ValueError("q2k_indices must have shape [num_kv_heads, total_q, 16]")
-        if q2k_indices.dtype != torch.int32 or not q2k_indices.is_contiguous():
-            raise ValueError("q2k_indices must be contiguous torch.int32")
-        if not q2k_indices.is_cuda:
-            raise ValueError("q2k_indices must be a CUDA tensor")
-        for name, tensor in (
-            ("cu_seqlens_q", cu_seqlens_q),
-            ("cu_seqlens_k", cu_seqlens_k),
-        ):
-            if tensor.dtype != torch.int32 or tensor.ndim != 1:
-                raise ValueError(f"{name} must be rank-1 torch.int32")
-            if not tensor.is_cuda or tensor.device != q2k_indices.device:
-                raise ValueError(f"{name} must share the q2k CUDA device")
-            if not tensor.is_contiguous():
-                raise ValueError(f"{name} must be contiguous")
-        if cu_seqlens_q.shape != cu_seqlens_k.shape:
-            raise ValueError("cu_seqlens_q and cu_seqlens_k must share shape")
-        if cu_seqlens_q.numel() < 2:
-            raise ValueError("packed varlen inputs require batch >= 1")
-        if fragment_indices is not None:
-            if fragment_indices.dtype != torch.int32:
-                raise TypeError("fragment_indices must be torch.int32")
-            if (
-                not fragment_indices.is_cuda
-                or fragment_indices.device != q2k_indices.device
-            ):
-                raise ValueError("fragment_indices must share the q2k CUDA device")
-            if (
-                tuple(fragment_indices.shape) != (cu_seqlens_q.numel() - 1,)
-                or not fragment_indices.is_contiguous()
-            ):
-                raise ValueError("fragment_indices must be contiguous with shape [B]")
-        if int(blk_kv) != _BLOCK_K:
-            raise ValueError("only block_size=128 is supported")
-        if int(qhead_per_kv) not in (1, 2, 4, 8, 16):
-            raise ValueError("qhead_per_kv must be one of 1, 2, 4, 8, or 16")
+        for field_idx in cutlass.range_constexpr(6):
+            mDst[dst_idx, field_idx] = mSrc[src_idx, field_idx]
 
-    @staticmethod
-    def _partition_config(
-        *,
-        batch: int,
-        max_seqlen_q: int,
-        max_kv_blocks: int,
-        device: torch.device,
-    ) -> tuple[int, int, int]:
-        properties = torch.cuda.get_device_properties(device)
-        num_sms = properties.multi_processor_count
-        packed_per_warp = _ceil_div(max_kv_blocks, 2)
-        per_cta_smem_bytes = _WARPS * packed_per_warp * _INT32_BYTES
-        smem_ctas_per_sm = max(
-            1,
-            properties.shared_memory_per_multiprocessor // per_cta_smem_bytes,
+    @cute.jit
+    def _schedule_bucket(
+        self,
+        mSchedulerMetadata: cute.Tensor,
+        work_idx: Int32,
+        target_q_per_cta: Int32,
+    ) -> Int32:
+        q_count = mSchedulerMetadata[work_idx, Int32(3)]
+        return cutlass.min(
+            Int32(_SCHEDULE_BUCKETS - 1),
+            cutlass.max(
+                Int32(0),
+                q_count * Int32(_SCHEDULE_BUCKETS) // target_q_per_cta,
+            ),
         )
-        thread_ctas_per_sm = max(
-            1,
-            properties.max_threads_per_multi_processor // _THREADS,
+
+    @cute.jit
+    def _reorder_schedule(
+        self,
+        mSchedulerMetadataIn: cute.Tensor,
+        mSchedulerMetadataOut: cute.Tensor,
+        mWorkCount: cute.Tensor,
+        work_capacity: Int32,
+        target_q_per_cta: Int32,
+    ) -> None:
+        tidx = cute.arch.thread_idx()[0]
+        warp_idx = tidx // Int32(32)
+        lane_idx = tidx % Int32(32)
+        num_work = cutlass.min(
+            cutlass.max(mWorkCount[Int32(0)], Int32(0)),
+            work_capacity,
         )
-        resident_ctas = num_sms * min(smem_ctas_per_sm, thread_ctas_per_sm)
-        partition_q = max(max_seqlen_q, 1)
-        # Keep at least one query per histogram thread while filling every CTA
-        # slot permitted by the SMEM and thread limits of the target device.
-        target_partitions_per_batch = _ceil_div(resident_ctas, batch)
-        max_partitions_for_q = _ceil_div(partition_q, _THREADS)
-        partitions_per_batch = max(
-            1,
-            min(target_partitions_per_batch, max_partitions_for_q, partition_q),
+        if num_work > Int32(_SCHEDULE_REORDER_CAPACITY):
+            work_idx = tidx
+            while work_idx < num_work:
+                self._copy_schedule_row(
+                    mSchedulerMetadataIn,
+                    mSchedulerMetadataOut,
+                    work_idx,
+                    work_idx,
+                )
+                work_idx += Int32(_REORDER_THREADS)
+            num_work = Int32(0)
+        max_chunks = _REORDER_MAX_CHUNKS
+        smem_ptr = cute.arch.get_dyn_smem(Int32, alignment=16)
+        chunk_counts = cute.make_tensor(
+            smem_ptr,
+            cute.make_layout((max_chunks, _SCHEDULE_BUCKETS)),
         )
-        q_per_cta = _ceil_div(partition_q, partitions_per_batch)
-        partitions_per_batch = _ceil_div(partition_q, q_per_cta)
-        q_per_warp = _ceil_div(q_per_cta, _WARPS)
-        return partitions_per_batch, q_per_cta, q_per_warp
+        chunk_offsets = cute.make_tensor(
+            smem_ptr + Int32(max_chunks * _SCHEDULE_BUCKETS),
+            cute.make_layout((max_chunks, _SCHEDULE_BUCKETS)),
+        )
+        bucket_bases = cute.make_tensor(
+            smem_ptr + Int32(2 * max_chunks * _SCHEDULE_BUCKETS),
+            cute.make_layout((_SCHEDULE_BUCKETS,)),
+        )
+        num_chunks = (
+            num_work + Int32(_WARP_THREADS - 1)
+        ) // Int32(_WARP_THREADS)
+        chunk_idx = warp_idx
+        while chunk_idx < num_chunks:
+            work_idx = chunk_idx * Int32(_WARP_THREADS) + lane_idx
+            bucket = Int32(-1)
+            if work_idx < num_work:
+                bucket = self._schedule_bucket(
+                    mSchedulerMetadataIn,
+                    work_idx,
+                    target_q_per_cta,
+                )
+            for bucket_idx in cutlass.range_constexpr(_SCHEDULE_BUCKETS):
+                bucket_mask = cute.arch.vote_ballot_sync(
+                    bucket == Int32(bucket_idx)
+                )
+                if lane_idx == Int32(0):
+                    chunk_counts[chunk_idx, bucket_idx] = cute.arch.popc(
+                        bucket_mask
+                    )
+            chunk_idx += Int32(_REORDER_WARPS)
+        cute.arch.sync_threads()
+
+        if tidx == Int32(0):
+            bucket_base = Int32(0)
+            for rev_bucket in cutlass.range_constexpr(_SCHEDULE_BUCKETS):
+                bucket_idx = Int32(_SCHEDULE_BUCKETS - 1 - rev_bucket)
+                bucket_bases[bucket_idx] = bucket_base
+                prefix = Int32(0)
+                chunk_idx = Int32(0)
+                while chunk_idx < num_chunks:
+                    chunk_offsets[chunk_idx, bucket_idx] = prefix
+                    prefix += chunk_counts[chunk_idx, bucket_idx]
+                    chunk_idx += Int32(1)
+                bucket_base += prefix
+        cute.arch.sync_threads()
+
+        chunk_idx = warp_idx
+        while chunk_idx < num_chunks:
+            src_idx = chunk_idx * Int32(_WARP_THREADS) + lane_idx
+            bucket = Int32(-1)
+            if src_idx < num_work:
+                bucket = self._schedule_bucket(
+                    mSchedulerMetadataIn,
+                    src_idx,
+                    target_q_per_cta,
+                )
+            local_rank = Int32(0)
+            for bucket_idx in cutlass.range_constexpr(_SCHEDULE_BUCKETS):
+                bucket_mask = cute.arch.vote_ballot_sync(
+                    bucket == Int32(bucket_idx)
+                )
+                if bucket == Int32(bucket_idx):
+                    lower_lane_mask = (Int32(1) << lane_idx) - Int32(1)
+                    if lane_idx == Int32(0):
+                        lower_lane_mask = Int32(0)
+                    local_rank = cute.arch.popc(bucket_mask & lower_lane_mask)
+            if src_idx < num_work:
+                dst_idx = (
+                    bucket_bases[bucket]
+                    + chunk_offsets[chunk_idx, bucket]
+                    + local_rank
+                )
+                self._copy_schedule_row(
+                    mSchedulerMetadataIn,
+                    mSchedulerMetadataOut,
+                    src_idx,
+                    dst_idx,
+                )
+            chunk_idx += Int32(_REORDER_WARPS)
+
+    @cute.kernel
+    def reorder_schedule_kernel(
+        self,
+        mSchedulerMetadataIn: cute.Tensor,
+        mSchedulerMetadataOut: cute.Tensor,
+        mWorkCount: cute.Tensor,
+        work_capacity: Int32,
+        target_q_per_cta: Int32,
+    ):
+        self._reorder_schedule(
+            mSchedulerMetadataIn,
+            mSchedulerMetadataOut,
+            mWorkCount,
+            work_capacity,
+            target_q_per_cta,
+        )
+
+    @cute.kernel
+    def tile_prefix_kernel(
+        self,
+        mTileCounts: cute.Tensor,
+        mRowPtr: cute.Tensor,
+        mRowMap: cute.Tensor,
+        batch: Int32,
+        total_rows: Int32,
+        max_kv_blocks: Int32,
+        partitions_per_batch: Int32,
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        lane_idx = tidx % Int32(32)
+        warp_idx = tidx // Int32(32)
+        job_idx = cute.arch.block_idx()[0]
+        blocks_per_batch = (
+            max_kv_blocks + Int32(_ROWS_PER_PREFIX_CTA - 1)
+        ) // Int32(_ROWS_PER_PREFIX_CTA)
+        jobs_per_head = batch * blocks_per_batch
+        head_idx = job_idx // jobs_per_head
+        job_in_head = job_idx - head_idx * jobs_per_head
+        batch_idx = job_in_head // blocks_per_batch
+        block_in_batch = job_in_head - batch_idx * blocks_per_batch
+        base_row = block_in_batch * Int32(_ROWS_PER_PREFIX_CTA)
+        actual_rows = cutlass.min(
+            Int32(_ROWS_PER_PREFIX_CTA),
+            max_kv_blocks - base_row,
+        )
+        partitions_per_batch_warp = partitions_per_batch * Int32(_WARPS)
+        smem_ptr = cute.arch.get_dyn_smem(Int32, alignment=16)
+        sTile = cute.make_tensor(
+            smem_ptr,
+            cute.make_layout(
+                (_ROWS_PER_PREFIX_CTA, partitions_per_batch_warp),
+                stride=(partitions_per_batch_warp, 1),
+            ),
+        )
+        total_items = actual_rows * partitions_per_batch_warp
+        item_idx = tidx
+        while item_idx < total_items:
+            row_offset = item_idx % actual_rows
+            partition_warp = item_idx // actual_rows
+            tile_idx = batch_idx * partitions_per_batch_warp + partition_warp
+            sTile[row_offset, partition_warp] = mTileCounts[
+                tile_idx,
+                head_idx,
+                base_row + row_offset,
+            ]
+            item_idx += Int32(_TILE_PREFIX_THREADS)
+        cute.arch.sync_threads()
+
+        if warp_idx < actual_rows:
+            local_row = base_row + warp_idx
+            row = mRowMap[batch_idx, local_row]
+            running = Int32(0)
+            if row >= Int32(0) and row < total_rows:
+                running = mRowPtr[head_idx, row]
+            partition_begin = Int32(0)
+            while partition_begin < partitions_per_batch_warp:
+                partition_warp = partition_begin + lane_idx
+                value = Int32(0)
+                if partition_warp < partitions_per_batch_warp:
+                    value = sTile[warp_idx, partition_warp]
+                inclusive = value
+                for scan_step in cutlass.range_constexpr(5):
+                    offset = 1 << scan_step
+                    neighbor = cute.arch.shuffle_sync_up(
+                        inclusive,
+                        offset=offset,
+                        mask_and_clamp=0,
+                    )
+                    if lane_idx >= Int32(offset):
+                        inclusive += neighbor
+                exclusive = running + inclusive - value
+                if partition_warp < partitions_per_batch_warp:
+                    sTile[warp_idx, partition_warp] = exclusive
+                running += cute.arch.shuffle_sync(inclusive, offset=31)
+                partition_begin += Int32(32)
+        cute.arch.sync_threads()
+
+        item_idx = tidx
+        while item_idx < total_items:
+            row_offset = item_idx % actual_rows
+            partition_warp = item_idx // actual_rows
+            tile_idx = batch_idx * partitions_per_batch_warp + partition_warp
+            mTileCounts[
+                tile_idx,
+                head_idx,
+                base_row + row_offset,
+            ] = sTile[row_offset, partition_warp]
+            item_idx += Int32(_TILE_PREFIX_THREADS)
+
+    @cute.kernel
+    def scatter_kernel(
+        self,
+        mQ2K: cute.Tensor,
+        mCuSeqlensQ: cute.Tensor,
+        mCuSeqlensK: cute.Tensor,
+        mFragmentIndices: Optional[cute.Tensor],
+        mRowMap: cute.Tensor,
+        mAbsoluteBase: cute.Tensor,
+        mQIdx: cute.Tensor,
+        mQSplitIdx: cute.Tensor,
+        mSplitCounts: cute.Tensor,
+        mKlLogicalPhysicalOffsets: cute.Tensor,
+        mRowPtr: cute.Tensor,
+        mKlPhysicalRowPtr: cute.Tensor,
+        mKlPhysicalQIndices: cute.Tensor,
+        mKlPhysicalValidRows: cute.Tensor,
+        total_rows: Int32,
+        max_kv_blocks: Int32,
+        padded_kv_blocks: Int32,
+        partitions_per_batch: Int32,
+        q_per_cta: Int32,
+        q_per_warp: Int32,
+        prepare_kl_schedule: cutlass.Constexpr[bool],
+    ):
+        tidx = cute.arch.thread_idx()[0]
+        cta_idx = cute.arch.block_idx()[0]
+        warp_idx = tidx // Int32(32)
+        lane_idx = tidx % Int32(32)
+        batch_idx = cta_idx // partitions_per_batch
+        partition_idx = cta_idx - batch_idx * partitions_per_batch
+        q_start_cta = mCuSeqlensQ[batch_idx] + partition_idx * q_per_cta
+        q_end_cta = cutlass.min(
+            q_start_cta + q_per_cta,
+            mCuSeqlensQ[batch_idx + Int32(1)],
+        )
+        q_start_warp = cutlass.min(
+            q_start_cta + warp_idx * q_per_warp,
+            q_end_cta,
+        )
+        q_end_warp = cutlass.min(q_start_warp + q_per_warp, q_end_cta)
+        q_in_iter = lane_idx // Int32(_TOPK)
+        topk_idx = lane_idx % Int32(_TOPK)
+        packed_per_warp = (max_kv_blocks + Int32(1)) // Int32(2)
+        smem_ptr = cute.arch.get_dyn_smem(Int32, alignment=16)
+        sPacked = cute.make_tensor(
+            smem_ptr,
+            cute.make_layout(
+                (_WARPS, packed_per_warp),
+                stride=(packed_per_warp, 1),
+            ),
+        )
+        sMyPacked = sPacked[warp_idx, None]
+        physical_batch_idx = (
+            batch_idx
+            if const_expr(mFragmentIndices is None)
+            else mFragmentIndices[batch_idx]
+        )
+        physical_offset_k = mCuSeqlensK[physical_batch_idx]
+        physical_block_base = (
+            physical_offset_k + physical_batch_idx * Int32(_BLOCK_K)
+        ) // Int32(_BLOCK_K)
+        q_len = mCuSeqlensQ[batch_idx + Int32(1)] - mCuSeqlensQ[batch_idx]
+        k_len = mCuSeqlensK[batch_idx + Int32(1)] - physical_offset_k
+
+        for head_idx in cutlass.range_constexpr(self.head_kv):
+            packed_idx = lane_idx
+            while packed_idx < packed_per_warp:
+                sMyPacked[packed_idx] = Int32(0)
+                packed_idx += Int32(32)
+            cute.arch.sync_warp()
+
+            q_base = q_start_warp
+            while q_base < q_end_warp:
+                # Process the two 16-lane query groups in fixed order. TopK
+                # entries are unique within one query, so this removes the
+                # only same-half packed-atomic race while retaining both
+                # queries per warp iteration.
+                for query_group in cutlass.range_constexpr(2):
+                    q_idx = q_base + Int32(query_group)
+                    valid_q = (
+                        q_in_iter == Int32(query_group)
+                        and q_idx < q_end_warp
+                    )
+                    q_local = Int32(0)
+                    kv_block = Int32(-1)
+                    if valid_q:
+                        q_local = q_idx - mCuSeqlensQ[batch_idx]
+                        kv_block = mQ2K[head_idx, q_idx, topk_idx]
+                    global_row = Int32(-1)
+                    if kv_block >= Int32(0) and kv_block < max_kv_blocks:
+                        global_row = mRowMap[batch_idx, kv_block]
+                    valid_edge = (
+                        valid_q
+                        and global_row >= Int32(0)
+                        and global_row < total_rows
+                    )
+                    valid_mask = cute.arch.vote_ballot_sync(valid_edge)
+                    group_mask = Int32(0xFFFF) << Int32(query_group * 16)
+                    valid_count = cute.arch.popc(valid_mask & group_mask)
+                    writer_rank = Int32(0)
+                    for other_slot in cutlass.range_constexpr(_TOPK):
+                        other_block = cute.arch.shuffle_sync(
+                            kv_block,
+                            query_group * _TOPK + other_slot,
+                        )
+                        if (
+                            other_block >= Int32(0)
+                            and other_block < max_kv_blocks
+                            and other_block < kv_block
+                        ):
+                            writer_rank += Int32(1)
+                    if valid_q and topk_idx == Int32(0):
+                        mSplitCounts[q_idx, head_idx] = valid_count
+                    if valid_edge:
+                        local_slot = self._atomic_inc_packed_i16(
+                            sMyPacked,
+                            kv_block,
+                        )
+                        tile_idx = cta_idx * Int32(_WARPS) + warp_idx
+                        out_idx = (
+                            mAbsoluteBase[tile_idx, head_idx, kv_block]
+                            + local_slot
+                        )
+                        mQIdx[head_idx, out_idx] = q_local
+                        mQSplitIdx[head_idx, out_idx] = (
+                            q_local
+                            | ((writer_rank & Int32(0xFF)) << Int32(24))
+                        )
+                        if const_expr(prepare_kl_schedule):
+                            physical_block = physical_block_base + kv_block
+                            if physical_block < padded_kv_blocks:
+                                logical_row_begin = mRowPtr[head_idx, global_row]
+                                physical_out_idx = (
+                                    mKlPhysicalRowPtr[head_idx, physical_block]
+                                    + mKlLogicalPhysicalOffsets[
+                                        head_idx, batch_idx, kv_block
+                                    ]
+                                    + out_idx
+                                    - logical_row_begin
+                                )
+                                block_begin = kv_block * Int32(_BLOCK_K)
+                                physical_rows = cutlass.min(
+                                    Int32(_BLOCK_K),
+                                    cutlass.max(Int32(0), k_len - block_begin),
+                                )
+                                q_logical = k_len - q_len + q_local
+                                valid_rows = cutlass.min(
+                                    physical_rows,
+                                    cutlass.max(
+                                        Int32(0),
+                                        q_logical - block_begin + Int32(1),
+                                    ),
+                                )
+                                mKlPhysicalQIndices[
+                                    head_idx, physical_out_idx
+                                ] = q_idx
+                                mKlPhysicalValidRows[
+                                    head_idx, physical_out_idx
+                                ] = (
+                                    valid_rows & Int32(KL_VALID_ROWS_MASK)
+                                ) | (
+                                    (writer_rank & Int32(KL_WRITER_RANK_MASK))
+                                    << Int32(KL_WRITER_RANK_SHIFT)
+                                )
+                    cute.arch.sync_warp()
+                q_base += Int32(2)
+            if const_expr(head_idx + 1 < self.head_kv):
+                cute.arch.sync_threads()
 
 
-__all__ = ["SparseK2qCsrBuilderSm100"]
+# Keep the former host import available throughout 0.1.x. Resolve lazily so
+# importing the builder first cannot create a circular import.
+def __getattr__(name: str):
+    if name == "SparseK2qCsrBuilderSm100":
+        from .k2q_csr_builder import SparseK2qCsrBuilderSm100
+
+        return SparseK2qCsrBuilderSm100
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = ["SparseK2qCsrPipelineSm100", "SparseK2qCsrBuilderSm100"]

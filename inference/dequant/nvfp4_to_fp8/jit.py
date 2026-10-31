@@ -9,14 +9,18 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 from torch.utils import cpp_extension
 
+from inference.msa_v1._build_utils import (
+    compiler_fingerprint,
+    cutlass_fingerprint,
+    cutlass_root,
+    require_cuda_version,
+)
 from inference.msa_v1._build_utils import cuda_home as _cuda_home
-from inference.msa_v1._build_utils import cutlass_root
-from inference.msa_v1._build_utils import require_cuda_version
 from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
 from inference.msa_v1._build_utils import torch_cuda_arch as _resolve_torch_arch
 
@@ -39,7 +43,7 @@ def _compiled_backend_name() -> str:
     return "qmul4" if _cuda_version() >= (13, 4) else "fp16_fallback"
 
 
-@lru_cache(maxsize=None)
+@cache
 def _target_arch(device=None) -> str:
     return _resolve_target_arch(device, component="NVFP4 dequant")
 
@@ -63,6 +67,8 @@ def _source_digest() -> str:
     digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
     digest.update(str(_cuda_home()).encode())
     digest.update(str(_cuda_version()).encode())
+    digest.update(compiler_fingerprint().encode())
+    digest.update(cutlass_fingerprint().encode())
     return digest.hexdigest()[:16]
 
 

@@ -15,9 +15,13 @@ from pathlib import Path
 import jinja2
 from torch.utils import cpp_extension
 
+from inference.msa_v1._build_utils import (
+    compiler_fingerprint,
+    cutlass_fingerprint,
+    require_cuda_version,
+)
 from inference.msa_v1._build_utils import cuda_home as _cuda_home
 from inference.msa_v1._build_utils import cutlass_root as _cutlass_root
-from inference.msa_v1._build_utils import require_cuda_version
 from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
 from inference.msa_v1._build_utils import torch_cuda_arch as _resolve_torch_arch
 
@@ -78,6 +82,8 @@ def _source_digest() -> str:
     digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
     digest.update(str(_cuda_home()).encode())
     digest.update(str(_cuda_version()).encode())
+    digest.update(compiler_fingerprint().encode())
+    digest.update(cutlass_fingerprint().encode())
     digest.update(str(_cutlass_root()).encode())
     version_header = _cutlass_root() / "include/cutlass/version.h"
     if version_header.is_file():

@@ -29,7 +29,7 @@ from msa_v1._common.cute_dsl_utils import to_cute_tensor as to_cute_tensor_kvout
 from msa_v1._common.tma_utils import (
     create_q_gather4_tma_desc,
 )
-from msa_v1.attention.bwd.atten_bwd import SparseAttentionBackwardSm100
+from msa_v1.attention.bwd.atten_bwd_sm100 import SparseAttentionBackwardSm100
 from msa_v1.attention.bwd.postprocess import (
     SparseAttentionBackwardDkvPostprocessSm100,
     SparseAttentionBackwardPostprocessAtomicDqSm100,
@@ -39,7 +39,7 @@ from msa_v1.attention.bwd.preprocess import (
     SparseAttentionBackwardDkvSplitZeroSm100,
     SparseAttentionBackwardPreprocessSm100,
 )
-from msa_v1.attention.fwd.atten_fwd import SparseAttentionForwardSm100
+from msa_v1.attention.fwd.atten_fwd_sm100 import SparseAttentionForwardSm100
 from msa_v1.attention.fwd.combine import combine
 from msa_v1.attention.prepare_scheduler import SparseAttentionSchedule
 

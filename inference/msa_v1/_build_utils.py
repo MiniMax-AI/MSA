@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_BUNDLED_CUTLASS = Path(__file__).resolve().parents[1] / "_vendor/cutlass"
 MM_SPARSE_TARGET_ARCH = "MM_SPARSE_TARGET_ARCH"
 
 
@@ -162,13 +164,13 @@ def require_cuda_version(
 
 @lru_cache(maxsize=1)
 def cutlass_root() -> Path:
-    """Locate public CUTLASS headers from the environment or repository submodule."""
+    """Locate an explicit override, bundled headers, or an editable submodule."""
 
     candidates = []
     for variable in ("CUTLASS_ROOT", "CUTLASS_PATH"):
         if value := os.environ.get(variable):
             candidates.append(Path(value))
-    candidates.append(_REPOSITORY_ROOT / "third_party/cutlass")
+    candidates.extend((_BUNDLED_CUTLASS, _REPOSITORY_ROOT / "third_party/cutlass"))
 
     attempted = []
     for candidate in _unique_paths(candidates):
@@ -176,9 +178,43 @@ def cutlass_root() -> Path:
         if (candidate / "include/cutlass/cutlass.h").is_file():
             return candidate
     raise RuntimeError(
-        "CUTLASS headers were not found. Initialize third_party/cutlass or set "
-        f"CUTLASS_ROOT. Tried: {attempted}"
+        "CUTLASS headers were not found. Reinstall the complete MSA wheel, "
+        "initialize third_party/cutlass for an editable install, or set "
+        f"CUTLASS_ROOT explicitly. Tried: {attempted}"
     )
+
+
+@lru_cache(maxsize=1)
+def cutlass_fingerprint() -> str:
+    """Include header contents, including advanced overrides, in JIT identity."""
+
+    root = cutlass_root()
+    digest = hashlib.sha256()
+    for directory in ("include", "tools/util/include"):
+        for path in sorted((root / directory).rglob("*")):
+            if path.is_file():
+                content = path.read_bytes()
+                digest.update(path.relative_to(root).as_posix().encode())
+                digest.update(len(content).to_bytes(8, "little"))
+                digest.update(content)
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=1)
+def compiler_fingerprint() -> str:
+    """Distinguish CUDA patch releases and host compilers in persistent caches."""
+
+    digest = hashlib.sha256()
+    for command in (
+        [str(cuda_home() / "bin/nvcc"), "--version"],
+        [os.environ.get("CXX", "c++"), "--version"],
+    ):
+        result = subprocess.run(command, capture_output=True, check=True, timeout=10)
+        digest.update(repr(command).encode())
+        digest.update(result.stdout)
+        digest.update(result.stderr)
+    digest.update(Path(__file__).read_bytes())
+    return digest.hexdigest()
 
 
 __all__ = [

@@ -30,7 +30,7 @@ from datas.inference.tensors import (
 from inference.msa_v1.indexer.prefill.bf16 import (
     BatchPrefillIndexerWithPagedKVCacheWrapper,
 )
-from inference.msa_v1.indexer.prefill.bf16.indexer_gemm import (
+from inference.msa_v1.indexer.prefill.bf16.indexer_gemm_sm100 import (
     M3_PAGED_DIRECT_SCORE_NUM_HEADS,
 )
 

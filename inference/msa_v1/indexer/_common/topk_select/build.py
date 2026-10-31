@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import sys
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -11,12 +13,28 @@ from pathlib import Path
 import torch
 from torch.utils import cpp_extension
 
-from inference.msa_v1._build_utils import cuda_home
+from inference.msa_v1._build_utils import compiler_fingerprint, cuda_home
 
 _LOGGER = logging.getLogger(__name__)
 _ROOT = Path(__file__).resolve().parent
 _CSRC = _ROOT / "csrc"
-_CACHE_ABI = "msa_v1_indexer_topk_decode_compact_v2"
+
+
+@lru_cache(maxsize=1)
+def _source_digest() -> str:
+    import torch
+
+    digest = hashlib.sha256()
+    digest.update(Path(__file__).read_bytes())
+    digest.update(sys.version.encode())
+    digest.update(torch.__version__.encode())
+    digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
+    digest.update(compiler_fingerprint().encode())
+    for source in sorted(_CSRC.rglob("*")):
+        if source.is_file():
+            digest.update(source.relative_to(_CSRC).as_posix().encode())
+            digest.update(source.read_bytes())
+    return digest.hexdigest()[:16]
 
 
 @lru_cache(maxsize=1)
@@ -24,12 +42,15 @@ def load_extension():
     """Build and load the internal TopK extension once per process."""
 
     selected_cuda_home = cuda_home()
-    build_root = Path(
-        os.environ.get(
-            "MINIMAX_MSA_V1_INDEXER_TOPK_BUILD_DIR",
-            Path.home() / ".cache" / "minimax_msa" / _CACHE_ABI,
-        )
-    ).expanduser()
+    build_root = (
+        Path(
+            os.environ.get(
+                "MINIMAX_MSA_V1_INDEXER_TOPK_BUILD_DIR",
+                Path.home() / ".cache" / "minimax_msa" / "indexer_topk",
+            )
+        ).expanduser()
+        / _source_digest()
+    )
     build_root.mkdir(parents=True, exist_ok=True)
     sources = [
         _CSRC / "api/indexer_topk_api.cpp",

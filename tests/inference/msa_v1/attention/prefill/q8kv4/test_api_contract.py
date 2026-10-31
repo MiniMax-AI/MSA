@@ -9,7 +9,7 @@ import torch
 
 from inference.msa_v1.attention.prefill import q8kv4 as q8kv4_package
 from inference.msa_v1.attention.prefill._common import metadata
-from inference.msa_v1.attention.prefill._common.prepare_k2q_csr import (
+from inference.msa_v1.attention.prefill._common.k2q_csr_builder import (
     SparseK2qCsrBuilderSm100,
 )
 from inference.msa_v1.attention.prefill.q8kv4 import (

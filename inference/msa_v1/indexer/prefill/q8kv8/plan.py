@@ -6,7 +6,7 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 
-from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm import (
+from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm_sm100 import (
     PrefillIndexerGemmSm100,
 )
 

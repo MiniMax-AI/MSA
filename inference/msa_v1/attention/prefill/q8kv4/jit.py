@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 import jinja2
@@ -16,12 +16,15 @@ from torch.utils import cpp_extension
 
 logger = logging.getLogger(__name__)
 
+from inference.msa_v1._build_utils import (
+    compiler_fingerprint,
+    cutlass_fingerprint,
+    require_cuda_version,
+)
 from inference.msa_v1._build_utils import cuda_home as _cuda_home
 from inference.msa_v1._build_utils import cutlass_root as _cutlass_root
-from inference.msa_v1._build_utils import require_cuda_version
 from inference.msa_v1._build_utils import target_arch as _resolve_target_arch
 from inference.msa_v1._build_utils import torch_cuda_arch as _resolve_torch_arch
-
 
 _ROOT = Path(__file__).resolve().parent
 _CSRC = _ROOT / "csrc"
@@ -38,7 +41,7 @@ def _cuda_version() -> tuple[int, int]:
     )
 
 
-@lru_cache(maxsize=None)
+@cache
 def _target_arch(device=None) -> str:
     return _resolve_target_arch(device, component="Q8KV4 prefill attention")
 
@@ -62,6 +65,8 @@ def _source_digest() -> str:
     digest.update(str(torch._C._GLIBCXX_USE_CXX11_ABI).encode())
     digest.update(str(_cuda_home()).encode())
     digest.update(str(_cuda_version()).encode())
+    digest.update(compiler_fingerprint().encode())
+    digest.update(cutlass_fingerprint().encode())
     digest.update(str(_cutlass_root()).encode())
     version_header = _cutlass_root() / "include/cutlass/version.h"
     if version_header.is_file():
@@ -103,7 +108,6 @@ class JitSpec:
         return f"{self.variant_name}_{self.target_arch}_{_source_digest()}"
 
     def build_and_load(self):
-        import torch
 
         cache_dir = _cache_root() / self.uri
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -184,7 +188,7 @@ def gen_jit_spec(device=None) -> JitSpec:
     return JitSpec(target_arch=_target_arch(device))
 
 
-@lru_cache(maxsize=None)
+@cache
 def _load_extension_for_arch(arch: str):
     return JitSpec(target_arch=arch).build_and_load()
 

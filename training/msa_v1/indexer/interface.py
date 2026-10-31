@@ -6,7 +6,7 @@ from typing import Optional
 
 import torch
 
-from msa_v1.indexer.m3_indexer import (
+from msa_v1.indexer.indexer_forward import (
     IndexerForwardWorkspace,
     IndexerSchedule,
     allocate_indexer_schedule,

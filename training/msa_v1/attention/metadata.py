@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from msa_v1.attention.prepare_k2q_csr import SparseK2qCsrBuilderSm100
+from msa_v1.attention.k2q_csr_builder import SparseK2qCsrBuilderSm100
 from msa_v1.attention.prepare_scheduler import SparseAttentionSchedule
 
 _HEAD_KV = 4

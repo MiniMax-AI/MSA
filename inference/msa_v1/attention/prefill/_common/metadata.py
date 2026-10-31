@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
-from inference.msa_v1.attention.prefill._common.prepare_k2q_csr import (
+from inference.msa_v1.attention.prefill._common.k2q_csr_builder import (
     SparseK2qCsrBuilderSm100,
 )
 from inference.msa_v1.attention.prefill._common.prepare_scheduler import (

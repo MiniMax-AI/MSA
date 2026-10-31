@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from msa_v1 import attention
-from msa_v1.attention.bwd.atten_bwd import SparseAttentionBackwardSm100
+from msa_v1.attention.bwd.atten_bwd_sm100 import SparseAttentionBackwardSm100
 from tests.training.msa_v1.cute.cases import MsaTestCase
 from tests.training.msa_v1.cute.testing import (
     HEAD_DIM,

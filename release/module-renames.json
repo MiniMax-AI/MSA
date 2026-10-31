@@ -1,0 +1,29 @@
+{
+  "retain_through": "0.1.x",
+  "files": {
+    "benchmarks/bench_kl_v1_topk_pathologies.py": "benchmarks/benchmark_kl_v1_topk_pathologies.py",
+    "inference/msa_v1/attention/prefill/_common/prepare_k2q_csr_cutedsl.py": "inference/msa_v1/attention/prefill/_common/prepare_k2q_csr.py",
+    "inference/msa_v1/attention/prefill/_common/prepare_k2q_csr_kernel.py": "inference/msa_v1/attention/prefill/_common/prepare_k2q_csr.py",
+    "inference/msa_v1/indexer/decode/indexer_gemm.py": "inference/msa_v1/indexer/decode/indexer_gemm_sm100.py",
+    "inference/msa_v1/indexer/prefill/bf16/indexer_gemm.py": "inference/msa_v1/indexer/prefill/bf16/indexer_gemm_sm100.py",
+    "inference/msa_v1/indexer/prefill/q8kv8/indexer_gemm.py": "inference/msa_v1/indexer/prefill/q8kv8/indexer_gemm_sm100.py",
+    "training/msa_v1/attention/bwd/atten_bwd.py": "training/msa_v1/attention/bwd/atten_bwd_sm100.py",
+    "training/msa_v1/attention/fwd/atten_fwd.py": "training/msa_v1/attention/fwd/atten_fwd_sm100.py",
+    "training/msa_v1/attention/prepare_k2q_csr_cutedsl.py": "training/msa_v1/attention/prepare_k2q_csr.py",
+    "training/msa_v1/attention/prepare_k2q_csr_kernel.py": "training/msa_v1/attention/prepare_k2q_csr.py",
+    "training/msa_v1/indexer/m3_indexer.py": "training/msa_v1/indexer/indexer_forward.py",
+    "training/msa_v1/indexer/m3_indexer_gemm.py": "training/msa_v1/indexer/indexer_gemm_sm100.py",
+    "training/msa_v1/indexer/m3_indexer_lse.py": "training/msa_v1/indexer/indexer_lse.py",
+    "training/msa_v1/indexer/m3_indexer_schedule.py": "training/msa_v1/indexer/indexer_schedule.py",
+    "training/msa_v1/indexer/m3_indexer_topk.py": "training/msa_v1/indexer/indexer_topk.py",
+    "training/msa_v1/indexer_tree/m3_arbitrary_plan.py": "training/msa_v1/indexer_tree/arbitrary_plan.py",
+    "training/msa_v1/indexer_tree/m3_indexer.py": "training/msa_v1/indexer_tree/indexer_forward.py",
+    "training/msa_v1/indexer_tree/m3_indexer_gemm.py": "training/msa_v1/indexer_tree/indexer_gemm_sm100.py",
+    "training/msa_v1/indexer_tree/m3_indexer_lse.py": "training/msa_v1/indexer_tree/indexer_lse.py",
+    "training/msa_v1/indexer_tree/m3_indexer_topk.py": "training/msa_v1/indexer_tree/indexer_topk.py"
+  },
+  "symbols": {
+    "training/msa_v1/attention/prepare_k2q_csr.py:SparseK2qCsrBuilderSm100": "training/msa_v1/attention/k2q_csr_builder.py:SparseK2qCsrBuilderSm100",
+    "inference/msa_v1/attention/prefill/_common/prepare_k2q_csr.py:SparseK2qCsrBuilderSm100": "inference/msa_v1/attention/prefill/_common/k2q_csr_builder.py:SparseK2qCsrBuilderSm100"
+  }
+}

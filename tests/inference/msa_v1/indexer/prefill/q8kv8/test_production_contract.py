@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm import (
+from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm_sm100 import (
     PrefillIndexerGemmSm100,
 )
 

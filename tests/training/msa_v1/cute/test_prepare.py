@@ -8,7 +8,7 @@ import math
 import pytest
 import torch
 from msa_v1 import attention, kl
-from msa_v1.attention.prepare_k2q_csr import SparseK2qCsrBuilderSm100
+from msa_v1.attention.k2q_csr_builder import SparseK2qCsrBuilderSm100
 from msa_v1.attention.prepare_scheduler import (
     KL_VALID_ROWS_MASK,
     KL_WRITER_RANK_MASK,

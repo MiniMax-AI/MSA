@@ -6,11 +6,11 @@ from typing import Optional
 
 import torch
 
-from msa_v1.indexer_tree.m3_arbitrary_plan import (
+from msa_v1.indexer_tree.arbitrary_plan import (
     M3ArbitraryMaskPlan,
     compile_m3_arbitrary_mask_plan,
 )
-from msa_v1.indexer_tree.m3_indexer import m3_indexer_forward
+from msa_v1.indexer_tree.indexer_forward import m3_indexer_forward
 
 IndexerPlan = M3ArbitraryMaskPlan
 

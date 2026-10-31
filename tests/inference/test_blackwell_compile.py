@@ -23,7 +23,7 @@ pytestmark = pytest.mark.gpu
 def test_decode_indexer_compiles_for_blackwell(
     arch: str, num_index_heads: int, query_length: int, input_dtype: type
 ) -> None:
-    from inference.msa_v1.indexer.decode.indexer_gemm import DecodeIndexerGemmSm100
+    from inference.msa_v1.indexer.decode.indexer_gemm_sm100 import DecodeIndexerGemmSm100
 
     assert Version(cutlass.__version__) >= Version("4.5.2")
 
@@ -90,7 +90,7 @@ def test_decode_shared_plan_compiles_for_blackwell(arch):
 @pytest.mark.parametrize("capability", ((10, 0), (10, 3)))
 @pytest.mark.parametrize("num_index_heads", (1, 2, 4))
 def test_q8kv8_prefill_indexer_compiles_for_blackwell(capability, num_index_heads):
-    from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm import (
+    from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm_sm100 import (
         PrefillIndexerGemmSm100,
     )
 
@@ -191,7 +191,7 @@ def test_training_indexer_compiles_for_blackwell(
 @pytest.mark.parametrize("heads", (1, 2, 4))
 def test_bf16_prefill_indexer_compiles_for_blackwell(capability, heads):
     assert Version(cutlass.__version__) >= Version("4.5.2")
-    from inference.msa_v1.indexer.prefill.bf16.indexer_gemm import M3IndexerGemmSm100
+    from inference.msa_v1.indexer.prefill.bf16.indexer_gemm_sm100 import M3IndexerGemmSm100
 
     def tensor(dtype, shape, order=None, alignment=16):
         return cute.runtime.make_fake_compact_tensor(

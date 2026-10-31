@@ -20,7 +20,7 @@ from inference.msa_v1._cache_layout import (
 from inference.msa_v1.aot_cache import compile_or_load
 from inference.msa_v1.indexer._common.topk_select import _topk_select
 from inference.msa_v1.indexer._common.topk_select.interface import MAXIMUM_COLUMNS
-from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm import (
+from inference.msa_v1.indexer.prefill.q8kv8.indexer_gemm_sm100 import (
     PrefillIndexerGemmSm100,
 )
 from inference.msa_v1.indexer.prefill.q8kv8.plan import (

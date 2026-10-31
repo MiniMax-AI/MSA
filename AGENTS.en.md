@@ -140,6 +140,42 @@ limitations. Import order is `cutlass` → `cutlass.cute as cute` →
 (GMEM tiles), `s*` (SMEM), `t*` (thread views), and `acc_*` (accumulators).
 TopK indices, LSE, and `cu_seqlens` metadata need not use tiled copies.
 
+## File naming and compatibility migrations
+
+- Use descriptive `snake_case` Python filenames that express responsibility, without historical
+  model prefixes, experiment numbers, or unnecessary implementation-language labels. Check sibling
+  implementations before adding files; use consistent role names across v1/v2 and training/inference.
+- Do not use `_cutedsl` or mechanically append `_kernel` to Python kernel filenames. Name the
+  implementation after its operation, such as `prepare_k2q_csr.py`. Name separate host wrappers
+  after their role, such as `k2q_csr_builder.py`.
+- Architecture-specific implementations use suffixes such as `_sm100`. A `@cute.kernel` decorator,
+  a `Sm100` class name, or testing on one architecture alone does not justify an architecture suffix.
+  Generic metadata, scan, sorting, and auxiliary processing do not automatically get one. Absence
+  of a suffix does not imply support for every GPU; preserve resource limits and hardware contracts.
+- `_sm100` may identify one implementation family supporting both SM100 and SM103; interfaces and
+  documentation specify actual support. Review architectural dependencies in code rather than
+  classifying files automatically by kernel decorators.
+- Training attention uses `atten_fwd` and `atten_bwd`; indexers use `indexer_forward`, `indexer_gemm`,
+  and `indexer_topk`. Precision, TP, and split suffixes distinguish actual implementations only.
+- Keep public host entries named `interface.py`, `forward.py`, and `backward.py`, and build entries
+  named `build.py` and `jit.py`. C++ and third-party sources follow existing role directories and
+  upstream naming conventions.
+- Name tests `test_<behavior_or_contract>.py`, benchmarks `benchmark.py` or `benchmark_<subject>.py`,
+  and combined validation entry points `run_validation.py`.
+- Renames must update static/dynamic imports, source lookup, tests, documentation, packaging, and
+  provenance manifests without changing computation, public APIs, or support. Compatibility entries
+  must not introduce dependencies between training and inference packages.
+- Preserve old paths as lightweight module aliases listed in `release/module-renames.json`; old and
+  new imports must resolve to the same module and objects. When a former host filename becomes an
+  implementation module, preserve the host class identity through symbol forwarding in the manifest.
+  Preserve CLI arguments, output, and exit
+  codes. Keep aliases throughout `0.1.x`, without default deprecation warnings; removal requires a
+  separate migration plan. Compatibility files are explicit naming-rule exceptions.
+- Before submission, check path conflicts, import cycles, both import orders, module identity, and
+  installed artifact origins. Old references belong only in compatibility entries/tests, migration
+  notes, rename manifests, and historical provenance. Document AOT invalidation caused by renames,
+  first-use compilation, and deployment warmup requirements.
+
 ## Compile keys
 
 Compile keys contain only stable properties that change code generation:

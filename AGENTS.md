@@ -139,6 +139,32 @@
 - interface 必须显式校验 dtype、device、shape、stride、alignment 和 metadata
   约束；不得通过隐藏的输入转换掩盖 kernel 限制。
 
+## 文件命名与兼容迁移
+
+- Python 文件使用描述性的 `snake_case`，名称表达职责，不使用历史模型前缀、实验编号或
+  无必要的技术路线标签。新增文件前必须对照同类模块；v1/v2、训练/推理采用一致的职责词汇。
+- Python kernel 文件不使用 `_cutedsl` 后缀，不机械添加 `_kernel`；实现文件直接表达操作，
+  例如 `prepare_k2q_csr.py`。需要分离 host 封装时，按职责命名，例如 `k2q_csr_builder.py`。
+- 架构专用实现使用 `_sm100` 等后缀。不得仅因包含 `@cute.kernel`、类名带 `Sm100` 或
+  仅在某架构验证过就添加后缀；通用 metadata、scan、排序及辅助处理不自动添加架构后缀。
+  无后缀不代表支持所有 GPU，现有资源限制和硬件契约必须保留。
+- `_sm100` 可表示同时支持 SM100/SM103 的同一实现系列，具体支持范围由接口和文档明确。
+  架构依赖须经代码 review，不得通过搜索 kernel decorator 自动归类。
+- 训练 attention 使用 `atten_fwd`、`atten_bwd`；indexer 使用 `indexer_forward`、
+  `indexer_gemm`、`indexer_topk` 等。精度、TP 和 split 后缀只用于区分实际实现。
+- 公开 host 入口保留 `interface.py`、`forward.py`、`backward.py`；构建入口保留
+  `build.py`、`jit.py`。C++ 和第三方来源文件遵循已有职责目录和上游命名。
+- 测试使用 `test_<行为或契约>.py`，benchmark 使用 `benchmark.py` 或
+  `benchmark_<对象>.py`，综合验收入口使用 `run_validation.py`。
+- 改名必须同步静态和动态 import、源码定位、测试、文档、打包和来源清单；不得改变计算
+  逻辑、公开 API 或支持范围。训练和推理不得通过兼容入口产生跨包依赖。
+- 旧路径按 `release/module-renames.json` 保留轻量模块别名，新旧 import 必须指向同一
+  模块与对象；旧文件名改作实现模块时，通过清单中的 symbol 转发保留原 host 类身份；旧 CLI 保持参数、输出和退出码。兼容入口在整个 `0.1.x` 保留且默认无
+  弃用告警，移除必须另行制定迁移方案。兼容文件是命名规则的显式例外。
+- 提交前检查路径冲突、循环导入、新旧导入顺序、模块身份和安装产物来源；旧引用只允许
+  出现在兼容入口、兼容测试、迁移说明、映射清单和历史来源记录中。文件改名引发 AOT
+  缓存失效时，须在用户迁移说明中明确首次编译与上线预热要求。
+
 ## Compile key 与 AOT 缓存
 
 - 遵循 FA4 interface：compile key 只能包含确实影响 codegen 的稳定静态属性，

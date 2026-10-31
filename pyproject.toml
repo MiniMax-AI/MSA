@@ -1,11 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "minimax-msa"
-version = "0.1.0"
+version = "0.1.0rc1"
 description = "Training and inference kernels for MiniMax sparse attention"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "NOTICE", "licenses/*.txt"]
 requires-python = ">=3.10"
 dependencies = [
     "nvidia-cutlass-dsl[cu13]>=4.5.2",

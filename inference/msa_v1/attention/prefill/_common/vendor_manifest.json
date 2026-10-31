@@ -15,12 +15,16 @@
       "import inference.msa_v1.attention.prefill._common.dsl"
     ],
     [
-      "from msa_v1.attention.prepare_k2q_csr",
-      "from inference.msa_v1.attention.prefill._common.prepare_k2q_csr"
+      "from msa_v1.attention.k2q_csr_builder",
+      "from inference.msa_v1.attention.prefill._common.k2q_csr_builder"
     ],
     [
       "from msa_v1.attention.prepare_scheduler",
       "from inference.msa_v1.attention.prefill._common.prepare_scheduler"
+    ],
+    [
+      "from msa_v1.attention.prepare_k2q_csr",
+      "from inference.msa_v1.attention.prefill._common.prepare_k2q_csr"
     ]
   ],
   "recorded_replacements": {
@@ -45,8 +49,8 @@
     ],
     "attention/metadata.py": [
       {
-        "source": "\nimport torch\n\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr import SparseK2qCsrBuilderSm100\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import SparseAttentionSchedule\n\n_HEAD_KV = 4\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_KV_BLOCK_SIZE = 128\n\n\n@dataclass(frozen=True)\nclass AttentionMetadata:\n    \"\"\"Per-layer metadata shared by the corresponding forward and backward.\"\"\"\n\n    topk_indices: torch.Tensor\n    cu_seqlens_q: torch.Tensor\n",
-        "destination": "\nimport torch\n\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr import (\n    SparseK2qCsrBuilderSm100,\n)\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SparseAttentionSchedule,\n)\n\n_TOPK = 16\n_KV_BLOCK_SIZE = 128\n\n\n@dataclass(frozen=True)\nclass AttentionMetadata:\n    \"\"\"Opaque metadata owned by one MSA v1 inference plan.\"\"\"\n\n    topk_indices: torch.Tensor\n    cu_seqlens_q: torch.Tensor\n"
+        "source": "\nimport torch\n\nfrom inference.msa_v1.attention.prefill._common.k2q_csr_builder import SparseK2qCsrBuilderSm100\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import SparseAttentionSchedule\n\n_HEAD_KV = 4\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_KV_BLOCK_SIZE = 128\n\n\n@dataclass(frozen=True)\nclass AttentionMetadata:\n    \"\"\"Per-layer metadata shared by the corresponding forward and backward.\"\"\"\n\n    topk_indices: torch.Tensor\n    cu_seqlens_q: torch.Tensor\n",
+        "destination": "\nimport torch\n\nfrom inference.msa_v1.attention.prefill._common.k2q_csr_builder import (\n    SparseK2qCsrBuilderSm100,\n)\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SparseAttentionSchedule,\n)\n\n_TOPK = 16\n_KV_BLOCK_SIZE = 128\n\n\n@dataclass(frozen=True)\nclass AttentionMetadata:\n    \"\"\"Opaque metadata owned by one MSA v1 inference plan.\"\"\"\n\n    topk_indices: torch.Tensor\n    cu_seqlens_q: torch.Tensor\n"
       },
       {
         "source": "    total_rows: int\n    max_seqlen_q: int\n    max_seqlen_k: int\n    deterministic: bool = False\n\n\ndef _validate_cu_seqlens(\n",
@@ -65,10 +69,11 @@
         "destination": "        total_rows=total_rows,\n        max_seqlen_q=max_seqlen_q,\n        max_seqlen_k=max_seqlen_k,\n    )\n\n\n"
       }
     ],
-    "attention/prepare_k2q_csr.py": [
+    "attention/k2q_csr_builder.py": [
       {
-        "source": "import torch\n\nfrom inference.msa_v1.aot_cache import compile_or_load\nfrom inference.msa_v1.attention.prefill._common.dsl.compile_utils import compile_with_timing\nfrom inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import to_cute_tensor\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr_cutedsl import SparseK2qCsrPipelineSm100\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SPARSE_SCHEDULE_MODEL,\n    SparseAttentionSchedule,\n)\n\n_HEAD_KV = 4\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_BLOCK_K = 128\n",
-        "destination": "import torch\n\nfrom inference.msa_v1.aot_cache import compile_or_load\nfrom inference.msa_v1.attention.prefill._common.dsl.compile_utils import (\n    compile_with_timing,\n)\nfrom inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import to_cute_tensor\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr_cutedsl import (\n    SparseK2qCsrPipelineSm100,\n)\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SPARSE_SCHEDULE_MODEL,\n    SparseAttentionSchedule,\n)\n\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_BLOCK_K = 128\n"
+        "source": "import torch\n\nfrom inference.msa_v1.aot_cache import compile_or_load\nfrom inference.msa_v1.attention.prefill._common.dsl.compile_utils import compile_with_timing\nfrom inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import to_cute_tensor\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr import SparseK2qCsrPipelineSm100\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SPARSE_SCHEDULE_MODEL,\n    SparseAttentionSchedule,\n)\n\n_HEAD_KV = 4\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_BLOCK_K = 128\n",
+        "destination": "import torch\n\nfrom inference.msa_v1.aot_cache import compile_or_load\nfrom inference.msa_v1.attention.prefill._common.dsl.compile_utils import (\n    compile_with_timing,\n)\nfrom inference.msa_v1.attention.prefill._common.dsl.cute_dsl_utils import to_cute_tensor\nfrom inference.msa_v1.attention.prefill._common.prepare_k2q_csr import (\n    SparseK2qCsrPipelineSm100,\n)\nfrom inference.msa_v1.attention.prefill._common.prepare_scheduler import (\n    SPARSE_SCHEDULE_MODEL,\n    SparseAttentionSchedule,\n)\n\n_QHEAD_PER_KV = 16\n_TOPK = 16\n_BLOCK_K = 128\n",
+        "reason": "推理 CSR 支持 KV head 数和 GQA 比例，使用公共 inference AOT cache；无全局运行时 workspace。"
       },
       {
         "source": "_KL_MACROS_PER_WORK = 16\n_KL_TARGET_Q_PER_CTA = _KL_Q_PER_MACRO * _KL_MACROS_PER_WORK\n_COMPILE_CACHE: dict[tuple, object] = {}\n_PIPELINE = SparseK2qCsrPipelineSm100()\n\n\ndef _ceil_div(value: int, divisor: int) -> int:\n",
@@ -127,7 +132,7 @@
         "destination": "                raise ValueError(\"fragment_indices must be contiguous with shape [B]\")\n        if int(blk_kv) != _BLOCK_K:\n            raise ValueError(\"only block_size=128 is supported\")\n        if int(qhead_per_kv) not in (1, 2, 4, 8, 16):\n            raise ValueError(\"qhead_per_kv must be one of 1, 2, 4, 8, or 16\")\n\n    @staticmethod\n    def _partition_config(\n"
       }
     ],
-    "attention/prepare_k2q_csr_cutedsl.py": [
+    "attention/prepare_k2q_csr.py": [
       {
         "source": "    KL_WRITER_RANK_SHIFT,\n)\n\n_HEAD_KV = 4\n_TOPK = 16\n_BLOCK_K = 128\n_KL_Q_PER_MACRO = 16\n",
         "destination": "    KL_WRITER_RANK_SHIFT,\n)\n\n_TOPK = 16\n_BLOCK_K = 128\n_KL_Q_PER_MACRO = 16\n"
@@ -226,7 +231,9 @@
     ]
   },
   "organization_files": [
-    "__init__.py"
+    "__init__.py",
+    "prepare_k2q_csr_cutedsl.py",
+    "prepare_k2q_csr_kernel.py"
   ],
   "local_implementation_files": [
     "atten_fwd_sm100.py",
@@ -308,12 +315,12 @@
       "destination": "metadata.py"
     },
     {
-      "source": "attention/prepare_k2q_csr.py",
-      "destination": "prepare_k2q_csr.py"
+      "source": "attention/k2q_csr_builder.py",
+      "destination": "k2q_csr_builder.py"
     },
     {
-      "source": "attention/prepare_k2q_csr_cutedsl.py",
-      "destination": "prepare_k2q_csr_cutedsl.py"
+      "source": "attention/prepare_k2q_csr.py",
+      "destination": "prepare_k2q_csr.py"
     },
     {
       "source": "attention/prepare_scheduler.py",
