@@ -6,9 +6,26 @@ import cutlass.cute as cute  # noqa: PLR0402
 # isort: split
 import cuda.bindings.driver as cuda
 
+# Original tokens covered by one logical block and one output score column.
+_BLOCK_TOKENS = 128
+
 
 class DecodeIndexerPlanSm100:
     """Generate a complete immutable-for-consumers plan in one CTA."""
+
+    def __init__(
+        self,
+        *,
+        pooling_factor=1,
+        pages_per_block=1,
+        blocks_per_tile=1,
+        include_partial_block=False,
+    ):
+        self.pooling_factor = pooling_factor
+        self.entries_per_block = _BLOCK_TOKENS // pooling_factor
+        self.pages_per_block = pages_per_block
+        self.blocks_per_tile = blocks_per_tile
+        self.include_partial_block = include_partial_block
 
     @cute.jit
     def __call__(
@@ -49,16 +66,26 @@ class DecodeIndexerPlanSm100:
         tid, _, _ = cute.arch.thread_idx()
         lane = tid % 32
         batch = cutlass.Int32(mLengths.shape[0])
+        if cutlass.const_expr(self.pages_per_block != 1):
+            max_pages = (max_pages + self.pages_per_block - 1) // self.pages_per_block
         if tid == 0:
             mScheduler[0] = 0
         for request in cutlass.range(tid, batch, 256):
             length = mLengths[request]
             mSnapshot[request] = length
-            count = (length - 1) // 128
+            if cutlass.const_expr(self.include_partial_block):
+                complete = length // self.pooling_factor
+                count = (
+                    complete + self.entries_per_block - 1
+                ) // self.entries_per_block
+            else:
+                count = (length - 1) // 128
             if count < 0:
                 count = cutlass.Int32(0)
             if count > max_pages:  # noqa: PLR1730
                 count = max_pages
+            if cutlass.const_expr(self.blocks_per_tile != 1):
+                count = (count + self.blocks_per_tile - 1) // self.blocks_per_tile
             mScheduler[request + 1] = count
         cute.arch.sync_threads()
 
@@ -123,7 +150,15 @@ class DecodeIndexerPlanSm100:
         for row in cutlass.range(tid, rows, 256):
             request = row // query_length
             token = row % query_length
-            valid = (mSnapshot[request] - query_length + token) // 128 + 1
+            if cutlass.const_expr(self.include_partial_block):
+                complete = (
+                    mSnapshot[request] - query_length + token + 1
+                ) // self.pooling_factor
+                valid = (
+                    complete + self.entries_per_block - 1
+                ) // self.entries_per_block
+            else:
+                valid = (mSnapshot[request] - query_length + token) // 128 + 1
             if valid < 1:
                 valid = cutlass.Int32(1)
             if valid > max_pages:  # noqa: PLR1730
