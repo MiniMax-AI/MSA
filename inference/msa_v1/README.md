@@ -26,6 +26,7 @@ Available formats and constraints:
 - BF16 paged prefill attention accepts contiguous and SGLang-style strided K/V views.
 - BF16 paged prefill indexer supports one, two, or four local index heads and returns
   `[num_index_heads, total_q, 16]`.
+- BF16 prefill `BatchPrefillBlockScoreWrapper` returns FP32 block scores over pooled keys, without TopK.
 - Q8KV4 and Q8KV8 decode attention support GQA=8/16 on B200/SM100 and B300/SM103,
   dispatch by the actual `Hq/Hkv`, and return BF16. Query length is configured through the public
   interface. Q8KV4 uses native CUTLASS C++ and retains SM107 GQA=16 support with
