@@ -15,6 +15,7 @@ operator follows a `plan()` / `run()` lifecycle: `plan()` accepts request-level 
 | Decode attention | `inference.msa_v1.attention.decode.<dtype>` | `BatchDecodeWithPagedKVCacheWrapper` |
 | Prefill attention | `inference.msa_v1.attention.prefill.<dtype>` | `BatchPrefillWithPagedKVCacheWrapper` |
 | Decode indexer | `inference.msa_v1.indexer.decode.<variant>` | `BatchDecodeIndexerWithPagedKVCacheWrapper` |
+| Decode block scores (pooled keys) | `inference.msa_v1.indexer.decode.interface` | `BatchDecodeBlockScoreWrapper` |
 | Prefill indexer | `inference.msa_v1.indexer.prefill.<variant>` | `BatchPrefillIndexerWithPagedKVCacheWrapper` |
 
 Available formats and constraints:

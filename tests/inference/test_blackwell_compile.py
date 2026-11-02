@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 pytestmark = pytest.mark.gpu
 
 
+def _fake_tensor(dtype, shape, alignment=16):
+    return cute.runtime.make_fake_compact_tensor(
+        dtype,
+        shape,
+        stride_order=tuple(reversed(range(len(shape)))),
+        assumed_align=alignment,
+    )
+
+
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
 @pytest.mark.parametrize("num_index_heads", (1, 2, 4))
 @pytest.mark.parametrize("query_length", range(1, 17))
@@ -27,14 +36,6 @@ def test_decode_indexer_compiles_for_blackwell(
 
     assert Version(cutlass.__version__) >= Version("4.5.2")
 
-    def tensor(dtype, shape, alignment=16):
-        return cute.runtime.make_fake_compact_tensor(
-            dtype,
-            shape,
-            stride_order=tuple(reversed(range(len(shape)))),
-            assumed_align=alignment,
-        )
-
     kernel = DecodeIndexerGemmSm100(
         num_index_heads=num_index_heads,
         sm_count=148,
@@ -42,12 +43,12 @@ def test_decode_indexer_compiles_for_blackwell(
         input_dtype=input_dtype,
     )
     args = (
-        tensor(input_dtype, (2, query_length * num_index_heads, 128)),
-        tensor(input_dtype, (37, 128, 128)),
-        tensor(cutlass.Int32, (2, 17), 4),
-        tensor(cutlass.Int32, (2,), 4),
-        tensor(cutlass.Float32, (num_index_heads, 2 * query_length, 17)),
-        tensor(cutlass.Uint8, ((2 + 4 * 148 + 2) * 4,)),
+        _fake_tensor(input_dtype, (2, query_length * num_index_heads, 128)),
+        _fake_tensor(input_dtype, (37, 128, 128)),
+        _fake_tensor(cutlass.Int32, (2, 17), 4),
+        _fake_tensor(cutlass.Int32, (2,), 4),
+        _fake_tensor(cutlass.Float32, (num_index_heads, 2 * query_length, 17)),
+        _fake_tensor(cutlass.Uint8, ((2 + 4 * 148 + 2) * 4,)),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
     )
     started_at = time.perf_counter()
@@ -59,7 +60,72 @@ def test_decode_indexer_compiles_for_blackwell(
 
 
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
-def test_decode_shared_plan_compiles_for_blackwell(arch):
+@pytest.mark.parametrize("input_dtype", (cutlass.BFloat16, cutlass.Float8E4M3FN))
+@pytest.mark.parametrize(
+    "factor,page_size,partial,query_length",
+    (
+        (4, 128, True, 3),
+        (4, 64, True, 3),
+        (4, 64, True, 16),
+        (2, 128, False, 3),
+        (2, 64, False, 3),
+        (1, 128, True, 3),
+        (1, 64, True, 3),
+    ),
+)
+def test_pooled_decode_indexer_compiles_for_blackwell(
+    arch, input_dtype, factor, page_size, partial, query_length
+):
+    from inference.msa_v1.indexer.decode.indexer_gemm_sm100 import (
+        DecodeIndexerGemmSm100,
+    )
+    from inference.msa_v1.indexer.decode.plan import _check_block_layout
+
+    pages_per_block, blocks_per_tile = _check_block_layout(factor, partial, page_size)
+    kernel = DecodeIndexerGemmSm100(
+        num_index_heads=4,
+        sm_count=148,
+        query_columns=((query_length * 4 + 7) // 8) * 8,
+        input_dtype=input_dtype,
+        pooling_factor=factor,
+        pages_per_block=pages_per_block,
+        blocks_per_tile=blocks_per_tile,
+        include_partial_block=partial,
+    )
+    started_at = time.perf_counter()
+    compiled = cute.compile(
+        kernel,
+        _fake_tensor(input_dtype, (2, query_length * 4, 128)),
+        _fake_tensor(input_dtype, (37, page_size // factor, 128)),
+        _fake_tensor(cutlass.Int32, (2, 17), 4),
+        _fake_tensor(cutlass.Int32, (2,), 4),
+        _fake_tensor(
+            cutlass.Float32, (4, 2 * query_length, (17 * page_size + 127) // 128)
+        ),
+        _fake_tensor(cutlass.Uint8, ((2 + 4 * 148 + 2) * 4,)),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options=f"--enable-tvm-ffi --opt-level 2 --gpu-arch={arch}",
+    )
+    logger.info(
+        "%s pooled decode compiled in %.3fs", arch, time.perf_counter() - started_at
+    )
+    assert compiled is not None
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a"))
+@pytest.mark.parametrize(
+    "settings",
+    (
+        {},
+        {
+            "pooling_factor": 4,
+            "pages_per_block": 2,
+            "blocks_per_tile": 4,
+            "include_partial_block": True,
+        },
+    ),
+)
+def test_decode_shared_plan_compiles_for_blackwell(arch, settings):
     from inference.msa_v1.indexer.decode.plan_kernel import DecodeIndexerPlanSm100
 
     def tensor(size):
@@ -69,7 +135,7 @@ def test_decode_shared_plan_compiles_for_blackwell(arch):
 
     started_at = time.perf_counter()
     compiled = cute.compile(
-        DecodeIndexerPlanSm100(),
+        DecodeIndexerPlanSm100(**settings),
         tensor(513),
         tensor(513),
         tensor(513 + 4 * 148 + 2),

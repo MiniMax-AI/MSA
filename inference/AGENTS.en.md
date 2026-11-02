@@ -177,7 +177,9 @@ owns the page table, `seq_lens`, scheduler state, and workspace. `run()` owns
 the public proxy-score plus forced-tail TopK path and accepts preallocated
 output for graph capture. Proxy scores are a private intermediate: they may be
 profiled separately for MBU/MFU diagnosis but are not a public performance
-metric.
+metric. The only public score-only exception is the pooled-key
+`inference.msa_v1.indexer.decode.interface.BatchDecodeBlockScoreWrapper`: it returns FP32
+per-head maxima per 128-original-token block, without TopK or a forced local block.
 
 The public packages are `inference.msa_v1.indexer.decode.bf16`, `q8kv4`, and `q8kv8`.
 The keyword-only `plan()` argument `num_index_heads=1` accepts H=1/2/4.
