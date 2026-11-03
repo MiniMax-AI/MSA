@@ -92,24 +92,27 @@ template <class Traits> struct IndexerGemmRunner {
     return cudaSuccess;
   }
 
-  static cudaError_t run(IndexerGemmParams const &params, cudaStream_t stream) {
+  static cudaError_t run(IndexerGemmParams const &params, cudaStream_t stream, bool pdl = false) {
     cudaError_t const initialize_status = initialize();
     if (initialize_status != cudaSuccess) {
       return initialize_status;
     }
     dim3 const grid(static_cast<unsigned int>(params.sm_count), 1, 1);
-    cudaLaunchAttribute attributes[1]{};
+    cudaLaunchAttribute attributes[2]{};
     attributes[0].id = cudaLaunchAttributeClusterDimension;
     attributes[0].val.clusterDim.x = 1;
     attributes[0].val.clusterDim.y = 1;
     attributes[0].val.clusterDim.z = 1;
+    // optional PDL. The kernel's griddepcontrol.wait is a no-op without it.
+    attributes[1].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[1].val.programmaticStreamSerializationAllowed = 1;
     cudaLaunchConfig_t launch_config{};
     launch_config.gridDim = grid;
     launch_config.blockDim = dim3(Kernel::kThreadCount, 1, 1);
     launch_config.dynamicSmemBytes = Kernel::kSharedStorageBytes;
     launch_config.stream = stream;
     launch_config.attrs = attributes;
-    launch_config.numAttrs = 1;
+    launch_config.numAttrs = pdl ? 2 : 1;
     cudaError_t const launch_status =
         cudaLaunchKernelEx(&launch_config, indexer_gemm_kernel<Traits>, params);
     return launch_status == cudaSuccess ? cudaGetLastError() : launch_status;
