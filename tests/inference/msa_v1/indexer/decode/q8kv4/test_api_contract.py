@@ -72,6 +72,30 @@ def test_preallocated_output_and_shape() -> None:
     assert torch.equal(output.cpu(), expected.unsqueeze(0))
 
 
+@pytest.mark.parametrize("num_index_heads", [2, 4])
+def test_head_minor_out_matches_contiguous_out(num_index_heads: int) -> None:
+    """Top-k written as [batch * Q, H, 16] equals the default [H, batch * Q, 16]."""
+    device = torch.device("cuda")
+    q, packed_k, k_scale, page_table, seq_lens = make_inputs(
+        3,
+        40,
+        torch.tensor([40 * 128, 33 * 128 + 5, 17 * 128 + 77], dtype=torch.int32),
+        seed=4,
+        device=device,
+        num_index_heads=num_index_heads,
+    )
+    wrapper = indexer.BatchDecodeIndexerWithPagedKVCacheWrapper()
+    assert wrapper.supports_head_minor_out
+    wrapper.plan(page_table, seq_lens, num_index_heads=num_index_heads)
+    expected = wrapper.run(q, packed_k, k_scale=k_scale).clone()
+    buffer = torch.full(
+        (3 * 8, num_index_heads, 16), -777, dtype=torch.int32, device=device
+    )
+    result = wrapper.run(q, packed_k, k_scale=k_scale, out=buffer.permute(1, 0, 2))
+    assert result.data_ptr() == buffer.data_ptr()
+    assert torch.equal(result, expected)
+
+
 def test_out_none_allocates_only_output() -> None:
     device = torch.device("cuda")
     inputs = make_inputs(
