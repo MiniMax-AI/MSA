@@ -75,16 +75,26 @@ inline int m3_max_n() { return kMaximumColumns; }
 // takes is uniform over that unit.
 // ---------------------------------------------------------------------------
 
+// Score row r = g * (rows / out_groups) + i is written to output row i * out_groups + g;
+// out_groups == 1 keeps the identity layout.
+__device__ __forceinline__ int *out_row_ptr(int *__restrict__ out_ids, int row, int rows,
+                                            int out_groups) {
+  if (out_groups == 1)
+    return out_ids + row * kTopK;
+  const int rows_per_group = rows / out_groups;
+  return out_ids + ((row % rows_per_group) * out_groups + row / rows_per_group) * kTopK;
+}
+
 // This row's nvm = n-1, the count the select ranks -- or 0 once the row is
 // already written, which is every row of n <= kTopK: fewer columns than slots,
 // so the answer is the n ids in order padded with -1, and nothing is ranked.
-__device__ __forceinline__ int row_nvm(const int *__restrict__ row_n, int *__restrict__ out_ids,
+__device__ __forceinline__ int row_nvm(const int *__restrict__ row_n, int *__restrict__ out_row,
                                        int row, int slot) {
   const int n = __ldg(row_n + row);
   if (n > kTopK)
     return n - 1; // column n-1 is forced-selected, never ranked
   if (slot < kTopK)
-    out_ids[row * kTopK + slot] = (slot < n) ? slot : -1;
+    out_row[slot] = (slot < n) ? slot : -1;
   return 0;
 }
 
@@ -176,7 +186,8 @@ inline int m3_rows_per_block(int n_max) { return ((n_max - 1) <= kThreads) ? kRo
 __global__ __launch_bounds__(kThreads) void m3_topk_kernel(const float *__restrict__ scores,
                                                            const int *__restrict__ row_n,
                                                            int *__restrict__ out_ids, int n_max,
-                                                           int row_stride, int rows) {
+                                                           int row_stride, int rows,
+                                                           int out_groups = 1) {
   __shared__ SelectSmem s;
   const int tid = static_cast<int>(threadIdx.x);
 
@@ -193,12 +204,13 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(const float *__restri
     // short-row branch leaves -- so one test below covers all three cases.
     const bool owns_row = (warp < kRowsPerBlock) && (row < rows);
 
+    int *out_row = out_row_ptr(out_ids, row, rows, out_groups);
     if (n_max <= kTopK) {
       if (owns_row)
-        row_nvm(row_n, out_ids, row, lane);
+        row_nvm(row_n, out_row, row, lane);
       return;
     }
-    const int nvm = owns_row ? row_nvm(row_n, out_ids, row, lane) : 0;
+    const int nvm = owns_row ? row_nvm(row_n, out_row, row, lane) : 0;
     float pre[kWarpKeys];
 #pragma unroll
     for (int i = 0; i < kWarpKeys; ++i) {
@@ -206,14 +218,15 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(const float *__restri
       pre[i] = (idx < nvm) ? __ldcg(row_scores(scores, row, row_stride) + idx) : 0.0f;
     }
     if (nvm > 0)
-      warp_rank_row(nvm, pre, out_ids + row * kTopK);
+      warp_rank_row(nvm, pre, out_row);
   } else {
     // ---- block family: one row per CTA, so blockIdx.x IS the row and every
     // thread of the CTA reads the same n -- the branch below is CTA-uniform,
     // which is what keeps the __syncthreads() inside block_rank_row convergent.
     const int row = static_cast<int>(blockIdx.x);
     const float *p = row_scores(scores, row, row_stride);
-    const int nvm = row_nvm(row_n, out_ids, row, tid);
+    int *out_row = out_row_ptr(out_ids, row, rows, out_groups);
+    const int nvm = row_nvm(row_n, out_row, row, tid);
     float pre[kPrefetchKeys];
 #pragma unroll
     for (int i = 0; i < kPrefetchKeys; ++i) {
@@ -221,7 +234,7 @@ __global__ __launch_bounds__(kThreads) void m3_topk_kernel(const float *__restri
       pre[i] = (id < nvm) ? __ldcg(p + id) : 0.0f;
     }
     if (nvm > 0)
-      block_rank_row<0>(nvm, p, pre, s, out_ids + row * kTopK);
+      block_rank_row<0>(nvm, p, pre, s, out_row);
   }
 }
 
@@ -251,8 +264,9 @@ inline int m3_occ() {
 // +7 to +15% at 4096 rows, +31 to +45% at 8192. A caller working at that scale
 // wants the packed grid back.
 inline void m3_launch(const float *scores, const int *row_n, int *out, int n_max, int row_stride,
-                      int rows, cudaStream_t st) {
-  m3_topk_kernel<<<rows, kThreads, 0, st>>>(scores, row_n, out, n_max, row_stride, rows);
+                      int rows, cudaStream_t st, int out_groups = 1) {
+  m3_topk_kernel<<<rows, kThreads, 0, st>>>(scores, row_n, out, n_max, row_stride, rows,
+                                            out_groups);
 }
 
 } // namespace m3
