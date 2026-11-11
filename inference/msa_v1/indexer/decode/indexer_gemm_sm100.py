@@ -47,16 +47,34 @@ class DecodeIndexerGemmSm100:
         sm_count: int,
         query_columns: int,
         input_dtype: type,
+        pooling_factor: int = 1,
+        pages_per_block: int = 1,
+        blocks_per_tile: int = 1,
+        include_partial_block: bool = False,
+        sm_scale: float | None = None,
     ) -> None:
         if num_index_heads not in (1, 2, 4) or sm_count <= 0:
             raise ValueError("invalid head count or SM count")
         self.num_index_heads = num_index_heads
+        # Each logical block (output column) still covers 128 original tokens;
+        # pooling stores one key per pooling_factor tokens.
+        self.pooling_factor = pooling_factor
+        self.entries_per_block = self.page_size // pooling_factor
+        self.entries_per_page = self.entries_per_block // pages_per_block
+        self.blocks_per_tile = blocks_per_tile
+        self.pages_per_tile = pages_per_block * blocks_per_tile
+        self.include_partial_block = include_partial_block
+        if blocks_per_tile > 1:
+            # Packed tiles use fewer K stages, chosen by page64/page128 screening.
+            self.k_stages = 4 if pages_per_block == 1 else 3
         if input_dtype not in (cutlass.BFloat16, cutlass.Float8E4M3FN):
             raise TypeError("input_dtype must be BF16 or E4M3")
         self.input_dtype = input_dtype
         self.score_scale = (
             1.0 / (self.head_dim**0.5) if input_dtype == cutlass.BFloat16 else 1.0
         )
+        if sm_scale is not None:
+            self.score_scale = sm_scale
         if query_columns not in range(8, 65, 8):
             raise ValueError("query_columns must be a multiple of 8 in [8, 64]")
         self.query_columns = query_columns
@@ -187,12 +205,58 @@ class DecodeIndexerGemmSm100:
         )
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
-        tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
-            tma_load_op,
-            mK_mk,
-            sK_tma_layout,
-            (self.page_size, self.k_chunk),
-        )
+        if cutlass.const_expr(self.entries_per_page != self.m_tile):
+            # Copy each short page separately so TMA never reads a neighbor page.
+            sK_slab_layout = cute.make_composed_layout(
+                sK_layout.inner,
+                0,
+                cute.make_layout(
+                    (self.entries_per_page, sector_elements, 1),
+                    stride=(sector_elements, 1, 0),
+                ),
+            )
+            mK_mkp = cute.make_tensor(
+                mKCache.iterator,
+                cute.make_layout(
+                    (self.entries_per_page, self.head_dim, physical_pages),
+                    stride=(mKCache.stride[1], 1, mKCache.stride[0]),
+                ),
+            )
+            tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mK_mkp,
+                sK_slab_layout,
+                (self.entries_per_page, sector_elements, 1),
+            )
+            sK_tma_layout = cute.make_composed_layout(
+                sK_layout.inner,
+                0,
+                cute.make_layout(
+                    (
+                        self.entries_per_page,
+                        sector_elements,
+                        1,
+                        self.pages_per_tile,
+                        k_sectors,
+                        self.k_stages,
+                    ),
+                    stride=(
+                        sector_elements,
+                        1,
+                        0,
+                        self.entries_per_page * sector_elements,
+                        self.m_tile * sector_elements,
+                        self.m_tile * self.k_chunk,
+                    ),
+                ),
+            )
+        else:
+            tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mK_mk,
+                sK_tma_layout,
+                (self.page_size, self.k_chunk),
+            )
         tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
             tma_load_op,
             mQ_kcr,
@@ -252,6 +316,7 @@ class DecodeIndexerGemmSm100:
         sQ_layout: cute.ComposedLayout,
         sQ_tma_layout: cute.ComposedLayout,
     ) -> None:
+        sector_elements = 128 * 8 // self.input_dtype.width
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane_idx = cute.arch.lane_idx()
@@ -325,7 +390,11 @@ class DecodeIndexerGemmSm100:
             num_stages=self.k_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            tx_count=self.page_size * self.k_chunk * self.input_dtype.width // 8,
+            tx_count=self.entries_per_page
+            * self.pages_per_tile
+            * self.k_chunk
+            * self.input_dtype.width
+            // 8,
             barrier_storage=storage.k_mbar_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
@@ -349,14 +418,24 @@ class DecodeIndexerGemmSm100:
         ).make_participants()
         pipeline.pipeline_init_arrive(is_relaxed=True)
 
-        gK = cute.flat_divide(mK_mk, (self.page_size, self.k_chunk))
-        tKsK, tKgK = cpasync.tma_partition(
-            tma_atom_K,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sK_tma, 0, 2),
-            cute.group_modes(gK, 0, 2),
-        )
+        if cutlass.const_expr(self.entries_per_page != self.m_tile):
+            gK = cute.flat_divide(mK_mk, (self.entries_per_page, sector_elements, 1))
+            tKsK, tKgK = cpasync.tma_partition(
+                tma_atom_K,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sK_tma, 0, 3),
+                cute.group_modes(gK, 0, 3),
+            )
+        else:
+            gK = cute.flat_divide(mK_mk, (self.page_size, self.k_chunk))
+            tKsK, tKgK = cpasync.tma_partition(
+                tma_atom_K,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sK_tma, 0, 2),
+                cute.group_modes(gK, 0, 2),
+            )
         gQ = cute.flat_divide(
             mQ_kcr,
             (
@@ -408,22 +487,56 @@ class DecodeIndexerGemmSm100:
                 if segment_pages > pages_remaining:  # noqa: PLR1730
                     segment_pages = pages_remaining
                 for _ in cutlass.range(segment_pages, unroll=1):
-                    physical_page = Int32(0)
-                    if lane_idx == Int32(0):
-                        physical_page = mPageTable_lb[
-                            logical_page,
-                            current_batch,
-                        ]
-                    physical_page = cute.arch.shuffle_sync(physical_page, 0)
-                    for chunk in cutlass.range_constexpr(self.chunks_per_page):
+                    if cutlass.const_expr(self.entries_per_page != self.m_tile):
+                        # Resolve the tile's independently mapped pages in parallel.
+                        # Missing or incomplete tail pages may hold -1 IDs; reuse the
+                        # tile's first page to complete TMA, and mask its rows.
+                        lane_page = Int32(0)
+                        if lane_idx < Int32(self.pages_per_tile):
+                            page = logical_page * self.pages_per_tile + lane_idx
+                            if (
+                                page >= mPageTable_lb.shape[0]
+                                or page * self.entries_per_page
+                                >= mSeqLens[current_batch] // self.pooling_factor
+                            ):
+                                page = logical_page * self.pages_per_tile
+                            lane_page = mPageTable_lb[page, current_batch]
                         k_empty = k_producer.acquire_and_advance()
-                        cute.copy(
-                            tma_atom_K,
-                            tKgK[(None, physical_page, Int32(chunk))],
-                            tKsK[(None, k_empty.index)],
-                            tma_bar_ptr=k_empty.barrier,
-                            cache_policy=Int64(self.k_cache_evict_first),
-                        )
+                        for page_in_tile in cutlass.range_constexpr(
+                            self.pages_per_tile
+                        ):
+                            physical_page = cute.arch.shuffle_sync(
+                                lane_page, page_in_tile
+                            )
+                            for sector in cutlass.range_constexpr(
+                                self.k_chunk // sector_elements
+                            ):
+                                cute.copy(
+                                    tma_atom_K,
+                                    tKgK[
+                                        (None, Int32(0), Int32(sector), physical_page)
+                                    ],
+                                    tKsK[(None, page_in_tile, sector, k_empty.index)],
+                                    tma_bar_ptr=k_empty.barrier,
+                                    cache_policy=Int64(self.k_cache_evict_first),
+                                )
+                    else:
+                        physical_page = Int32(0)
+                        if lane_idx == Int32(0):
+                            physical_page = mPageTable_lb[
+                                logical_page,
+                                current_batch,
+                            ]
+                        physical_page = cute.arch.shuffle_sync(physical_page, 0)
+                        for chunk in cutlass.range_constexpr(self.chunks_per_page):
+                            k_empty = k_producer.acquire_and_advance()
+                            cute.copy(
+                                tma_atom_K,
+                                tKgK[(None, physical_page, Int32(chunk))],
+                                tKsK[(None, k_empty.index)],
+                                tma_bar_ptr=k_empty.barrier,
+                                cache_policy=Int64(self.k_cache_evict_first),
+                            )
                     global_page += Int32(1)
                     logical_page += Int32(1)
                 pages_remaining -= segment_pages
@@ -532,47 +645,106 @@ class DecodeIndexerGemmSm100:
                         rScores,
                     )
                     cute.arch.fence_view_async_tmem_load()
+                    if cutlass.const_expr(
+                        self.include_partial_block
+                        or self.entries_per_block != self.m_tile
+                    ):
+                        for value_idx in cutlass.range_constexpr(cute.size(rScores)):
+                            coord = tTR_cScores[value_idx]
+                            complete = (
+                                mSeqLens[current_batch]
+                                - query_length
+                                + coord[1] // self.num_index_heads
+                                + 1
+                            ) // self.pooling_factor
+                            if (
+                                coord[0]
+                                >= self.entries_per_block * self.blocks_per_tile
+                                or logical_page
+                                * self.entries_per_block
+                                * self.blocks_per_tile
+                                + coord[0]
+                                >= complete
+                            ):
+                                rScores[value_idx] = -Float32.inf
                     for query_idx in cutlass.range_constexpr(self.query_columns):
                         rScoresFlat[query_idx] = cute.arch.warp_redux_sync(
                             rScoresFlat[query_idx],
                             "fmax",
                         )
-                    if lane_idx == Int32(0):
-                        cute.autovec_copy(
-                            rScoresFlat,
-                            sPartialMax[partial_stage, score_warp_idx, None],
-                        )
-                    acc_full.release()
-                    score_barrier.arrive_and_wait()
-
-                    if score_warp_idx == Int32(0):
-                        for column_group in cutlass.range_constexpr(
-                            (self.query_columns + 31) // 32
-                        ):
-                            query_idx = lane_idx + column_group * 32
-                            if query_idx < query_length * self.num_index_heads:
-                                row_max = -Float32.inf
-                                for partial_idx in cutlass.range_constexpr(
-                                    self.score_warps
-                                ):
-                                    row_max = cute.arch.fmax(
-                                        row_max,
-                                        sPartialMax[
-                                            partial_stage, partial_idx, query_idx
-                                        ],
+                    if cutlass.const_expr(self.blocks_per_tile > 1):
+                        # Each warp owns one complete 32-entry block; no shared
+                        # reduction or cross-warp barrier is needed.
+                        if lane_idx == Int32(0):
+                            for query_idx in cutlass.range_constexpr(
+                                self.query_columns
+                            ):
+                                if query_idx < query_length * self.num_index_heads:
+                                    coord = tTR_cScores[query_idx]
+                                    output_block = (
+                                        logical_page * self.blocks_per_tile
+                                        + coord[0] // self.entries_per_block
                                     )
-                                local_block = (
-                                    mSeqLens[current_batch]
-                                    - query_length
-                                    + query_idx // self.num_index_heads
-                                ) // self.page_size
-                                if logical_page < local_block:
-                                    mOut_pqb[
-                                        query_idx % self.num_index_heads,
-                                        current_batch * query_length
-                                        + query_idx // self.num_index_heads,
-                                        logical_page,
-                                    ] = row_max * self.score_scale
+                                    local_block = (
+                                        mSeqLens[current_batch]
+                                        - query_length
+                                        + query_idx // self.num_index_heads
+                                    ) // self.page_size
+                                    visible = output_block < local_block
+                                    if cutlass.const_expr(self.include_partial_block):
+                                        visible = True
+                                    if visible and output_block < mOut_pqb.shape[2]:
+                                        mOut_pqb[
+                                            query_idx % self.num_index_heads,
+                                            current_batch * query_length
+                                            + query_idx // self.num_index_heads,
+                                            output_block,
+                                        ] = (
+                                            rScoresFlat[query_idx] * self.score_scale
+                                        )
+                        acc_full.release()
+                    else:
+                        if lane_idx == Int32(0):
+                            cute.autovec_copy(
+                                rScoresFlat,
+                                sPartialMax[partial_stage, score_warp_idx, None],
+                            )
+                        acc_full.release()
+                        score_barrier.arrive_and_wait()
+
+                        if score_warp_idx == Int32(0):
+                            for column_group in cutlass.range_constexpr(
+                                (self.query_columns + 31) // 32
+                            ):
+                                query_idx = lane_idx + column_group * 32
+                                if query_idx < query_length * self.num_index_heads:
+                                    row_max = -Float32.inf
+                                    for partial_idx in cutlass.range_constexpr(
+                                        self.score_warps
+                                    ):
+                                        row_max = cute.arch.fmax(
+                                            row_max,
+                                            sPartialMax[
+                                                partial_stage, partial_idx, query_idx
+                                            ],
+                                        )
+                                    local_block = (
+                                        mSeqLens[current_batch]
+                                        - query_length
+                                        + query_idx // self.num_index_heads
+                                    ) // self.page_size
+                                    visible = logical_page < local_block
+                                    if cutlass.const_expr(self.include_partial_block):
+                                        visible = True
+                                    if visible:
+                                        mOut_pqb[
+                                            query_idx % self.num_index_heads,
+                                            current_batch * query_length
+                                            + query_idx // self.num_index_heads,
+                                            logical_page,
+                                        ] = (
+                                            row_max * self.score_scale
+                                        )
                     global_page += Int32(1)
                     logical_page += Int32(1)
                 pages_remaining -= segment_pages

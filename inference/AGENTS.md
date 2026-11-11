@@ -298,6 +298,8 @@ local_block = query_position // 128
 - BF16、Q8KV4 与 Q8KV8 的公开入口均为 `BatchDecodeIndexerWithPagedKVCacheWrapper`；BF16/Q8KV8 的
   `run()` 不接收 `k_scale`。公开 wrapper 内部顺序执行 proxy score 与 forced-tail TopK，
   不公开 score-only wrapper、模块级 `forward()` 或 GEMM wrapper 名称。
+- 唯一例外是池化 Key 的公开 score-only 入口 `inference.msa_v1.indexer.decode.interface.BatchDecodeBlockScoreWrapper`：
+  返回每 head、每个 128 原始 token block 的 FP32 最大分数，不执行 TopK，也不强制加入 local block。
 - 代理分数仅是内部中间量；性能分析可以单独计量私有 proxy-score stage，并按实际瓶颈评估
   MBU 或 MFU，但它只用于诊断 kernel 上限，不能替代公开 `run()` 的 CUDA Graph E2E
   latency。Production 调用方只接收最终 TopK indices。

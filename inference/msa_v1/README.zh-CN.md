@@ -15,6 +15,7 @@ MSA v1 提供 paged sparse attention 和 indexer 的 decode/prefill 接口。所
 | Decode attention | `inference.msa_v1.attention.decode.<dtype>` | `BatchDecodeWithPagedKVCacheWrapper` |
 | Prefill attention | `inference.msa_v1.attention.prefill.<dtype>` | `BatchPrefillWithPagedKVCacheWrapper` |
 | Decode indexer | `inference.msa_v1.indexer.decode.<variant>` | `BatchDecodeIndexerWithPagedKVCacheWrapper` |
+| Decode block scores（池化 Key） | `inference.msa_v1.indexer.decode.interface` | `BatchDecodeBlockScoreWrapper` |
 | Prefill indexer | `inference.msa_v1.indexer.prefill.<variant>` | `BatchPrefillIndexerWithPagedKVCacheWrapper` |
 
 可用数据格式与约束：

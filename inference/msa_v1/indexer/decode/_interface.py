@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import time
 from contextlib import nullcontext
 from functools import cache
@@ -24,11 +25,14 @@ from inference.msa_v1.indexer._common.topk_select.interface import (
     MAXIMUM_COLUMNS as _MAXIMUM_PAGES,
 )
 from inference.msa_v1.indexer.decode.indexer_gemm_sm100 import DecodeIndexerGemmSm100
-from inference.msa_v1.indexer.decode.plan import BatchDecodeIndexerPlan
+from inference.msa_v1.indexer.decode.plan import (
+    _DEFAULT_BLOCK_LAYOUT,
+    BatchDecodeIndexerPlan,
+    _check_block_layout,
+)
 
 logger = logging.getLogger(__name__)
 
-_PAGE_SIZE = 128
 _HEAD_DIM = 128
 _TOP_K = 16
 _COMPILE_CACHE: dict[tuple, object] = {}
@@ -70,6 +74,8 @@ def _check_workspace_buffer(workspace_buffer: torch.Tensor) -> None:
 def _check_metadata(
     page_table: torch.Tensor,
     seq_lens: torch.Tensor,
+    *,
+    pages_per_block: int = 1,
 ) -> None:
     if not page_table.is_cuda or not page_table.is_contiguous():
         raise ValueError("page_table must be a contiguous CUDA tensor")
@@ -77,8 +83,9 @@ def _check_metadata(
         raise ValueError("page_table must have dtype torch.int32")
     if page_table.ndim != 2 or page_table.shape[0] <= 0:
         raise ValueError("page_table must have shape [batch, max_pages]")
-    if not 0 < page_table.shape[1] <= _MAXIMUM_PAGES:
-        raise ValueError(f"max_pages must be in [1, {_MAXIMUM_PAGES}]")
+    maximum_pages = _MAXIMUM_PAGES * pages_per_block
+    if not 0 < page_table.shape[1] <= maximum_pages:
+        raise ValueError(f"max_pages must be in [1, {maximum_pages}]")
     if not seq_lens.is_cuda or not seq_lens.is_contiguous():
         raise ValueError("seq_lens must be a contiguous CUDA tensor")
     if seq_lens.dtype is not torch.int32:
@@ -98,13 +105,15 @@ class _BatchDecodeProxyScoreWrapper:
     """Manage metadata and compiled launch state for private proxy scores.
 
     ``seq_lens`` includes the current query chunk. For query
-    ``q_idx``, only logical pages before
-    ``(seq_lens[b] - Q + q_idx) // 128`` are written. The local page and the
-    output suffix remain untouched.
+    ``q_idx``, historical-only mode writes logical blocks before
+    ``(seq_lens[b] - Q + q_idx) // 128``. Partial mode also scores complete
+    groups in the current block. The private historical output suffix is untouched.
 
     A wrapper instance is not safe for concurrent use from multiple streams.
     Use one wrapper per concurrent stream.
     """
+
+    _initialize_output = False
 
     def __init__(
         self,
@@ -112,9 +121,23 @@ class _BatchDecodeProxyScoreWrapper:
         *,
         use_cuda_graph: bool = False,
         input_dtype: torch.dtype = torch.float8_e4m3fn,
+        pooling_factor: int = 1,
+        include_partial_block: bool = False,
+        sm_scale: float | None = None,
+        page_size: int = 128,
         page_table_buffer: torch.Tensor | None = None,
         seq_lens_buffer: torch.Tensor | None = None,
     ) -> None:
+        self._pages_per_block, self._blocks_per_tile = _check_block_layout(
+            pooling_factor, include_partial_block, page_size
+        )
+        self._pooling_factor = pooling_factor
+        self._include_partial_block = include_partial_block
+        self._page_size = page_size
+        self._entries_per_page = page_size // pooling_factor
+        if sm_scale is not None and (not math.isfinite(sm_scale) or sm_scale <= 0):
+            raise ValueError("sm_scale must be finite and positive")
+        self._sm_scale = sm_scale
         self._input_dtype = input_dtype
         if workspace_buffer is not None:
             _check_workspace_buffer(workspace_buffer)
@@ -130,7 +153,11 @@ class _BatchDecodeProxyScoreWrapper:
                 "use_cuda_graph=True"
             )
         if page_table_buffer is not None and seq_lens_buffer is not None:
-            _check_metadata(page_table_buffer, seq_lens_buffer)
+            _check_metadata(
+                page_table_buffer,
+                seq_lens_buffer,
+                pages_per_block=self._pages_per_block,
+            )
             if (
                 workspace_buffer is not None
                 and workspace_buffer.device != page_table_buffer.device
@@ -152,6 +179,10 @@ class _BatchDecodeProxyScoreWrapper:
         self._max_pages: int | None = None
         self._device: torch.device | None = None
         self._sm_count: int | None = None
+
+    @property
+    def _block_layout(self) -> tuple[int, bool, int]:
+        return (self._pooling_factor, self._include_partial_block, self._page_size)
 
     @staticmethod
     def workspace_size(batch_size: int) -> int:
@@ -178,7 +209,7 @@ class _BatchDecodeProxyScoreWrapper:
             raise ValueError("query_length must be an integer in [1, 16]")
         self._query_length = query_length
         self._num_index_heads = num_index_heads
-        _check_metadata(page_table, seq_lens)
+        _check_metadata(page_table, seq_lens, pages_per_block=self._pages_per_block)
         if torch.cuda.get_device_capability(page_table.device) not in (
             (10, 0),
             (10, 3),
@@ -222,6 +253,7 @@ class _BatchDecodeProxyScoreWrapper:
                 max_pages=page_table.shape[1],
                 num_index_heads=num_index_heads,
                 query_length=self._query_length,
+                block_layout=self._block_layout,
             )
             self._shared_plan = shared_plan
         else:
@@ -239,6 +271,9 @@ class _BatchDecodeProxyScoreWrapper:
                     num_index_heads=num_index_heads,
                     query_length=query_length,
                     workspace_buffer=self._external_workspace,
+                    pooling_factor=self._pooling_factor,
+                    include_partial_block=self._include_partial_block,
+                    page_size=self._page_size,
                 )
             reuse.update()
             self._owned_plan = reuse
@@ -247,7 +282,9 @@ class _BatchDecodeProxyScoreWrapper:
         self._page_table = planned_page_table
         self._seq_lens = self._shared_plan._seq_lens
         self._batch_size = page_table.shape[0]
-        self._max_pages = page_table.shape[1]
+        self._max_pages = (
+            page_table.shape[1] + self._pages_per_block - 1
+        ) // self._pages_per_block
         self._device = page_table.device
         self._sm_count = self._shared_plan.num_workers
 
@@ -276,7 +313,7 @@ class _BatchDecodeProxyScoreWrapper:
             # only that metadata so TMA and the dynamic-stride ABI stay valid.
             k_cache = k_cache.as_strided(
                 k_cache.shape,
-                (_PAGE_SIZE * k_cache.stride(1), k_cache.stride(1), 1),
+                (self._entries_per_page * k_cache.stride(1), k_cache.stride(1), 1),
             )
         k_cute = _as_dynamic_tensor(k_cache, assumed_align=16)
         page_table_cute = _as_dynamic_tensor(
@@ -309,12 +346,20 @@ class _BatchDecodeProxyScoreWrapper:
             self._sm_count,
             query_columns,
         )
+        if self._block_layout != _DEFAULT_BLOCK_LAYOUT or self._sm_scale is not None:
+            # Score-only options extend, and never change, the TopK compile key.
+            compile_key += (*self._block_layout, self._sm_scale)
         if compile_key not in _COMPILE_CACHE:
             kernel = DecodeIndexerGemmSm100(
                 num_index_heads=self._num_index_heads,
                 sm_count=self._sm_count,
                 query_columns=query_columns,
                 input_dtype=q_cute.element_type,
+                pooling_factor=self._pooling_factor,
+                pages_per_block=self._pages_per_block,
+                blocks_per_tile=self._blocks_per_tile,
+                include_partial_block=self._include_partial_block,
+                sm_scale=self._sm_scale,
             )
             fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
             started_at = time.time()
@@ -368,9 +413,11 @@ class _BatchDecodeProxyScoreWrapper:
         if (
             k_cache.ndim != 3
             or k_cache.shape[0] <= 0
-            or k_cache.shape[1:] != (_PAGE_SIZE, _HEAD_DIM)
+            or k_cache.shape[1:] != (self._entries_per_page, _HEAD_DIM)
         ):
-            raise ValueError("k_cache must have shape [physical_pages, 128, 128]")
+            raise ValueError(
+                f"k_cache must have shape [physical_pages, {self._entries_per_page}, 128]"
+            )
         if k_cache.device != self._device:
             raise ValueError("k_cache must be on the planned metadata device")
 
@@ -398,10 +445,14 @@ class _BatchDecodeProxyScoreWrapper:
                 self._batch_size * self._query_length,
                 self._max_pages,
             ):
-                raise ValueError("out must have shape [H, batch * Q, max_pages]")
+                raise ValueError(
+                    f"out must have shape [H, batch * Q, {self._max_pages}]"
+                )
             if out.device != self._device:
                 raise ValueError("out must be on the planned metadata device")
 
+        if self._initialize_output:
+            out.fill_(-torch.inf)
         compiled, cute_tensors = self._compile_and_bind(q, k_cache, out)
         with _stream_context():
             compiled(*cute_tensors)
