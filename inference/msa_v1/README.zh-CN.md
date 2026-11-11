@@ -26,6 +26,7 @@ MSA v1 提供 paged sparse attention 和 indexer 的 decode/prefill 接口。所
 - BF16 paged prefill attention 支持 contiguous 和 SGLang-style strided K/V view。
 - BF16 paged prefill indexer 支持 1/2/4 个本地 index head，输出为
   `[num_index_heads, total_q, 16]`。
+- BF16 prefill `BatchPrefillBlockScoreWrapper` 基于 pooled key 返回 FP32 block 分数，不执行 TopK。
 - Q8KV4 与 Q8KV8 decode attention 在 B200/SM100、B300/SM103 上支持 GQA=8/16，
   按实际 `Hq/Hkv` dispatch，输出 BF16；query length 由公开接口指定。
   Q8KV4 使用原生 CUTLASS C++，并保留 CUDA 13.5 或更新版本上的 SM107 GQA=16 支持。

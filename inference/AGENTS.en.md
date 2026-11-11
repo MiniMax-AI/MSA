@@ -178,6 +178,9 @@ the public proxy-score plus forced-tail TopK path and accepts preallocated
 output for graph capture. Proxy scores are a private intermediate: they may be
 profiled separately for MBU/MFU diagnosis but are not a public performance
 metric.
+Exception: `inference.msa_v1.indexer.prefill.bf16.interface.BatchPrefillBlockScoreWrapper` is the
+one public score-only entry, for pooled K cache callers that select blocks themselves; its README
+defines the contract, and existing TopK paths are unchanged.
 
 The public packages are `inference.msa_v1.indexer.decode.bf16`, `q8kv4`, and `q8kv8`.
 The keyword-only `plan()` argument `num_index_heads=1` accepts H=1/2/4.

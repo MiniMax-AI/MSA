@@ -25,13 +25,16 @@ def make_real_prefill_inputs(
     *,
     num_index_heads: int,
     device: torch.device,
+    page_size: int = PAGE_SIZE,
+    rows_per_page: int = PAGE_SIZE,
 ) -> RealPrefillInputs:
     generator = torch.Generator(device=device).manual_seed(case.seed)
     page_table, physical_pages = make_disjoint_page_table(
         case.final_kv_lens,
-        max_cols=case.max_cols,
+        max_cols=(case.max_final_kv + page_size - 1) // page_size,
         generator=generator,
         device=device,
+        page_size=page_size,
     )
     q = (
         torch.randn(
@@ -43,7 +46,7 @@ def make_real_prefill_inputs(
     ).to(torch.bfloat16)
     k_cache = (
         torch.randn(
-            (physical_pages, 1, PAGE_SIZE, HEAD_DIM),
+            (physical_pages, 1, rows_per_page, HEAD_DIM),
             generator=generator,
             device=device,
         )

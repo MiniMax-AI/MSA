@@ -34,6 +34,24 @@ assert indices.shape == (2, 5, 16)
 `plan()` 接收 varlen 与 page-table metadata，`run()` 接收当前层的 BF16 Q 和 paged BF16
 K cache。调用方可以向 `run()` 传入预分配输出。
 
+### 池化 Key 的 Block 分数
+
+`BatchPrefillBlockScoreWrapper` 只返回分数，不执行 TopK，也不强制加入 local block。
+每个存储 key 表示 `pooling_factor`（1、2 或 4）个原始 token，因此每个 128-token
+分数 block 存储 `128 // pooling_factor` 个 key。
+
+```python
+from inference.msa_v1.indexer.prefill.bf16.interface import BatchPrefillBlockScoreWrapper
+
+scorer = BatchPrefillBlockScoreWrapper()
+scorer.plan(
+    cu_seqlens_q, cu_seqlens_k, page_table,
+    total_q=total_q, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+    num_index_heads=2, pooling_factor=4,
+)
+scores = scorer.run(q, pooled_k_cache, out=score_output)
+```
+
 ## 数据契约
 
 每个请求的总 KV 长度最多为 2,097,152 tokens（16384 页，每页 128 tokens），
@@ -69,6 +87,26 @@ local_page = query_position // 128
 历史页评分为 FP32 Q/K 点积在该页 token 上的最大值乘以 `1/sqrt(128)`；
 TopK 使用 16-bit 量化近似排序，分数接近时不保证与精确 FP32 排序相同。
 
+### 池化 Key 的 Block 分数
+
+Q 仍为 BF16 `[total_q,H,128]`。K 为 BF16 `[physical_pages,1,page_size // pooling_factor,128]`；
+默认 `page_size=128` 时每个物理 page 对应一个分数 block。`page_size=64` 时，每个逻辑
+128-token 分数 block 使用两个 page-table 项；pooling factor 为 4 时，每个 64-token
+物理 page 存储 16 个 key。
+带 padding 和非连续外层 stride 的 cache 遵循上文相同的布局约束。
+
+两组累积长度都以原始 token 为单位。请求 b 的 query i 的原始位置为
+`p = kv_length[b] - query_length[b] + i`。只有 `(j+1) * pooling_factor <= p+1`
+时，存储 key j 才可见；未完成的 group 不贡献分数。输出为未缩放 FP32
+`[H,total_q,ceil(max_seqlen_k/128)]`，包括当前 block 中已可见的 key。
+没有可见完整 key 的 block、未来 block 和 padding query 行均为 `-inf`。
+缩放、舍入、选择和不完整 group 策略由调用方负责。既有 indexer wrapper 的行为保持不变。
+
+每个请求的 page table 容量必须覆盖 `ceil(max_seqlen_k/page_size)` 个物理 page。
+长度必须非负、单调、从零开始，最终 Q offset 不超过计划的 total Q 容量，且
+`kv_length >= query_length`。有效 page-table 项必须指向已初始化的 cache page。
+这些设备值约束由调用方负责；`run()` 不做 device-to-host 校验或同步。
+
 ## 运行约束
 
 - 仅支持 SM100/SM103 和 paged K cache。
@@ -78,11 +116,22 @@ TopK 使用 16-bit 量化近似排序，分数接近时不保证与精确 FP32 �
 - Q/K、metadata、workspace 和输出必须位于同一 CUDA device，并满足接口校验的 shape、
   stride 和 alignment。
 
-Wrapper 独占可写 workspace 和默认输出；默认输出会被后续 `run()` 覆盖。并发 stream
+TopK wrapper 独占可写 workspace 和默认输出；默认输出会被后续 `run()` 覆盖。并发 stream
 使用独立 wrapper，并用 event 保证 metadata 更新先于消费。保持 metadata 地址、shape、
 总 Q 和容量不变时，长度原地更新后在 capture 外调用 `replan()`；page mapping 原地更新
 须在消费前完成。地址、shape、head 数或容量变化时重新 `plan()` 并重新 capture。
 Graph 使用期间保持 wrapper、输入和输出存活。
+
+### 池化 Key 的 Block 分数
+
+在 capture 外调用 `plan()`，并在 capture 前预热 `run()`。地址、shape、head 数和容量不变时，
+长度和 page mapping 可以原地更新；每次调用和 Graph replay 都重建 metadata 并覆盖全部输出。
+并发执行使用独立 wrapper，并通过 stream/event 排序 metadata 更新。
+首次不传 `out` 的调用才分配 wrapper 持有的默认输出。
+仅使用显式 `out` 时不分配默认分数 tensor；已分配的默认输出仍由 wrapper 持有，
+并由后续不传 `out` 的调用覆盖。显式 `out` 必须为同设备、连续、16 字节对齐的
+FP32，shape 与计划输出一致。KV 长度上限为 2,097,152 个原始 token；输出容量必须少于
+2^31 个元素。
 
 ## 验证命令
 
@@ -93,6 +142,12 @@ python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark --suite ful
 
 Benchmark 测量 CUDA Graph 中公开 `run()` 路径的耗时。`--verify` 在计时之外使用独立
 reference，全量检查有效历史 scores 和 TopK 输出。
+
+### 池化 Key 的 Block 分数
+
+```bash
+python -m pytest tests/inference/msa_v1/indexer/prefill/bf16/test_pooled_block_scores.py --msa-inference-suite=full
+```
 
 ## Cache 布局
 
