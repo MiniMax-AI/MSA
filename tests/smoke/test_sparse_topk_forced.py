@@ -175,6 +175,44 @@ def test_forced_large_k(
     print(f"  [PASS] large K={max_k_tiles}: force_begin={force_begin}, force_end={force_end}")
 
 
+def test_forced_clustered_scores_no_duplicates(
+    num_qo_heads=2, max_k_tiles=8192, total_qo_len=32,
+    topk=16, num_valid_pages=8192,
+    force_begin=1, force_end=2, seed=5,
+):
+    """More than 2048 tiles in the fp16 threshold bin sends the row to the
+    fp32 refinement steps; the forced blocks must still appear exactly once
+    and the rest must be the true top-k."""
+    torch.manual_seed(seed)
+    dev = torch.device("cuda")
+    max_score = 4.125 + 0.02 * torch.randn(num_qo_heads, max_k_tiles, total_qo_len,
+                                           device=dev, dtype=torch.float32)
+    max_score[:, num_valid_pages:, :] = float('-inf')
+
+    result = sparse_topk_select(
+        max_score, topk, num_valid_pages=num_valid_pages,
+        force_begin_blocks=force_begin, force_end_blocks=force_end,
+    )
+    forced_score = max_score[:, :num_valid_pages, :].clone()
+    forced_score[:, :force_begin, :] = float('inf')
+    forced_score[:, num_valid_pages - force_end:, :] = float('inf')
+    expected = forced_score.topk(topk, dim=1).indices.sort(dim=1).values
+    expected = expected.permute(2, 0, 1).to(torch.int32)
+    assert torch.equal(result, expected), (
+        f"[FAIL] clustered scores: got {result[0, 0].tolist()}, "
+        f"expected {expected[0, 0].tolist()}"
+    )
+    print(f"  [PASS] clustered scores: K={max_k_tiles}, "
+          f"force_begin={force_begin}, force_end={force_end}")
+
+
+def test_forced_clustered_scores_scalar_transpose():
+    """Same as above on the padded-tile transpose path (qo, K not multiples of 32)."""
+    test_forced_clustered_scores_no_duplicates(
+        max_k_tiles=3000, total_qo_len=7, num_valid_pages=2900, seed=6,
+    )
+
+
 if __name__ == "__main__":
     dev = torch.device("cuda")
     p = torch.cuda.get_device_properties(dev)
@@ -191,4 +229,6 @@ if __name__ == "__main__":
     test_forced_ascending_order()
     test_forced_with_xor_fast_path()
     test_forced_large_k()
+    test_forced_clustered_scores_no_duplicates()
+    test_forced_clustered_scores_scalar_transpose()
     print("\nAll forced-block tests PASSED!")

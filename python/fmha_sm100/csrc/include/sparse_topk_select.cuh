@@ -191,6 +191,16 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
                                      int* smemThresholdBinIdx, int* smemFinalDstIdx,
                                      int* smemFinalBinSize, int* smemFoundTopKValues,
                                      SmemFinalType& smemFinal, int rowStart, int topK) {
+  // Step 0 is the fp16 fast path. When its threshold bin overflows
+  // kNumFinalItems, step 1 restarts the fp32 radix over the whole row
+  // (patternShift == 0), so drop what step 0 already wrote to smemOutput.
+  // Otherwise every element above the step-0 threshold bin is emitted twice.
+  if constexpr (step == 1) {
+    if (threadIdx.x == 0) {
+      smemFoundTopKValues[0] = 0;
+      smemFinalDstIdx[0] = 0;
+    }
+  }
   // Clear the histogram.
 #pragma unroll
   for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock) {
