@@ -301,6 +301,8 @@ local_block = query_position // 128
 - 代理分数仅是内部中间量；性能分析可以单独计量私有 proxy-score stage，并按实际瓶颈评估
   MBU 或 MFU，但它只用于诊断 kernel 上限，不能替代公开 `run()` 的 CUDA Graph E2E
   latency。Production 调用方只接收最终 TopK indices。
+- 例外：`inference.msa_v1.indexer.prefill.bf16.interface.BatchPrefillBlockScoreWrapper` 是唯一的公开
+  score-only 入口，供池化 K cache 调用方自行选择 block；契约见其 README，既有 TopK 路径不变。
 
 ## 内部 Indexer TopK Select 契约
 

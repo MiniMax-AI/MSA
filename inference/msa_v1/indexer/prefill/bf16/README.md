@@ -34,6 +34,24 @@ assert indices.shape == (2, 5, 16)
 accepts varlen and page-table metadata, and `run()` accepts BF16 Q and paged BF16 K tensors for
 the current layer. Callers may pass a preallocated output to `run()`.
 
+### Pooled-key block scores
+
+`BatchPrefillBlockScoreWrapper` returns scores without TopK selection or a forced local
+block. One stored key represents `pooling_factor` (1, 2, or 4) original tokens, so each
+128-token score block stores `128 // pooling_factor` keys.
+
+```python
+from inference.msa_v1.indexer.prefill.bf16.interface import BatchPrefillBlockScoreWrapper
+
+scorer = BatchPrefillBlockScoreWrapper()
+scorer.plan(
+    cu_seqlens_q, cu_seqlens_k, page_table,
+    total_q=total_q, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+    num_index_heads=2, pooling_factor=4,
+)
+scores = scorer.run(q, pooled_k_cache, out=score_output)
+```
+
 ## Data contract
 
 The maximum total KV length per request is 2,097,152 tokens (16384 pages of 128 tokens),
@@ -71,6 +89,29 @@ A historical page's score is the maximum FP32 Q/K dot product across its tokens,
 `1/sqrt(128)`. TopK uses approximate 16-bit quantized ordering; near-tied scores need not match
 exact FP32 sorting.
 
+### Pooled-key block scores
+
+Q has the same BF16 `[total_q,H,128]` layout. K is BF16
+`[physical_pages,1,page_size // pooling_factor,128]`; the default `page_size=128` stores
+one score block per physical page. `page_size=64` uses two page-table entries per logical
+128-token score block; with pooling factor 4, each 64-token physical page stores 16 keys.
+Padded and non-contiguous outer cache strides follow the same cache-layout requirements
+above.
+
+Both cumulative length arrays count original tokens. Query i of request b has original
+position `p = kv_length[b] - query_length[b] + i`. Stored key j becomes visible only when
+`(j+1) * pooling_factor <= p+1`; an unfinished group contributes no score. The output is
+unscaled FP32 `[H,total_q,ceil(max_seqlen_k/128)]`, including visible keys in the current
+block. Blocks with no visible complete keys, future blocks, and padded query rows contain
+`-inf`. Scaling, rounding, selection, and any partial-group policy belong to the caller.
+The existing indexer wrapper retains its original behavior.
+
+The page table must cover `ceil(max_seqlen_k/page_size)` physical pages per request.
+Length metadata must be nonnegative and monotone, start at zero, end at or below the
+planned total Q capacity, and satisfy `kv_length >= query_length`. Valid page-table entries
+must address initialized cache pages. These device-value constraints are the caller's
+responsibility; `run()` performs no device-to-host validation or synchronization.
+
 ## Runtime requirements
 
 - Only SM100/SM103 and paged K caches are supported.
@@ -80,12 +121,26 @@ exact FP32 sorting.
 - Q/K, metadata, workspace, and output must reside on the same CUDA device and satisfy the
   validated shape, stride, and alignment requirements.
 
-Each wrapper owns its writable workspace and default output; later `run()` calls overwrite
+The TopK wrapper owns its writable workspace and default output; later `run()` calls overwrite
 the default output. Use separate wrappers for concurrent streams and events to order metadata
 updates before consumers. With metadata addresses, shapes, total Q, and capacities unchanged,
 call `replan()` outside capture after in-place length updates; finish in-place page mapping
 updates before consumers run. Changes to addresses, shapes, head counts, or capacities require
 `plan()` and a new capture. Keep the wrapper, inputs, and outputs alive while using its Graph.
+
+### Pooled-key block scores
+
+Call `plan()` outside capture and warm up `run()` before capture. With addresses, shapes,
+head count, and capacities unchanged, lengths and page mappings may change in place;
+`run()` rebuilds its metadata and overwrites the complete output on every call and Graph
+replay. Use separate wrappers for concurrent execution and order updates with stream
+or event dependencies. The wrapper allocates its default output lazily on the first call
+without `out`.
+Using only explicit `out` avoids a default score tensor; an existing default output
+remains owned by the wrapper and is overwritten by later calls without `out`.
+An explicit `out` must be contiguous, 16-byte aligned FP32 on the same device and have the
+planned output shape. The maximum KV length is 2,097,152 original tokens; output capacity
+must contain fewer than 2^31 elements.
 
 ## Validation commands
 
@@ -96,6 +151,12 @@ python -m benchmarks.inference.msa_v1.indexer.prefill.bf16.benchmark --suite ful
 
 The benchmark measures the public `run()` path inside CUDA Graphs. `--verify` checks all
 valid historical scores and TopK outputs against an independent reference outside timing.
+
+### Pooled-key block scores
+
+```bash
+python -m pytest tests/inference/msa_v1/indexer/prefill/bf16/test_pooled_block_scores.py --msa-inference-suite=full
+```
 
 ## Cache layout
 

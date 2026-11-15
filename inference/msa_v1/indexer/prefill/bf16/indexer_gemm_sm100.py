@@ -20,8 +20,18 @@ from inference.msa_v1.attention.prefill._common.dsl.utils import fmax_reduce
 _HEAD_DIM = 128
 _PHYSICAL_M_TILE = 256
 _K_TILE = 128
+_K_SLAB = _HEAD_DIM // 2
+_CTA_N_TILE = _K_TILE // 2
+_LOGICAL_BLOCKS_PER_SPLIT = 512
 _SM_SCALE = 1.0 / math.sqrt(_HEAD_DIM)
 M3_PAGED_DIRECT_SCORE_NUM_HEADS = (1, 2, 4)
+
+
+def _check_pooled_geometry(pooling_factor: int, page_size: int) -> None:
+    if type(pooling_factor) is not int or pooling_factor not in (1, 2, 4):
+        raise ValueError("pooling_factor must be 1, 2, or 4")
+    if type(page_size) is not int or page_size not in (64, 128):
+        raise ValueError("page_size must be 64 or 128 original tokens")
 
 
 @dsl_user_op
@@ -61,16 +71,31 @@ class M3IndexerGemmSm100:
         q_stages: int = 1,
         k_stages: int = 4,
         acc_stages: int = 4,
+        pooling_factor: int = 1,
+        page_size: int = 128,
+        score_only: bool = False,
     ) -> None:
         if (q_stages, k_stages, acc_stages) != (1, 4, 4):
             raise ValueError("M3 K1 requires q/k/acc stages = 1/4/4")
         if num_index_heads not in M3_PAGED_DIRECT_SCORE_NUM_HEADS:
             raise ValueError("M3 indexer requires 1, 2, or 4 local index heads")
 
+        _check_pooled_geometry(pooling_factor, page_size)
+        if not score_only and (pooling_factor, page_size) != (1, 128):
+            raise ValueError("pooled keys require the score-only interface")
+        self.score_only = score_only
+        self.pooling_factor = pooling_factor
+        self.entries_per_block = _K_TILE // pooling_factor
+        self.entries_per_page = page_size // pooling_factor
+        self.blocks_per_tile = _K_TILE // self.entries_per_block
+        self.compact_load = self.entries_per_page < _K_TILE
+        self.load_rows = min(self.entries_per_page, _CTA_N_TILE)
+        self.logical_blocks_per_split = _LOGICAL_BLOCKS_PER_SPLIT
+        self.mma_tiles_per_split = self.logical_blocks_per_split // self.blocks_per_tile
         self.num_index_heads = num_index_heads
         if compute_capability not in {(10, 0), (10, 3)}:
             raise ValueError("compute_capability must be SM100 or SM103")
-        self.use_tmem_load_reduce = compute_capability == (10, 3)
+        self.use_tmem_load_reduce = compute_capability == (10, 3) and not score_only
         self.head_dim = _HEAD_DIM
         self.physical_m_tile = _PHYSICAL_M_TILE
         self.logical_q_tile = _PHYSICAL_M_TILE // num_index_heads
@@ -95,11 +120,12 @@ class M3IndexerGemmSm100:
             16,
         )
 
-        self.score_warp_ids = tuple(range(12))
-        self.q_load_warp_id = 12
-        self.k_load_warp_id = 13
-        self.mma_warp_id = 14
-        self.empty_warp_ids = (15,)
+        score_warps = 8 if score_only else 12
+        self.score_warp_ids = tuple(range(score_warps))
+        self.q_load_warp_id = score_warps
+        self.k_load_warp_id = score_warps + 1
+        self.mma_warp_id = score_warps + 2
+        self.empty_warp_ids = (score_warps + 3,)
         self.score_threads = cute.arch.WARP_SIZE * len(self.score_warp_ids)
         self.score_consumer_warps = 4
         self.score_worker_groups = len(self.score_warp_ids) // self.score_consumer_warps
@@ -115,7 +141,7 @@ class M3IndexerGemmSm100:
         self.num_regs_score = 152
         self.num_regs_other = 32
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
-        self.neg_inf = -1.0e30
+        self.neg_inf = float("-inf") if score_only else -1.0e30
 
     @cute.jit
     def __call__(
@@ -168,14 +194,36 @@ class M3IndexerGemmSm100:
             tiled_mma,
             cta_layout_vmnk.shape,
         )
-        k_tma_atom, k_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            mK,
-            cute.select(k_smem_layout, mode=[0, 1, 2]),
-            self.mma_tiler_mnk,
-            tiled_mma,
-            cta_layout_vmnk.shape,
-        )
+        k_load_layout = k_smem_layout
+        if cutlass.const_expr(self.compact_load):
+            # A CTA owns N64. Fill it from independently paged K64 slabs.
+            k_load_layout = sm100_utils.make_smem_layout(
+                OperandMajorMode.K,
+                (_CTA_N_TILE, _HEAD_DIM),
+                self.io_dtype,
+                self.k_stages,
+            )
+            k_slab_layout = cute.make_composed_layout(
+                k_load_layout.inner,
+                0,
+                cute.make_layout((self.load_rows, _K_SLAB), stride=(_K_SLAB, 1)),
+            )
+            k_tma_atom, k_tma_tensor = cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mK,
+                k_slab_layout,
+                (self.load_rows, _K_SLAB),
+                num_multicast=1,
+            )
+        else:
+            k_tma_atom, k_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mK,
+                cute.select(k_smem_layout, mode=[0, 1, 2]),
+                self.mma_tiler_mnk,
+                tiled_mma,
+                cta_layout_vmnk.shape,
+            )
 
         @cute.struct
         class SharedStorage:
@@ -196,6 +244,7 @@ class M3IndexerGemmSm100:
             cta_layout_vmnk,
             q_smem_layout,
             k_smem_layout,
+            k_load_layout,
             mScore,
             mCuSeqlensQ,
             mCuSeqlensK,
@@ -205,7 +254,15 @@ class M3IndexerGemmSm100:
             mFragmentIndices,
             inv_lse_temperature,
         ).launch(
-            grid=(num_task_slots * self.cta_group_size, 1, 1),
+            grid=(
+                num_task_slots * self.cta_group_size,
+                (
+                    cute.ceil_div(mScore.shape[2], self.logical_blocks_per_split)
+                    if cutlass.const_expr(self.score_only)
+                    else 1
+                ),
+                1,
+            ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape_mnk,
             stream=stream,
@@ -248,20 +305,57 @@ class M3IndexerGemmSm100:
         batch_idx: cutlass.Int32,
         k_mcast_mask: cutlass.Int16,
         num_tiles: cutlass.Int32,
+        num_valid_logical_pages: cutlass.Int32,
     ):
         state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.k_stages
         )
         for tile_idx in cutlass.range(num_tiles, unroll=1):
             k_pipe.producer_acquire(state)
-            physical_page = mPageTable[batch_idx, tile_idx]
-            cute.copy(
-                k_tma_atom,
-                tKgK[(None, 0, physical_page)],
-                tKsK[(None, state.index)],
-                tma_bar_ptr=k_pipe.producer_get_barrier(state),
-                mcast_mask=k_mcast_mask,
-            )
+            if cutlass.const_expr(self.compact_load):
+                page_begin = cute.arch.block_idx()[1] * cutlass.Int32(
+                    self.logical_blocks_per_split
+                    * self.entries_per_block
+                    // self.entries_per_page
+                )
+                cta_rank = cute.arch.block_idx()[0] % cutlass.Int32(2)
+                first_page = page_begin + tile_idx * cutlass.Int32(
+                    _K_TILE // self.entries_per_page
+                )
+                pages_per_cta = _CTA_N_TILE // self.entries_per_page
+                for page_in_cta in cutlass.range_constexpr(pages_per_cta):
+                    logical_page = (
+                        first_page
+                        + cta_rank * cutlass.Int32(pages_per_cta)
+                        + cutlass.Int32(page_in_cta)
+                    )
+                    # Complete the fixed TMA byte count on a tail tile. The
+                    # completed-group mask excludes these duplicated rows.
+                    if logical_page >= num_valid_logical_pages:
+                        logical_page = first_page
+                    physical_page = mPageTable[batch_idx, logical_page]
+                    for k_half in cutlass.range_constexpr(_HEAD_DIM // _K_SLAB):
+                        cute.copy(
+                            k_tma_atom,
+                            tKgK[(None, 0, k_half, physical_page)],
+                            tKsK[(None, page_in_cta, k_half, state.index)],
+                            tma_bar_ptr=k_pipe.producer_get_barrier(state),
+                            mcast_mask=k_mcast_mask,
+                        )
+            else:
+                logical_page = tile_idx
+                if cutlass.const_expr(self.score_only):
+                    logical_page += cute.arch.block_idx()[1] * cutlass.Int32(
+                        self.logical_blocks_per_split
+                    )
+                physical_page = mPageTable[batch_idx, logical_page]
+                cute.copy(
+                    k_tma_atom,
+                    tKgK[(None, 0, physical_page)],
+                    tKsK[(None, state.index)],
+                    tma_bar_ptr=k_pipe.producer_get_barrier(state),
+                    mcast_mask=k_mcast_mask,
+                )
             state.advance()
         if num_tiles > cutlass.Int32(0):
             k_pipe.producer_tail(state)
@@ -517,6 +611,112 @@ class M3IndexerGemmSm100:
                         score = block_max * sm_scale_temperature
                     mScore[q_head, q_global, tile_idx] = score
 
+    @cute.jit
+    def _pooled_block_max(
+        self,
+        tTR_rAcc: cute.Tensor,
+        block_in_tile: cutlass.Constexpr[int],
+        entry_begin: cutlass.Int32,
+        completed_end: cutlass.Int32,
+        masked: cutlass.Constexpr[bool],
+    ):
+        max_0 = cutlass.Float32(self.neg_inf)
+        max_1 = cutlass.Float32(self.neg_inf)
+        max_2 = cutlass.Float32(self.neg_inf)
+        max_3 = cutlass.Float32(self.neg_inf)
+        for col in cutlass.range_constexpr(self.entries_per_block):
+            valid = True
+            if cutlass.const_expr(masked):
+                valid = entry_begin + cutlass.Int32(col) < completed_end
+            if valid:
+                value = tTR_rAcc[block_in_tile * self.entries_per_block + col]
+                if cutlass.const_expr(col % 4 == 0):
+                    max_0 = cute.arch.fmax(max_0, value)
+                elif cutlass.const_expr(col % 4 == 1):
+                    max_1 = cute.arch.fmax(max_1, value)
+                elif cutlass.const_expr(col % 4 == 2):
+                    max_2 = cute.arch.fmax(max_2, value)
+                else:
+                    max_3 = cute.arch.fmax(max_3, value)
+        return cute.arch.fmax(
+            cute.arch.fmax(max_0, max_1), cute.arch.fmax(max_2, max_3)
+        )
+
+    @cute.jit
+    def _pooled_score_consumer(
+        self,
+        tile_worker_idx: cutlass.Int32,
+        row_m: cutlass.Int32,
+        q_global_begin: cutlass.Int32,
+        q_local_begin: cutlass.Int32,
+        seq_q: cutlass.Int32,
+        seq_k: cutlass.Int32,
+        num_full_tiles: cutlass.Int32,
+        num_tiles: cutlass.Int32,
+        acc_pipe,
+        tmem_tiled_copy: cute.TiledCopy,
+        tTR_tAcc_staged: cute.Tensor,
+        tTR_rAcc: cute.Tensor,
+        mScore: cute.Tensor,
+    ):
+        """Write unscaled maxima over complete groups in original-token coordinates."""
+        block_begin = cute.arch.block_idx()[1] * cutlass.Int32(
+            self.logical_blocks_per_split
+        )
+        q_in_tile = row_m // cutlass.Int32(self.num_index_heads)
+        q_head = row_m - q_in_tile * cutlass.Int32(self.num_index_heads)
+        q_local = q_local_begin + q_in_tile
+        q_global = q_global_begin + q_in_tile
+        q_valid = q_local < seq_q
+        visible_end = seq_k - seq_q + q_local + cutlass.Int32(1)
+        if visible_end > seq_k:
+            visible_end = seq_k
+        if visible_end < cutlass.Int32(0):
+            visible_end = cutlass.Int32(0)
+        completed_end = visible_end // cutlass.Int32(self.pooling_factor)
+        worker_tiles = (
+            num_tiles + cutlass.Int32(self.score_worker_groups - 1) - tile_worker_idx
+        ) // cutlass.Int32(self.score_worker_groups)
+        for worker_tile_idx in cutlass.range(worker_tiles, unroll=1):
+            tile_idx = tile_worker_idx + worker_tile_idx * cutlass.Int32(
+                self.score_worker_groups
+            )
+            state = pipeline.PipelineState(
+                self.acc_stages,
+                tile_idx,
+                tile_idx % cutlass.Int32(self.acc_stages),
+                (tile_idx // cutlass.Int32(self.acc_stages)) & cutlass.Int32(1),
+            )
+            acc_pipe.consumer_wait(state)
+            tTR_tAcc = tTR_tAcc_staged[(None, None, None, None, state.index)]
+            cute.copy(tmem_tiled_copy, tTR_tAcc, tTR_rAcc)
+            cute.arch.fence_view_async_tmem_load()
+            with cute.arch.elect_one():
+                acc_pipe.consumer_release(state)
+            if q_valid:
+                for block_in_tile in cutlass.range_constexpr(self.blocks_per_tile):
+                    entry_begin = (
+                        block_begin * cutlass.Int32(self.entries_per_block)
+                        + tile_idx * cutlass.Int32(self.k_tile)
+                        + cutlass.Int32(block_in_tile * self.entries_per_block)
+                    )
+                    block_max = cutlass.Float32(self.neg_inf)
+                    if tile_idx < num_full_tiles:
+                        block_max = self._pooled_block_max(
+                            tTR_rAcc, block_in_tile, entry_begin, completed_end, False
+                        )
+                    else:
+                        block_max = self._pooled_block_max(
+                            tTR_rAcc, block_in_tile, entry_begin, completed_end, True
+                        )
+                    logical_block = (
+                        block_begin
+                        + tile_idx * cutlass.Int32(self.blocks_per_tile)
+                        + cutlass.Int32(block_in_tile)
+                    )
+                    if logical_block < mScore.shape[2]:
+                        mScore[q_head, q_global, logical_block] = block_max
+
     @cute.kernel
     def kernel(
         self,
@@ -528,6 +728,7 @@ class M3IndexerGemmSm100:
         cta_layout_vmnk: cute.Layout,
         q_smem_layout: cute.ComposedLayout,
         k_smem_layout: cute.ComposedLayout,
+        k_load_layout: cute.ComposedLayout,
         mScore: cute.Tensor,
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
@@ -539,7 +740,7 @@ class M3IndexerGemmSm100:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        bidx, _, _ = cute.arch.block_idx()
+        bidx, split_idx, _ = cute.arch.block_idx()
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cta_coord_vmnk = cta_layout_vmnk.get_flat_coord(cta_rank)
         mma_tile_coord_v = bidx % cute.size(cta_layout_vmnk, mode=[0])
@@ -560,6 +761,7 @@ class M3IndexerGemmSm100:
         seq_k = cutlass.Int32(0)
         num_full_tiles = cutlass.Int32(0)
         num_tiles = cutlass.Int32(0)
+        num_valid_logical_pages = cutlass.Int32(0)
         if cute.arch.lane_idx() == cutlass.Int32(0) and batch_idx >= cutlass.Int32(0):
             q_start = mCuSeqlensQ[batch_idx]
             q_end = mCuSeqlensQ[batch_idx + cutlass.Int32(1)]
@@ -585,8 +787,29 @@ class M3IndexerGemmSm100:
                 first_visible = seq_k
             if last_visible > seq_k:
                 last_visible = seq_k
-            num_full_tiles = first_visible // cutlass.Int32(self.k_tile)
-            num_tiles = cute.ceil_div(last_visible, self.k_tile)
+            if cutlass.const_expr(self.score_only):
+                first_complete = first_visible // cutlass.Int32(self.pooling_factor)
+                last_complete = last_visible // cutlass.Int32(self.pooling_factor)
+                num_full_tiles = first_complete // cutlass.Int32(self.k_tile)
+                num_tiles = cute.ceil_div(last_complete, self.k_tile)
+                if cutlass.const_expr(self.compact_load):
+                    num_valid_logical_pages = cute.ceil_div(
+                        last_complete, self.entries_per_page
+                    )
+                tile_begin = split_idx * cutlass.Int32(self.mma_tiles_per_split)
+                num_full_tiles -= tile_begin
+                num_tiles -= tile_begin
+                if num_full_tiles < cutlass.Int32(0):
+                    num_full_tiles = cutlass.Int32(0)
+                if num_full_tiles > cutlass.Int32(self.mma_tiles_per_split):
+                    num_full_tiles = cutlass.Int32(self.mma_tiles_per_split)
+                if num_tiles < cutlass.Int32(0):
+                    num_tiles = cutlass.Int32(0)
+                if num_tiles > cutlass.Int32(self.mma_tiles_per_split):
+                    num_tiles = cutlass.Int32(self.mma_tiles_per_split)
+            else:
+                num_full_tiles = first_visible // cutlass.Int32(self.k_tile)
+                num_tiles = cute.ceil_div(last_visible, self.k_tile)
 
         q_start = cute.arch.shuffle_sync(q_start, 0)
         k_start = cute.arch.shuffle_sync(k_start, 0)
@@ -594,6 +817,8 @@ class M3IndexerGemmSm100:
         seq_k = cute.arch.shuffle_sync(seq_k, 0)
         num_full_tiles = cute.arch.shuffle_sync(num_full_tiles, 0)
         num_tiles = cute.arch.shuffle_sync(num_tiles, 0)
+        if cutlass.const_expr(self.compact_load):
+            num_valid_logical_pages = cute.arch.shuffle_sync(num_valid_logical_pages, 0)
 
         if warp_idx == self.q_load_warp_id:
             cpasync.prefetch_descriptor(q_tma_atom)
@@ -614,6 +839,12 @@ class M3IndexerGemmSm100:
             byte_alignment=128,
             swizzle=k_smem_layout.inner,
         )
+
+        if cutlass.const_expr(self.compact_load):
+            sK_load = cute.make_tensor(sK.iterator, k_load_layout.outer)
+            sK_slabs = cute.local_tile(
+                sK_load, (self.load_rows, _K_SLAB), (None, None, None)
+            )
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierIndexerSm100.TmemPtr),
@@ -681,14 +912,18 @@ class M3IndexerGemmSm100:
             cute.slice_(self.mma_tiler_mnk, (None, 0, None)),
             (None, None),
         )
-        gK = cute.local_tile(
-            k_tma_tensor,
-            cute.slice_(self.mma_tiler_mnk, (0, None, None)),
-            (None, 0, None),
-        )
+        if cutlass.const_expr(self.compact_load):
+            gK = cute.local_tile(
+                k_tma_tensor, (self.load_rows, _K_SLAB), (None, None, None)
+            )
+        else:
+            gK = cute.local_tile(
+                k_tma_tensor,
+                cute.slice_(self.mma_tiler_mnk, (0, None, None)),
+                (None, 0, None),
+            )
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
         tCgQ = thr_mma.partition_A(gQ)
-        tCgK = thr_mma.partition_B(gK)
         tQsQ, tQgQ = cpasync.tma_partition(
             q_tma_atom,
             cta_coord_vmnk[2],
@@ -696,13 +931,23 @@ class M3IndexerGemmSm100:
             cute.group_modes(sQ, 0, 3),
             cute.group_modes(tCgQ, 0, 3),
         )
-        tKsK, tKgK = cpasync.tma_partition(
-            k_tma_atom,
-            cta_coord_vmnk[1],
-            cute.make_layout(cute.size(cta_layout_vmnk, mode=[1])),
-            cute.group_modes(sK, 0, 3),
-            cute.group_modes(tCgK, 0, 3),
-        )
+        if cutlass.const_expr(self.compact_load):
+            tKsK, tKgK = cpasync.tma_partition(
+                k_tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sK_slabs, 0, 2),
+                cute.group_modes(gK, 0, 2),
+            )
+        else:
+            tCgK = thr_mma.partition_B(gK)
+            tKsK, tKgK = cpasync.tma_partition(
+                k_tma_atom,
+                cta_coord_vmnk[1],
+                cute.make_layout(cute.size(cta_layout_vmnk, mode=[1])),
+                cute.group_modes(sK, 0, 3),
+                cute.group_modes(tCgK, 0, 3),
+            )
         q_mcast_mask = cpasync.create_tma_multicast_mask(
             cta_layout_vmnk, cta_coord_vmnk, mcast_mode=2
         )
@@ -754,24 +999,41 @@ class M3IndexerGemmSm100:
         if warp_idx <= self.score_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_score)
             row_m = tTR_cC[0][0]
-            self._score_consumer(
-                tile_worker_idx,
-                row_m,
-                q_start + q_local_begin,
-                q_local_begin,
-                seq_q,
-                seq_k,
-                num_full_tiles,
-                num_tiles,
-                inv_lse_temperature,
-                acc_pipe,
-                tmem_tiled_copy,
-                tmem_load_reduce_atom,
-                tTR_tAcc_staged,
-                tTR_rAcc,
-                tTR_rBlockMax,
-                mScore,
-            )
+            if cutlass.const_expr(self.score_only):
+                self._pooled_score_consumer(
+                    tile_worker_idx,
+                    row_m,
+                    q_start + q_local_begin,
+                    q_local_begin,
+                    seq_q,
+                    seq_k,
+                    num_full_tiles,
+                    num_tiles,
+                    acc_pipe,
+                    tmem_tiled_copy,
+                    tTR_tAcc_staged,
+                    tTR_rAcc,
+                    mScore,
+                )
+            else:
+                self._score_consumer(
+                    tile_worker_idx,
+                    row_m,
+                    q_start + q_local_begin,
+                    q_local_begin,
+                    seq_q,
+                    seq_k,
+                    num_full_tiles,
+                    num_tiles,
+                    inv_lse_temperature,
+                    acc_pipe,
+                    tmem_tiled_copy,
+                    tmem_load_reduce_atom,
+                    tTR_tAcc_staged,
+                    tTR_rAcc,
+                    tTR_rBlockMax,
+                    mScore,
+                )
         elif warp_idx == self.q_load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             self._q_producer(
@@ -793,6 +1055,7 @@ class M3IndexerGemmSm100:
                 batch_idx,
                 k_mcast_mask,
                 num_tiles,
+                num_valid_logical_pages,
             )
         elif warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)

@@ -189,7 +189,16 @@ def test_training_indexer_compiles_for_blackwell(
 
 @pytest.mark.parametrize("capability", ((10, 0), (10, 3)))
 @pytest.mark.parametrize("heads", (1, 2, 4))
-def test_bf16_prefill_indexer_compiles_for_blackwell(capability, heads):
+@pytest.mark.parametrize(
+    "factor,page_size,score_only",
+    (
+        (1, 128, False),
+        *((factor, page, True) for factor in (4, 2, 1) for page in (64, 128)),
+    ),
+)
+def test_bf16_prefill_indexer_compiles_for_blackwell(
+    capability, heads, factor, page_size, score_only
+):
     assert Version(cutlass.__version__) >= Version("4.5.2")
     from inference.msa_v1.indexer.prefill.bf16.indexer_gemm_sm100 import M3IndexerGemmSm100
 
@@ -202,10 +211,16 @@ def test_bf16_prefill_indexer_compiles_for_blackwell(capability, heads):
         )
 
     arch = f"sm_{capability[0]}{capability[1]}a"
-    kernel = M3IndexerGemmSm100(compute_capability=capability, num_index_heads=heads)
+    kernel = M3IndexerGemmSm100(
+        compute_capability=capability,
+        num_index_heads=heads,
+        pooling_factor=factor,
+        page_size=page_size,
+        score_only=score_only,
+    )
     args = (
         tensor(cutlass.BFloat16, (512 * heads, 128)),
-        tensor(cutlass.BFloat16, (128, 128, 64), (1, 0, 2)),
+        tensor(cutlass.BFloat16, (page_size // factor, 128, 64), (1, 0, 2)),
         tensor(cutlass.Int32, (2, 32), alignment=4),
         tensor(cutlass.Float32, (heads, 512, 32)),
         tensor(cutlass.Int32, (3,), alignment=4),
@@ -220,9 +235,12 @@ def test_bf16_prefill_indexer_compiles_for_blackwell(capability, heads):
     started_at = time.perf_counter()
     result = cute.compile(kernel, *args, options=f"--enable-tvm-ffi --gpu-arch={arch}")
     logger.info(
-        "%s BF16 indexer heads=%d compiled in %.3fs",
+        "%s BF16 indexer heads=%d factor=%d page=%d score_only=%s compiled in %.3fs",
         arch,
         heads,
+        factor,
+        page_size,
+        score_only,
         time.perf_counter() - started_at,
     )
     assert result is not None

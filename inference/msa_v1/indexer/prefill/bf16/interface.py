@@ -24,6 +24,7 @@ from inference.msa_v1.indexer._common.topk_select.interface import (
 from inference.msa_v1.indexer.prefill.bf16.indexer_gemm_sm100 import (
     M3_PAGED_DIRECT_SCORE_NUM_HEADS,
     M3IndexerGemmSm100,
+    _check_pooled_geometry,
 )
 from inference.msa_v1.indexer.prefill.bf16.schedule import M3IndexerScheduleSm100
 
@@ -191,7 +192,23 @@ class _PlanState:
     num_index_heads: int
 
 
-def _compile_schedule(state: _PlanState) -> object:
+@dataclass(slots=True)
+class _BlockScorePlanState:
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    page_table: torch.Tensor
+    task_batch_idx: torch.Tensor
+    task_q_local_begin: torch.Tensor
+    default_out: torch.Tensor | None
+    num_task_slots: int
+    total_q: int
+    max_cols: int
+    num_index_heads: int
+    pooling_factor: int
+    page_size: int
+
+
+def _compile_schedule(state: _PlanState | _BlockScorePlanState) -> object:
     capability = _check_runtime(state.page_table.device)
     key = (
         "msa_v1_indexer_prefill_bf16_schedule_sm100",
@@ -227,7 +244,7 @@ def _compile_schedule(state: _PlanState) -> object:
     return compiled
 
 
-def _run_schedule(state: _PlanState) -> None:
+def _run_schedule(state: _PlanState | _BlockScorePlanState) -> None:
     compiled = _compile_schedule(state)
     with torch.cuda.nvtx.range("PrefillIndexerBF16Schedule"):
         compiled(
@@ -244,7 +261,9 @@ def _run_schedule(state: _PlanState) -> None:
 def _compile_gemm(
     q_flat: torch.Tensor,
     k_tma_view: torch.Tensor,
-    state: _PlanState,
+    state: _PlanState | _BlockScorePlanState,
+    *,
+    output: torch.Tensor | None = None,
 ) -> object:
     capability = _check_runtime(q_flat.device)
     key = (
@@ -254,13 +273,25 @@ def _compile_gemm(
         torch.bfloat16,
         torch.float32,
     )
+    geometry = {}
+    if isinstance(state, _BlockScorePlanState):
+        geometry = {
+            "pooling_factor": state.pooling_factor,
+            "page_size": state.page_size,
+            "score_only": True,
+        }
+        key += ("block_scores", state.pooling_factor, state.page_size)
     compiled = _GEMM_COMPILE_CACHE.get(key)
     if compiled is not None:
         return compiled
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("warm up the BF16 indexer GEMM before CUDA Graph capture")
+    if output is None:
+        output = state.proxy_scores
     kernel = M3IndexerGemmSm100(
-        compute_capability=capability, num_index_heads=state.num_index_heads
+        compute_capability=capability,
+        num_index_heads=state.num_index_heads,
+        **geometry,
     )
     compiled = compile_or_load(
         key,
@@ -269,7 +300,7 @@ def _compile_gemm(
             _to_cute_tensor(q_flat),
             _to_cute_tensor(normalize_cache_singletons(k_tma_view), leading_dim=1),
             _to_cute_tensor(state.page_table),
-            _to_cute_tensor(state.proxy_scores),
+            _to_cute_tensor(output),
             _to_cute_tensor(state.cu_seqlens_q),
             _to_cute_tensor(state.cu_seqlens_k),
             _to_cute_tensor(state.task_batch_idx),
@@ -284,6 +315,56 @@ def _compile_gemm(
     )
     _GEMM_COMPILE_CACHE[key] = compiled
     return compiled
+
+
+def _check_qk_inputs(
+    state: _PlanState | _BlockScorePlanState,
+    q: torch.Tensor,
+    paged_k_cache: torch.Tensor,
+    rows_per_page: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _check_cuda_contiguous(q, name="q")
+    check_cache_layout(paged_k_cache, name="paged_k_cache")
+    for name, tensor in (("q", q), ("paged_k_cache", paged_k_cache)):
+        _check_same_device(state.page_table, tensor, name=name)
+        if tensor.dtype != torch.bfloat16:
+            raise TypeError(f"{name} must be torch.bfloat16")
+    expected_q_shape = (state.total_q, state.num_index_heads, _HEAD_DIM)
+    if tuple(q.shape) != expected_q_shape:
+        raise ValueError(f"q must have shape {expected_q_shape}")
+    if paged_k_cache.ndim != 4 or tuple(paged_k_cache.shape[1:]) != (
+        1,
+        rows_per_page,
+        _HEAD_DIM,
+    ):
+        raise ValueError(
+            f"paged_k_cache must have shape [physical_pages, 1, {rows_per_page}, 128]"
+        )
+    q_flat = q.view(state.total_q * state.num_index_heads, _HEAD_DIM)
+    k_tma_view = normalize_cache_singletons(paged_k_cache[:, 0].permute(1, 2, 0))
+    return q_flat, k_tma_view
+
+
+def _launch_gemm(
+    compiled: object,
+    state: _PlanState | _BlockScorePlanState,
+    q_flat: torch.Tensor,
+    k_tma_view: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    compiled(
+        q_flat,
+        k_tma_view,
+        state.page_table,
+        output,
+        state.cu_seqlens_q,
+        state.cu_seqlens_k,
+        state.task_batch_idx,
+        state.task_q_local_begin,
+        None,
+        state.num_task_slots,
+        1.0,
+    )
 
 
 class BatchPrefillIndexerWithPagedKVCacheWrapper:
@@ -382,23 +463,7 @@ class BatchPrefillIndexerWithPagedKVCacheWrapper:
         """Return forced-tail TopK logical page indices for one layer."""
 
         state = self._require_plan()
-        _check_cuda_contiguous(q, name="q")
-        check_cache_layout(paged_k_cache, name="paged_k_cache")
-        for name, tensor in (("q", q), ("paged_k_cache", paged_k_cache)):
-            _check_same_device(state.page_table, tensor, name=name)
-            if tensor.dtype != torch.bfloat16:
-                raise TypeError(f"{name} must be torch.bfloat16")
-        expected_q_shape = (state.total_q, state.num_index_heads, _HEAD_DIM)
-        if tuple(q.shape) != expected_q_shape:
-            raise ValueError(f"q must have shape {expected_q_shape}")
-        if paged_k_cache.ndim != 4 or tuple(paged_k_cache.shape[1:]) != (
-            1,
-            _PAGE_SIZE,
-            _HEAD_DIM,
-        ):
-            raise ValueError(
-                "paged_k_cache must have shape [physical_pages, 1, 128, 128]"
-            )
+        q_flat, k_tma_view = _check_qk_inputs(state, q, paged_k_cache, _PAGE_SIZE)
         out_tensor = state.topk_indices if out is None else out
         _check_cuda_contiguous(out_tensor, name="out")
         _check_same_device(q, out_tensor, name="out")
@@ -410,23 +475,9 @@ class BatchPrefillIndexerWithPagedKVCacheWrapper:
                 f"out must be torch.int32 with shape {tuple(state.topk_indices.shape)}"
             )
 
-        q_flat = q.view(state.total_q * state.num_index_heads, _HEAD_DIM)
-        k_tma_view = normalize_cache_singletons(paged_k_cache[:, 0].permute(1, 2, 0))
         compiled = _compile_gemm(q_flat, k_tma_view, state)
         with torch.cuda.nvtx.range("PrefillIndexerBF16ProxyScore"):
-            compiled(
-                q_flat,
-                k_tma_view,
-                state.page_table,
-                state.proxy_scores,
-                state.cu_seqlens_q,
-                state.cu_seqlens_k,
-                state.task_batch_idx,
-                state.task_q_local_begin,
-                None,
-                state.num_task_slots,
-                1.0,
-            )
+            _launch_gemm(compiled, state, q_flat, k_tma_view, state.proxy_scores)
         with torch.cuda.nvtx.range("PrefillIndexerBF16TopKSelect"):
             _topk_select(
                 state.proxy_scores.view(-1, state.max_cols),
@@ -442,4 +493,124 @@ class BatchPrefillIndexerWithPagedKVCacheWrapper:
         return state
 
 
-__all__ = ["BatchPrefillIndexerWithPagedKVCacheWrapper"]
+class BatchPrefillBlockScoreWrapper:
+    """Compute FP32 block maxima over complete pooled keys, without selection.
+
+    One stored key represents ``pooling_factor`` original tokens, so each
+    logical 128-token score block stores ``128 // pooling_factor`` keys. Query
+    and KV cumulative lengths remain in original-token units.
+    """
+
+    def __init__(self) -> None:
+        self._plan_state: _BlockScorePlanState | None = None
+
+    def plan(
+        self,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_k: torch.Tensor,
+        page_table: torch.Tensor,
+        *,
+        total_q: int,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        num_index_heads: int = 4,
+        pooling_factor: int = 1,
+        page_size: int = 128,
+    ) -> None:
+        """Bind original-token metadata and allocate graph-owned scheduling buffers.
+
+        Construct outside capture and warm up ``run()`` before capture. Metadata
+        contents may then change in place within these capacities, including
+        shorter query/KV lengths. Keep the same addresses and shapes.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("plan() must be called outside CUDA Graph capture")
+        _check_pooled_geometry(pooling_factor, page_size)
+        total_q = int(total_q)
+        max_seqlen_q = int(max_seqlen_q)
+        max_seqlen_k = int(max_seqlen_k)
+        num_index_heads = int(num_index_heads)
+        batch, max_cols = _validate_plan_inputs(
+            cu_seqlens_q,
+            cu_seqlens_k,
+            page_table,
+            total_q=total_q,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            num_index_heads=num_index_heads,
+        )
+        if page_table.shape[1] < _ceil_div(max_seqlen_k, page_size):
+            raise ValueError("page_table capacity is smaller than max_seqlen_k")
+        if total_q * num_index_heads * max_cols >= 2**31:
+            raise ValueError("score capacity must contain fewer than 2**31 elements")
+        _check_runtime(page_table.device)
+        slots = _num_task_slots(total_q, batch, num_index_heads)
+        options = {"device": page_table.device}
+        self._plan_state = _BlockScorePlanState(
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table=page_table,
+            task_batch_idx=torch.empty(slots, dtype=torch.int32, **options),
+            task_q_local_begin=torch.empty(slots, dtype=torch.int32, **options),
+            default_out=None,
+            num_task_slots=slots,
+            total_q=total_q,
+            max_cols=max_cols,
+            num_index_heads=num_index_heads,
+            pooling_factor=pooling_factor,
+            page_size=page_size,
+        )
+        _run_schedule(self._plan_state)
+
+    def run(
+        self,
+        q: torch.Tensor,
+        paged_k_cache: torch.Tensor,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return unscaled FP32 ``[H, total_q, ceil(max_seqlen_k/128)]``.
+
+        At original position p, stored key j is visible only once
+        ``(j + 1) * pooling_factor <= p + 1``. Empty, padded, and future
+        blocks are overwritten with -inf on every call and graph replay.
+        Calls sharing a wrapper must be serialized; use separate wrappers
+        for independent streams or graphs.
+        """
+        state = self._plan_state
+        if state is None:
+            raise RuntimeError("plan() must be called before run()")
+        q_flat, k_tma_view = _check_qk_inputs(
+            state, q, paged_k_cache, state.page_size // state.pooling_factor
+        )
+        expected_output_shape = (state.num_index_heads, state.total_q, state.max_cols)
+        if out is None and state.default_out is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "provide out or warm up run() before CUDA Graph capture"
+                )
+            state.default_out = torch.empty(
+                expected_output_shape, dtype=torch.float32, device=q.device
+            )
+        output = state.default_out if out is None else out
+        _check_cuda_contiguous(output, name="out")
+        _check_same_device(q, output, name="out")
+        if (
+            output.dtype != torch.float32
+            or tuple(output.shape) != expected_output_shape
+        ):
+            raise ValueError(
+                f"out must be torch.float32 with shape {expected_output_shape}"
+            )
+        compiled = _compile_gemm(q_flat, k_tma_view, state, output=output)
+        with torch.cuda.nvtx.range("PrefillIndexerBF16BlockScores"):
+            output.fill_(float("-inf"))
+            _run_schedule(state)
+            _launch_gemm(compiled, state, q_flat, k_tma_view, output)
+        return output
+
+
+__all__ = [
+    "BatchPrefillIndexerWithPagedKVCacheWrapper",
+    "BatchPrefillBlockScoreWrapper",
+]
