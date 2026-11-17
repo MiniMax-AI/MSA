@@ -5,6 +5,6 @@
 namespace minimax::msa_v1::indexer::topk {
 
 torch::Tensor indexer_topk_run(torch::Tensor scores, torch::Tensor lengths, torch::Tensor output,
-                               bool compact_grid);
+                               bool compact_grid, int64_t out_groups);
 
 } // namespace minimax::msa_v1::indexer::topk

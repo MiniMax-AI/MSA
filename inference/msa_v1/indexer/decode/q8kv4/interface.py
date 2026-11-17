@@ -275,6 +275,10 @@ class _BatchDecodeProxyScoreWrapper:
 class BatchDecodeIndexerWithPagedKVCacheWrapper:
     """Compose Q8KV4 proxy scores with the forced-tail TopK selection."""
 
+    # run(out=...) also accepts the [H, batch * Q, 16] view of a contiguous
+    # [batch * Q, H, 16] buffer, which the Q8KV4 decode attention reads.
+    supports_head_minor_out = True
+
     def __init__(
         self,
         workspace_buffer: torch.Tensor | None = None,
@@ -365,14 +369,20 @@ class BatchDecodeIndexerWithPagedKVCacheWrapper:
         ):
             raise RuntimeError("plan() must be called before run()")
         topk_out = self._topk_indices if out is None else out
+        head_minor = (
+            not topk_out.is_contiguous()
+            and topk_out.ndim == 3
+            and topk_out.permute(1, 0, 2).is_contiguous()
+        )
         if (
             topk_out.shape != self._topk_indices.shape
             or topk_out.dtype is not torch.int32
             or topk_out.device != self._topk_indices.device
-            or not topk_out.is_contiguous()
+            or not (topk_out.is_contiguous() or head_minor)
         ):
             raise ValueError(
-                "out must be contiguous int32 [H, batch * Q, 16] on the planned device"
+                "out must be int32 [H, batch * Q, 16] on the planned device, contiguous "
+                "or a permute(1, 0, 2) view of a contiguous [batch * Q, H, 16] tensor"
             )
         proxy_scores = self._proxy_score.run(
             q,
@@ -383,8 +393,11 @@ class BatchDecodeIndexerWithPagedKVCacheWrapper:
         _topk_select(
             proxy_scores.view(-1, proxy_scores.shape[-1]),
             self._num_valid_pages.view(-1),
-            out=topk_out.view(-1, _TOP_K),
+            out=(
+                topk_out.permute(1, 0, 2) if head_minor else topk_out
+            ).reshape(-1, _TOP_K),
             compact_grid=True,
+            out_groups=topk_out.shape[0] if head_minor else 1,
         )
         return topk_out
 
