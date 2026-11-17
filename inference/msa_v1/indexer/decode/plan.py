@@ -11,7 +11,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from inference.msa_v1.indexer._common.topk_select.interface import MAXIMUM_COLUMNS
 
-from .plan_kernel import DecodeIndexerPlanSm100
+from .plan_kernel import _BLOCK_TOKENS, DecodeIndexerPlanSm100
 
 try:
     import tvm_ffi
@@ -20,6 +20,24 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _COMPILE_CACHE: dict[tuple, object] = {}
+
+
+# (pooling_factor, include_partial_block, page_size) of the TopK wrappers; it
+# keeps their original compile keys.
+_DEFAULT_BLOCK_LAYOUT = (1, False, _BLOCK_TOKENS)
+
+
+def _check_block_layout(pooling_factor, include_partial_block, page_size):
+    """Validate pooled-key options; return pages per block and blocks per tile."""
+    if type(pooling_factor) is not int or pooling_factor not in (1, 2, 4):
+        raise ValueError("pooling_factor must be 1, 2, or 4")
+    if type(include_partial_block) is not bool:
+        raise ValueError("include_partial_block must be bool")
+    if type(page_size) is not int or page_size not in (64, _BLOCK_TOKENS):
+        raise ValueError("page_size must be 64 or 128 original tokens")
+    # Four 32-entry blocks fill one 128-row MMA tile.
+    blocks_per_tile = 4 if pooling_factor == 4 else 1
+    return _BLOCK_TOKENS // page_size, blocks_per_tile
 
 
 class BatchDecodeIndexerPlan:
@@ -38,6 +56,9 @@ class BatchDecodeIndexerPlan:
         num_index_heads: int = 1,
         query_length: int = 8,
         workspace_buffer: torch.Tensor | None = None,
+        pooling_factor: int = 1,
+        include_partial_block: bool = False,
+        page_size: int = 128,
     ):
         if not seq_lens_buffer.is_cuda or seq_lens_buffer.dtype != torch.int32:
             raise ValueError("seq_lens_buffer must be a CUDA int32 tensor")
@@ -53,8 +74,13 @@ class BatchDecodeIndexerPlan:
             raise ValueError("query_length must be an integer in [1, 16]")
         if type(num_index_heads) is not int or num_index_heads not in (1, 2, 4):
             raise ValueError("num_index_heads must be 1, 2, or 4")
-        if type(max_pages) is not int or not 1 <= max_pages <= MAXIMUM_COLUMNS:
-            raise ValueError(f"max_pages must be an integer in [1, {MAXIMUM_COLUMNS}]")
+        pages_per_block, blocks_per_tile = _check_block_layout(
+            pooling_factor, include_partial_block, page_size
+        )
+        maximum_pages = MAXIMUM_COLUMNS * pages_per_block
+        if type(max_pages) is not int or not 1 <= max_pages <= maximum_pages:
+            raise ValueError(f"max_pages must be an integer in [1, {maximum_pages}]")
+        self._block_layout = (pooling_factor, include_partial_block, page_size)
         self.device = seq_lens_buffer.device
         with torch.cuda.device(self.device):
             if torch.cuda.is_current_stream_capturing():
@@ -121,11 +147,18 @@ class BatchDecodeIndexerPlan:
             cutlass.Int32(self.num_workers),
         )
         key = ("decode_shared_plan_v1", arch)
+        if self._block_layout != _DEFAULT_BLOCK_LAYOUT:
+            key += self._block_layout
         if key not in _COMPILE_CACHE:
             started = time.perf_counter()
             with torch.cuda.device(self.device):
                 _COMPILE_CACHE[key] = cute.compile(
-                    DecodeIndexerPlanSm100(),
+                    DecodeIndexerPlanSm100(
+                        pooling_factor=pooling_factor,
+                        pages_per_block=pages_per_block,
+                        blocks_per_tile=blocks_per_tile,
+                        include_partial_block=include_partial_block,
+                    ),
                     *self._tensors,
                     *self._args,
                     cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -162,7 +195,15 @@ class BatchDecodeIndexerPlan:
         if not self._initialized:
             raise RuntimeError("shared_plan.update() must precede run()")
 
-    def _check_binding(self, seq_lens, *, max_pages, num_index_heads, query_length):
+    def _check_binding(
+        self,
+        seq_lens,
+        *,
+        max_pages,
+        num_index_heads,
+        query_length,
+        block_layout=_DEFAULT_BLOCK_LAYOUT,
+    ):
         if (
             seq_lens.device != self.device
             or seq_lens.data_ptr() != self._source_lengths.data_ptr()
@@ -170,6 +211,7 @@ class BatchDecodeIndexerPlan:
             or max_pages != self.max_pages
             or num_index_heads != self.num_index_heads
             or query_length != self.query_length
+            or block_layout != self._block_layout
         ):
             raise ValueError("shared_plan metadata binding does not match this wrapper")
 
