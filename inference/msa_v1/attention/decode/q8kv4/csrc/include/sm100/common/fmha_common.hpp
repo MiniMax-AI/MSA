@@ -99,6 +99,8 @@ template <class Traits> struct Sm100FmhaFwdKernelParams {
   float scale_output_split = 1.0f;
   bool use_persistent_scheduler = false;
   bool use_precomputed_scheduler = false;
+  // trigger dependents right after setup (MSA_Q8KV4_DECODE_ATTN_PDL); 0 keeps the end-of-kernel trigger.
+  int pdl_early_trigger = 0;
 };
 
 template <class Traits>

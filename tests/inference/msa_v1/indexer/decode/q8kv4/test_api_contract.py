@@ -33,6 +33,7 @@ def test_wrapper_is_the_only_public_entrypoint() -> None:
         "paged_k_cache",
         "k_scale",
         "out",
+        "pdl",
     )
 
 

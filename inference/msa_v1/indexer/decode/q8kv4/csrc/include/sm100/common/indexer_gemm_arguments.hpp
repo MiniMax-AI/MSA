@@ -27,6 +27,8 @@ struct IndexerGemmArguments {
   int64_t packed_k_token_stride = 0;
   int64_t k_scale_page_stride = 0;
   int sm_count = 0;
+  // launch with programmatic stream serialization (PDL); host-side only.
+  bool pdl = false;
 };
 
 cudaError_t launch_indexer_gemm(IndexerGemmArguments const &arguments, cudaStream_t stream);

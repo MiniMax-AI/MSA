@@ -113,7 +113,16 @@ CUTLASS_DEVICE void run_fwd_mainloop_device(Sm100FmhaFwdKernelParams<Traits> con
     allocator.release_allocation_lock();
   }
 
+  // PDL: everything above touches no data written by the preceding kernels; every
+  // global read of the work below (Q, TopK, page table, KV, plan) follows the wait. A no-op
+  // without a PDL launch.
+  asm volatile("griddepcontrol.wait;" ::: "memory");
   __syncthreads();
+  // Let the PDL-launched consumer (it waits for this grid's completion before reading the
+  // output) launch and prefetch its weights on SMs this grid leaves free.
+  if (params.pdl_early_trigger && thread_idx == 0) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 
   {
     bool const workspace_split = use_workspace_split<Traits>(params);

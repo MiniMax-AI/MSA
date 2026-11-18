@@ -19,7 +19,7 @@ cudaError_t launch_indexer_gemm(IndexerGemmArguments const &arguments, cudaStrea
   if (status != cudaSuccess) {
     return status;
   }
-  return Runner::run(params, stream);
+  return Runner::run(params, stream, arguments.pdl);
 }
 
 } // namespace minimax::msa_v1::indexer::decode::q8kv4
